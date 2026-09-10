@@ -519,7 +519,7 @@ export const DraftSessionChatInterface = memo(
               cliType: draft.cliType,
               agentType: draft.agentType,
               modeId: selectedModeId,
-              modelId: selectedModelId,
+              modelId: modelOptions.length > 0 ? (selectedModelId ?? undefined) : undefined,
               configOptionValues: dispatchConfigOptionValues,
               issuePRMentions: prompt
                 ? extractIssuePRMentionsFromText(
@@ -546,6 +546,7 @@ export const DraftSessionChatInterface = memo(
           dispatchConfigOptionValues,
           knownIssuePrItems,
           mcpSelection.selectedIds,
+          modelOptions.length,
           parentRepoFullName,
           selectedModeId,
           selectedModelId,

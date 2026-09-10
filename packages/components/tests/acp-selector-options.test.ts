@@ -631,6 +631,118 @@ describe('buildAcpSelectorOptions', () => {
     expect(options.configOptionSelectors).toEqual([]);
   });
 
+  it('uses static DeepSeek model options and prefers deepseek-v4-pro', () => {
+    const options = buildAcpSelectorOptions({
+      configId: agentConfigId,
+      cliType: 'builtin',
+      agentType: 'deepseek',
+      machine: machineWithCapabilities({}),
+    });
+
+    expect(options.capabilityAuthority).toBe('provisional');
+    expect(options.modelOptions.length).toBeGreaterThan(0);
+    expect(options.modelOptions.map((option) => option.value)).toContain('deepseek-v4-pro');
+    expect(options.defaultModelId).toBe('deepseek-v4-pro');
+  });
+
+  it('does not use the first cached DeepSeek model when deepseek-v4-pro is in the catalog', () => {
+    const options = buildAcpSelectorOptions({
+      configId: agentConfigId,
+      cliType: 'builtin',
+      agentType: 'deepseek',
+      machine: machineWithCapabilities({
+        [agentConfigId]: {
+          cliType: 'builtin',
+          agentType: 'deepseek',
+          cacheVersion: ACP_CAPABILITY_CACHE_VERSION,
+          provenance: 'runtime',
+          modes: [],
+          models: [
+            { modelId: 'deepseek-chat', name: 'DeepSeek Chat' },
+            { modelId: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
+          ],
+          configOptions: [],
+          fetchedAt: 1,
+        },
+      }),
+    });
+
+    expect(options.capabilityAuthority).toBe('authoritative');
+    expect(options.modelOptions.map((option) => option.value)).toEqual([
+      'deepseek-chat',
+      'deepseek-v4-pro',
+    ]);
+    expect(options.defaultModelId).toBe('deepseek-v4-pro');
+  });
+
+  it('prefers deepseek-v4-pro over a probed first-id currentValue when the catalog offers it', () => {
+    const options = buildAcpSelectorOptions({
+      configId: agentConfigId,
+      cliType: 'builtin',
+      agentType: 'deepseek',
+      machine: machineWithCapabilities({
+        [agentConfigId]: {
+          cliType: 'builtin',
+          agentType: 'deepseek',
+          cacheVersion: ACP_CAPABILITY_CACHE_VERSION,
+          provenance: 'runtime',
+          modes: [],
+          models: [],
+          configOptions: [
+            {
+              id: 'model',
+              name: 'Model',
+              category: 'model',
+              type: 'select',
+              currentValue: 'deepseek-chat',
+              options: [
+                { value: 'deepseek-chat', name: 'DeepSeek Chat' },
+                { value: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
+              ],
+            },
+          ],
+          fetchedAt: 1,
+        },
+      }),
+    });
+
+    expect(options.capabilityAuthority).toBe('authoritative');
+    expect(options.modelOptions.map((option) => option.value)).toEqual([
+      'deepseek-chat',
+      'deepseek-v4-pro',
+    ]);
+    expect(options.defaultModelId).toBe('deepseek-v4-pro');
+  });
+
+  it('falls back to the first cached model when the official DeepSeek id is absent', () => {
+    const options = buildAcpSelectorOptions({
+      configId: agentConfigId,
+      cliType: 'builtin',
+      agentType: 'deepseek',
+      machine: machineWithCapabilities({
+        [agentConfigId]: {
+          cliType: 'builtin',
+          agentType: 'deepseek',
+          cacheVersion: ACP_CAPABILITY_CACHE_VERSION,
+          provenance: 'runtime',
+          modes: [],
+          models: [
+            { modelId: 'deepseek-chat', name: 'DeepSeek Chat' },
+            { modelId: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
+          ],
+          configOptions: [],
+          fetchedAt: 1,
+        },
+      }),
+    });
+
+    expect(options.modelOptions.map((option) => option.value)).toEqual([
+      'deepseek-chat',
+      'deepseek-reasoner',
+    ]);
+    expect(options.defaultModelId).toBe('deepseek-chat');
+  });
+
   it('exposes static builtin selectors for title-generation settings', () => {
     const selectors = buildAllConfigOptionSelectors({
       configId: agentConfigId,

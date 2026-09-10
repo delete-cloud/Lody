@@ -9,6 +9,7 @@ import {
   getAcpCapabilityCacheKey,
   getAcpCapabilityCacheEntryAuthority,
   getBuiltinDefaultModeId,
+  getBuiltinDefaultModelId,
   getStaticBuiltinAcpCapabilities,
   isAcpCapabilityCacheEntryCurrentForRuntimeOverrides,
   type AcpCapabilityAuthority,
@@ -240,12 +241,18 @@ const resolveConfigOptions = (target?: AcpSelectorTarget): ResolvedConfigOptions
         });
       }
       if (capability.models && capability.models.length > 0) {
+        const modelIds = capability.models.map((model) => model.modelId);
+        const builtinDefaultModelId = getBuiltinDefaultModelId(target.cliType, target.agentType);
+        const officialModelId =
+          builtinDefaultModelId && modelIds.includes(builtinDefaultModelId)
+            ? builtinDefaultModelId
+            : undefined;
         synthesized.push({
           id: 'model',
           name: 'Model',
           category: 'model',
           type: 'select',
-          currentValue: capability.models[0]?.modelId ?? '',
+          currentValue: officialModelId ?? capability.models[0]?.modelId ?? '',
           options: capability.models.map((m) => ({
             value: m.modelId,
             name: m.name ?? m.modelId,
@@ -490,6 +497,27 @@ const resolveDefaultModeId = (
 };
 
 /**
+ * First-run default model when the user has no persisted selection. Official
+ * DeepSeek prefers `deepseek-v4-pro` when that id is in the catalog; never
+ * silently take the first cached model id.
+ */
+const resolveDefaultModelId = (
+  target: AcpSelectorTarget | undefined,
+  modelConfigOption: AcpConfigOptionSummary | undefined
+): string | null => {
+  const currentValue =
+    typeof modelConfigOption?.currentValue === 'string' ? modelConfigOption.currentValue : null;
+  const builtinDefaultModelId = getBuiltinDefaultModelId(target?.cliType, target?.agentType);
+  if (
+    builtinDefaultModelId &&
+    modelConfigOption?.options.some((option) => option.value === builtinDefaultModelId)
+  ) {
+    return builtinDefaultModelId;
+  }
+  return currentValue;
+};
+
+/**
  * Builds ACP selector options without i18n translation.
  * Use this for non-React contexts or when you need raw config values.
  * For React components, prefer useAcpSelectorOptions hook instead.
@@ -541,8 +569,7 @@ export const buildAcpSelectorOptions = (target?: AcpSelectorTarget): AcpSelector
     modeOptions,
     modelOptions,
     defaultModeId: resolveDefaultModeId(target, modeConfigOption),
-    defaultModelId:
-      typeof modelConfigOption?.currentValue === 'string' ? modelConfigOption.currentValue : null,
+    defaultModelId: resolveDefaultModelId(target, modelConfigOption),
     configOptionSelectors,
   };
 };

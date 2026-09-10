@@ -4,6 +4,7 @@ import {
   deriveModelReasoningEffortsFromLegacyModelIds,
   resolveAgentRunConfigSelection,
   summarizeAgentRunConfigCapabilities,
+  withSelectedModelConfigOptionValue,
   type AcpCapabilityCacheEntry,
 } from '../src';
 
@@ -351,5 +352,26 @@ describe('agent run config selection', () => {
       planMode: true,
     });
     expect(resolveAgentRunConfigSelection({ planMode: true }, legacy)).toEqual({ modeId: 'plan' });
+  });
+
+  it('copies a dedicated modelId into configOptionValues without overwriting an existing model key', () => {
+    expect(withSelectedModelConfigOptionValue(undefined, 'deepseek-v4-pro')).toEqual({
+      model: 'deepseek-v4-pro',
+    });
+    expect(
+      withSelectedModelConfigOptionValue({ reasoning_effort: 'max' }, 'deepseek-v4-pro')
+    ).toEqual({
+      reasoning_effort: 'max',
+      model: 'deepseek-v4-pro',
+    });
+    expect(
+      withSelectedModelConfigOptionValue({ model: 'deepseek-chat' }, 'deepseek-v4-pro')
+    ).toEqual({
+      model: 'deepseek-chat',
+    });
+    expect(withSelectedModelConfigOptionValue({ reasoning_effort: 'max' }, '  ')).toEqual({
+      reasoning_effort: 'max',
+    });
+    expect(withSelectedModelConfigOptionValue(undefined, undefined)).toBeUndefined();
   });
 });

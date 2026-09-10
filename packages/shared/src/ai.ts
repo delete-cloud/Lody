@@ -405,6 +405,15 @@ const BUILTIN_DEFAULT_MODE_IDS: Record<BuiltinAgentType, string> = {
 };
 
 /**
+ * Lody-owned model default for builtin agents when a turn has no persisted
+ * selection. Only agents whose official catalog id is not the first cached
+ * model need an entry; callers must still check that the catalog offers it.
+ */
+const BUILTIN_DEFAULT_MODEL_IDS: Partial<Record<BuiltinAgentType, string>> = {
+  deepseek: 'deepseek-v4-pro',
+};
+
+/**
  * Lody-owned mode default for builtin agents when a turn has no
  * persisted selection. Capability-aware callers should use it only when the
  * adapter offers the returned mode.
@@ -415,6 +424,19 @@ export const getBuiltinDefaultModeId = (
 ): string | undefined =>
   cliType === 'builtin' && agentType && isBuiltinAgentType(agentType)
     ? BUILTIN_DEFAULT_MODE_IDS[agentType]
+    : undefined;
+
+/**
+ * Lody-owned model default for builtin agents when a turn has no persisted
+ * selection. Capability-aware callers should use it only when the catalog
+ * offers the returned id — never as a silent first-id substitute.
+ */
+export const getBuiltinDefaultModelId = (
+  cliType: AgentConfigCliType | null | undefined,
+  agentType: AgentType | null | undefined
+): string | undefined =>
+  cliType === 'builtin' && agentType && isBuiltinAgentType(agentType)
+    ? BUILTIN_DEFAULT_MODEL_IDS[agentType]
     : undefined;
 
 const DEEPSEEK_HARNESS_CONFIG_OPTIONS: AcpConfigOptionSummary[] = [

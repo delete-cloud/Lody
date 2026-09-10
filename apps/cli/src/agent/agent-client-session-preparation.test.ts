@@ -372,6 +372,290 @@ describe('AgentClient session preparation gate', () => {
     });
   });
 
+  it('keeps the requested DeepSeek model across newSession adapter first-id currentValue', async () => {
+    connectionMocks.newSession.mockResolvedValueOnce({
+      sessionId: 'acp-session-1',
+      configOptions: [
+        {
+          id: 'model',
+          category: 'model',
+          type: 'select',
+          name: 'Model',
+          currentValue: 'deepseek-chat',
+          options: [
+            { value: 'deepseek-chat', name: 'DeepSeek Chat' },
+            { value: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
+          ],
+        },
+        {
+          id: 'reasoning_effort',
+          category: 'thought_level',
+          type: 'select',
+          name: 'Reasoning effort',
+          currentValue: 'max',
+          options: [{ value: 'max', name: 'Max' }],
+        },
+      ],
+    });
+    const client = new AgentClient({
+      logger: createLogger(),
+      sessionId: 'session-deepseek-model' as SessionId,
+      terminalManager: {} as never,
+      agentConfig: { cliType: 'builtin', agentType: 'deepseek' },
+      configOptionValues: { model: 'deepseek-v4-pro' },
+      onUpdateMessage: vi.fn(),
+      onRequestPermission: vi.fn(),
+    });
+
+    await client.startSession({} as never, '/workdir');
+
+    expect(client.currentModel?.modelId).toBe('deepseek-chat');
+
+    connectionMocks.newSession.mockResolvedValueOnce({ sessionId: 'acp-session-2' });
+    await client.prepareReplacementSession();
+    expect(connectionMocks.newSession).toHaveBeenLastCalledWith({
+      cwd: '/workdir',
+      mcpServers: [],
+      _meta: {
+        lody: {
+          sessionConfig: {
+            version: 1,
+            configOptionValues: { model: 'deepseek-v4-pro', reasoning_effort: 'max' },
+          },
+        },
+      },
+    });
+
+    connectionMocks.setSessionConfigOption.mockResolvedValue({
+      configOptions: [
+        {
+          id: 'model',
+          category: 'model',
+          type: 'select',
+          name: 'Model',
+          currentValue: 'deepseek-v4-pro',
+          options: [
+            { value: 'deepseek-chat', name: 'DeepSeek Chat' },
+            { value: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
+          ],
+        },
+        {
+          id: 'reasoning_effort',
+          category: 'thought_level',
+          type: 'select',
+          name: 'Reasoning effort',
+          currentValue: 'max',
+          options: [{ value: 'max', name: 'Max' }],
+        },
+      ],
+    });
+    await applyAcpSessionRunConfig({
+      session: {
+        sessionId: 'session-deepseek-model' as SessionId,
+        acpSessionId: 'acp-session-1' as never,
+        agentClient: client,
+      },
+      config: { modelId: 'deepseek-v4-pro', configOptionValues: { model: 'deepseek-v4-pro' } },
+      logger: createLogger(),
+    });
+    expect(client.currentModel?.modelId).toBe('deepseek-v4-pro');
+
+    connectionMocks.newSession.mockResolvedValueOnce({ sessionId: 'acp-session-3' });
+    await client.prepareReplacementSession();
+    expect(connectionMocks.newSession).toHaveBeenLastCalledWith({
+      cwd: '/workdir',
+      mcpServers: [],
+      _meta: {
+        lody: {
+          sessionConfig: {
+            version: 1,
+            configOptionValues: { model: 'deepseek-v4-pro', reasoning_effort: 'max' },
+          },
+        },
+      },
+    });
+  });
+
+  it('keeps a pending model after another config option is applied and the model switch fails', async () => {
+    connectionMocks.newSession.mockResolvedValueOnce({
+      sessionId: 'acp-session-1',
+      configOptions: [
+        {
+          id: 'mode',
+          category: 'mode',
+          type: 'select',
+          name: 'Mode',
+          currentValue: 'default',
+          options: [
+            { value: 'default', name: 'Default' },
+            { value: 'plan', name: 'Plan' },
+          ],
+        },
+        {
+          id: 'model',
+          category: 'model',
+          type: 'select',
+          name: 'Model',
+          currentValue: 'deepseek-chat',
+          options: [
+            { value: 'deepseek-chat', name: 'DeepSeek Chat' },
+            { value: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
+          ],
+        },
+      ],
+    });
+    connectionMocks.setSessionConfigOption
+      .mockResolvedValueOnce({
+        configOptions: [
+          {
+            id: 'mode',
+            category: 'mode',
+            type: 'select',
+            name: 'Mode',
+            currentValue: 'plan',
+            options: [
+              { value: 'default', name: 'Default' },
+              { value: 'plan', name: 'Plan' },
+            ],
+          },
+          {
+            id: 'model',
+            category: 'model',
+            type: 'select',
+            name: 'Model',
+            currentValue: 'deepseek-chat',
+            options: [
+              { value: 'deepseek-chat', name: 'DeepSeek Chat' },
+              { value: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
+            ],
+          },
+        ],
+      })
+      .mockRejectedValueOnce(new Error('model switch failed'));
+    const client = new AgentClient({
+      logger: createLogger(),
+      sessionId: 'session-pending-model-survives' as SessionId,
+      terminalManager: {} as never,
+      agentConfig: { cliType: 'builtin', agentType: 'deepseek' },
+      configOptionValues: { model: 'deepseek-v4-pro' },
+      onUpdateMessage: vi.fn(),
+      onRequestPermission: vi.fn(),
+    });
+
+    await client.startSession({} as never, '/workdir');
+    expect(client.currentModel?.modelId).toBe('deepseek-chat');
+
+    await applyAcpSessionRunConfig({
+      session: {
+        sessionId: 'session-pending-model-survives' as SessionId,
+        acpSessionId: 'acp-session-1' as never,
+        agentClient: client,
+      },
+      config: { modeId: 'plan', modelId: 'deepseek-v4-pro' },
+      logger: createLogger(),
+    });
+    expect(client.currentModel?.modelId).toBe('deepseek-chat');
+
+    connectionMocks.newSession.mockResolvedValueOnce({ sessionId: 'acp-session-2' });
+    await client.prepareReplacementSession();
+    expect(connectionMocks.newSession).toHaveBeenLastCalledWith({
+      cwd: '/workdir',
+      mcpServers: [],
+      _meta: {
+        lody: {
+          sessionConfig: {
+            version: 1,
+            configOptionValues: { mode: 'plan', model: 'deepseek-v4-pro' },
+          },
+        },
+      },
+    });
+  });
+
+  it('does not treat an unconfirmed request as currentModel when the snapshot confirms another model', async () => {
+    connectionMocks.initialize.mockResolvedValue({
+      agentCapabilities: { loadSession: true },
+    });
+    connectionMocks.loadSession.mockResolvedValue({
+      configOptions: [
+        {
+          id: 'model',
+          category: 'model',
+          type: 'select',
+          name: 'Model',
+          currentValue: 'deepseek-chat',
+          options: [
+            { value: 'deepseek-chat', name: 'DeepSeek Chat' },
+            { value: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
+          ],
+        },
+      ],
+    });
+    const client = new AgentClient({
+      logger: createLogger(),
+      sessionId: 'session-deepseek-load' as SessionId,
+      terminalManager: {} as never,
+      agentConfig: { cliType: 'builtin', agentType: 'deepseek' },
+      configOptionValues: { model: 'deepseek-v4-pro' },
+      onUpdateMessage: vi.fn(),
+      onRequestPermission: vi.fn(),
+    });
+
+    await client.startSession({} as never, '/workdir', 'stored-deepseek-session' as never);
+
+    expect(client.currentModel?.modelId).toBe('deepseek-chat');
+
+    connectionMocks.newSession.mockResolvedValueOnce({ sessionId: 'acp-session-2' });
+    await client.prepareReplacementSession();
+    expect(connectionMocks.newSession).toHaveBeenLastCalledWith({
+      cwd: '/workdir',
+      mcpServers: [],
+      _meta: {
+        lody: {
+          sessionConfig: {
+            version: 1,
+            configOptionValues: { model: 'deepseek-v4-pro' },
+          },
+        },
+      },
+    });
+  });
+
+  it('does not keep the requested model as currentModel when newSession returns an empty snapshot', async () => {
+    connectionMocks.newSession.mockResolvedValueOnce({
+      sessionId: 'acp-session-1',
+      configOptions: [],
+    });
+    const client = new AgentClient({
+      logger: createLogger(),
+      sessionId: 'session-empty-new-session' as SessionId,
+      terminalManager: {} as never,
+      agentConfig: { cliType: 'builtin', agentType: 'deepseek' },
+      configOptionValues: { model: 'deepseek-v4-pro' },
+      onUpdateMessage: vi.fn(),
+      onRequestPermission: vi.fn(),
+    });
+
+    await client.startSession({} as never, '/workdir');
+
+    expect(client.currentModel).toBeUndefined();
+
+    connectionMocks.newSession.mockResolvedValueOnce({ sessionId: 'acp-session-2' });
+    await client.prepareReplacementSession();
+    expect(connectionMocks.newSession).toHaveBeenLastCalledWith({
+      cwd: '/workdir',
+      mcpServers: [],
+      _meta: {
+        lody: {
+          sessionConfig: {
+            version: 1,
+            configOptionValues: { model: 'deepseek-v4-pro' },
+          },
+        },
+      },
+    });
+  });
+
   it('loads sessions with selected config option values', async () => {
     connectionMocks.initialize.mockResolvedValue({
       agentCapabilities: { loadSession: true },

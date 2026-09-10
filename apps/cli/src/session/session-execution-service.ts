@@ -55,6 +55,7 @@ import {
   getManagedBuiltinRuntimeByAgentType,
   getManagedBuiltinRuntimeByRuntimeName,
   serializeCustomAcpLaunchSpec,
+  withSelectedModelConfigOptionValue,
 } from '@lody/shared';
 import type { ContentBlock } from '@agentclientprotocol/sdk';
 import type { ModelInfo } from '@lody/shared';
@@ -3414,7 +3415,10 @@ export class SessionExecutionService {
           workspaceId: message.workspaceId,
           agentCliType: acpSessionConfig.cliType,
           agentType: acpSessionConfig.agentType,
-          configOptionValues: acpSessionConfig.configOptionValues,
+          configOptionValues: withSelectedModelConfigOptionValue(
+            acpSessionConfig.configOptionValues,
+            acpSessionConfig.modelId
+          ),
           mcpServerIds: acpSessionConfig.mcpServerIds ?? [],
           taskToolsEnabled: acpSessionConfig.taskToolsEnabled === true,
           customAcp: resumeCustomAcp,
@@ -4208,7 +4212,10 @@ export class SessionExecutionService {
       workspaceId,
       agentCliType: acpSessionConfig.cliType,
       agentType: acpSessionConfig.agentType,
-      configOptionValues: acpSessionConfig.configOptionValues,
+      configOptionValues: withSelectedModelConfigOptionValue(
+        acpSessionConfig.configOptionValues,
+        acpSessionConfig.modelId
+      ),
       mcpServerIds: acpSessionConfig.mcpServerIds ?? [],
       taskToolsEnabled: acpSessionConfig.taskToolsEnabled === true,
       agentConfigId: existingMeta?.agentConfigId,

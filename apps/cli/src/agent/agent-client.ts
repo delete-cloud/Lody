@@ -645,8 +645,15 @@ export class AgentClient implements acp.Client {
   private agentMcpCapabilities: acp.McpCapabilities | undefined;
   /** Session config options returned by the agent; the source of model/mode choices and names. */
   private configOptions: acp.SessionConfigOption[] = [];
-  /** Desired config retained across same-client replacement sessions. */
+  /** Agent-confirmed config. Replaced by session snapshots and live updates. */
   private readonly configOptionValues: NonNullable<SessionTurnInputConfig['configOptionValues']>;
+  /**
+   * Requested config that has not been applied yet. Overlays confirmed values in
+   * replacement `_meta` until setSessionConfigOption or a live config update.
+   */
+  private readonly pendingConfigOptionValues: NonNullable<
+    SessionTurnInputConfig['configOptionValues']
+  >;
   /** Legacy top-level `models` state proves that `session/set_model` is supported. */
   private legacySessionModelState: LegacySessionModelState | null = null;
   public currentModel?: ModelInfo;
@@ -665,6 +672,7 @@ export class AgentClient implements acp.Client {
       options.terminalEnabled ??
       !(options.agentConfig?.cliType === 'builtin' && options.agentConfig.agentType === 'grok');
     this.configOptionValues = { ...(options.configOptionValues ?? {}) };
+    this.pendingConfigOptionValues = { ...(options.configOptionValues ?? {}) };
   }
 
   private describePromptDiagnosticContext(): string {
@@ -919,6 +927,7 @@ export class AgentClient implements acp.Client {
 
     if (notification.update.sessionUpdate === 'config_option_update') {
       this.applyConfigOptionsState(notification.update.configOptions, true);
+      this.clearPendingConfigOptionValues();
     }
 
     this.handleGoalSessionInfoUpdate(notification);
@@ -1575,17 +1584,37 @@ export class AgentClient implements acp.Client {
       : undefined;
   }
 
+  private sessionStartConfigOptionValues(): NonNullable<
+    SessionTurnInputConfig['configOptionValues']
+  > {
+    return {
+      ...this.configOptionValues,
+      ...this.pendingConfigOptionValues,
+    };
+  }
+
+  private clearPendingConfigOptionValues(): void {
+    for (const configId of Object.keys(this.pendingConfigOptionValues)) {
+      delete this.pendingConfigOptionValues[configId];
+    }
+  }
+
+  private clearPendingConfigOptionValue(configId: string): void {
+    delete this.pendingConfigOptionValues[configId];
+  }
+
   private getSessionStartMeta(forkSessionTurnId?: string) {
     const clientIdentifier = this.getGrokClientIdentifier();
+    const sessionConfigOptionValues = this.sessionStartConfigOptionValues();
     const lody = {
       ...(forkSessionTurnId !== undefined
         ? { forkAtTurn: { version: 1 as const, turnId: forkSessionTurnId } }
         : {}),
-      ...(Object.keys(this.configOptionValues).length > 0
+      ...(Object.keys(sessionConfigOptionValues).length > 0
         ? {
             sessionConfig: {
               version: 1 as const,
-              configOptionValues: { ...this.configOptionValues },
+              configOptionValues: sessionConfigOptionValues,
             },
           }
         : {}),
@@ -2533,11 +2562,17 @@ export class AgentClient implements acp.Client {
       // option (e.g. `agent`); drop it again here. See BC doc entry
       // BC-2026-06-24-ACP-CONFIG-OPTION-AGENT-FILTERED.
       this.applyConfigOptionsState(result.configOptions, true);
+      if (result.configOptions.length === 0) {
+        this.clearPendingConfigOptionValues();
+      } else {
+        this.clearPendingConfigOptionValue(configId);
+      }
     } else if (result) {
       // Older agents may acknowledge the request without returning the full
       // snapshot. Keep replacement startup and runtime projection on the same
       // accepted value for any matching option the agent already advertised.
       this.retainLegacyConfigOptionValue(configId, value);
+      this.clearPendingConfigOptionValue(configId);
     }
 
     this.logger.debug(

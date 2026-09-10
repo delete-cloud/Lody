@@ -42,7 +42,7 @@ describe('session bootstrap helpers', () => {
           agentType: 'codex',
           modeId: 'safe',
           modelId: 'default',
-          configOptionValues: { reasoning: 'high' },
+          configOptionValues: { reasoning: 'high', model: 'default' },
           issuePRMentions: [
             {
               type: 'issue',

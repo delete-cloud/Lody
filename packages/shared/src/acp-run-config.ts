@@ -23,6 +23,9 @@ export const ACP_COLLABORATION_MODE_CONFIG_ID = 'collaboration_mode';
 export const ACP_COLLABORATION_MODE_DEFAULT_VALUE = 'default';
 export const ACP_COLLABORATION_MODE_PLAN_VALUE = 'plan';
 
+/** Conventional ACP config option id for the dedicated model selector. */
+export const ACP_MODEL_CONFIG_ID = 'model';
+
 /** Legacy config option id that carries reasoning effort without a category. */
 export const ACP_REASONING_EFFORT_CONFIG_ID = 'reasoning_effort';
 
@@ -140,6 +143,27 @@ export const hasAgentRunConfigSelection = (
     selection.reasoningEffort !== undefined ||
     selection.fastMode !== undefined ||
     selection.planMode !== undefined);
+
+/**
+ * Carries a dedicated `modelId` into ACP `configOptionValues` so newSession
+ * `_meta.lody.sessionConfig` sees the same selection applyAcpSessionRunConfig
+ * will set after the session exists. Does not overwrite an existing model key.
+ */
+export const withSelectedModelConfigOptionValue = (
+  configOptionValues: Record<string, AcpConfigOptionValue> | undefined,
+  modelId: string | null | undefined
+): Record<string, AcpConfigOptionValue> | undefined => {
+  const selectedModelId = modelId?.trim();
+  if (!selectedModelId) {
+    return configOptionValues && Object.keys(configOptionValues).length > 0
+      ? configOptionValues
+      : undefined;
+  }
+  if (configOptionValues?.[ACP_MODEL_CONFIG_ID] !== undefined) {
+    return configOptionValues;
+  }
+  return { ...configOptionValues, [ACP_MODEL_CONFIG_ID]: selectedModelId };
+};
 
 const findConfigOption = (
   capability: RunConfigCapabilitySource | undefined,

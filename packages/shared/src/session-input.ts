@@ -11,6 +11,7 @@ import type {
   VisualAnnotationReferencePayload,
 } from './ai';
 import { isSessionFileSourcePath } from './ai';
+import { withSelectedModelConfigOptionValue } from './acp-run-config';
 import type { SessionHistoryInput } from './schema';
 import type { McpServerId } from './ids';
 import { reanchorMessageTextSpansForTrim, sanitizeMessageTextSpans } from './message-text-spans';
@@ -545,6 +546,11 @@ export const buildSessionTurnInputConfig = (args: {
   prompt?: string;
 }): ACPSessionConfig => {
   const normalizedInputBlocks = normalizeSessionInputBlocks(args.inputBlocks, '');
+  const modelId = args.modelId ?? undefined;
+  const configOptionValues = withSelectedModelConfigOptionValue(
+    args.configOptionValues ?? undefined,
+    modelId
+  );
 
   return {
     prompt: args.prompt ?? extractPromptPreviewFromInputBlocks(normalizedInputBlocks),
@@ -552,11 +558,8 @@ export const buildSessionTurnInputConfig = (args: {
     cliType: args.cliType,
     agentType: args.agentType,
     modeId: args.modeId ?? undefined,
-    modelId: args.modelId ?? undefined,
-    configOptionValues:
-      args.configOptionValues && Object.keys(args.configOptionValues).length > 0
-        ? args.configOptionValues
-        : undefined,
+    modelId,
+    configOptionValues,
     mcpServerIds: args.mcpServerIds ? [...args.mcpServerIds] : undefined,
     ...(args.taskToolsEnabled !== undefined
       ? { taskToolsEnabled: args.taskToolsEnabled === true }

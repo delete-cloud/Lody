@@ -35,6 +35,7 @@ import {
   getMachineFlockDocId,
   getSessionRoomId,
   normalizeSessionPreparationRunConfigForDedup,
+  withSelectedModelConfigOptionValue,
   isLoroRepoDocDeleted,
   type SessionLaunchConfig,
   type SessionMeta,
@@ -914,7 +915,10 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       agentConfigId: spec.agentConfigId as AgentConfigId,
       agentCliType: spec.cliType,
       agentType: spec.agentType,
-      configOptionValues: spec.runConfig?.configOptionValues,
+      configOptionValues: withSelectedModelConfigOptionValue(
+        spec.runConfig?.configOptionValues,
+        spec.runConfig?.modelId
+      ),
       mcpServerIds: spec.runConfig?.mcpServerIds ?? [],
       taskToolsEnabled: spec.runConfig?.taskToolsEnabled === true,
       customAcp: agentConfig.customAcp,

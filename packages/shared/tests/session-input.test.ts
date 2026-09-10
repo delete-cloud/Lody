@@ -631,6 +631,24 @@ describe('session-input helpers', () => {
     });
   });
 
+  it('copies a dedicated modelId into the create payload configOptionValues', () => {
+    expect(
+      buildSessionTurnInputConfig({
+        inputBlocks: [{ type: 'text', text: 'run this' }],
+        cliType: 'builtin',
+        agentType: 'deepseek',
+        modelId: 'deepseek-v4-pro',
+        configOptionValues: { reasoning_effort: 'max' },
+      })
+    ).toMatchObject({
+      modelId: 'deepseek-v4-pro',
+      configOptionValues: {
+        reasoning_effort: 'max',
+        model: 'deepseek-v4-pro',
+      },
+    });
+  });
+
   it('builds an initial session input config only for valid prompt and cli type', () => {
     expect(
       buildInitialSessionTurnInputConfig({
