@@ -381,9 +381,9 @@ describe('AgentClient session preparation gate', () => {
           category: 'model',
           type: 'select',
           name: 'Model',
-          currentValue: 'deepseek-chat',
+          currentValue: 'deepseek-flash',
           options: [
-            { value: 'deepseek-chat', name: 'DeepSeek Chat' },
+            { value: 'deepseek-flash', name: 'DeepSeek Flash' },
             { value: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
           ],
         },
@@ -409,7 +409,7 @@ describe('AgentClient session preparation gate', () => {
 
     await client.startSession({} as never, '/workdir');
 
-    expect(client.currentModel?.modelId).toBe('deepseek-chat');
+    expect(client.currentModel?.modelId).toBe('deepseek-flash');
 
     connectionMocks.newSession.mockResolvedValueOnce({ sessionId: 'acp-session-2' });
     await client.prepareReplacementSession();
@@ -435,7 +435,7 @@ describe('AgentClient session preparation gate', () => {
           name: 'Model',
           currentValue: 'deepseek-v4-pro',
           options: [
-            { value: 'deepseek-chat', name: 'DeepSeek Chat' },
+            { value: 'deepseek-flash', name: 'DeepSeek Flash' },
             { value: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
           ],
         },
@@ -496,9 +496,9 @@ describe('AgentClient session preparation gate', () => {
           category: 'model',
           type: 'select',
           name: 'Model',
-          currentValue: 'deepseek-chat',
+          currentValue: 'deepseek-flash',
           options: [
-            { value: 'deepseek-chat', name: 'DeepSeek Chat' },
+            { value: 'deepseek-flash', name: 'DeepSeek Flash' },
             { value: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
           ],
         },
@@ -523,9 +523,9 @@ describe('AgentClient session preparation gate', () => {
             category: 'model',
             type: 'select',
             name: 'Model',
-            currentValue: 'deepseek-chat',
+            currentValue: 'deepseek-flash',
             options: [
-              { value: 'deepseek-chat', name: 'DeepSeek Chat' },
+              { value: 'deepseek-flash', name: 'DeepSeek Flash' },
               { value: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
             ],
           },
@@ -543,7 +543,7 @@ describe('AgentClient session preparation gate', () => {
     });
 
     await client.startSession({} as never, '/workdir');
-    expect(client.currentModel?.modelId).toBe('deepseek-chat');
+    expect(client.currentModel?.modelId).toBe('deepseek-flash');
 
     await applyAcpSessionRunConfig({
       session: {
@@ -554,7 +554,7 @@ describe('AgentClient session preparation gate', () => {
       config: { modeId: 'plan', modelId: 'deepseek-v4-pro' },
       logger: createLogger(),
     });
-    expect(client.currentModel?.modelId).toBe('deepseek-chat');
+    expect(client.currentModel?.modelId).toBe('deepseek-flash');
 
     connectionMocks.newSession.mockResolvedValueOnce({ sessionId: 'acp-session-2' });
     await client.prepareReplacementSession();
@@ -583,9 +583,9 @@ describe('AgentClient session preparation gate', () => {
           category: 'model',
           type: 'select',
           name: 'Model',
-          currentValue: 'deepseek-chat',
+          currentValue: 'deepseek-flash',
           options: [
-            { value: 'deepseek-chat', name: 'DeepSeek Chat' },
+            { value: 'deepseek-flash', name: 'DeepSeek Flash' },
             { value: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
           ],
         },
@@ -603,7 +603,7 @@ describe('AgentClient session preparation gate', () => {
 
     await client.startSession({} as never, '/workdir', 'stored-deepseek-session' as never);
 
-    expect(client.currentModel?.modelId).toBe('deepseek-chat');
+    expect(client.currentModel?.modelId).toBe('deepseek-flash');
 
     connectionMocks.newSession.mockResolvedValueOnce({ sessionId: 'acp-session-2' });
     await client.prepareReplacementSession();

@@ -365,9 +365,9 @@ describe('agent run config selection', () => {
       model: 'deepseek-v4-pro',
     });
     expect(
-      withSelectedModelConfigOptionValue({ model: 'deepseek-chat' }, 'deepseek-v4-pro')
+      withSelectedModelConfigOptionValue({ model: 'deepseek-flash' }, 'deepseek-v4-pro')
     ).toEqual({
-      model: 'deepseek-chat',
+      model: 'deepseek-flash',
     });
     expect(withSelectedModelConfigOptionValue({ reasoning_effort: 'max' }, '  ')).toEqual({
       reasoning_effort: 'max',

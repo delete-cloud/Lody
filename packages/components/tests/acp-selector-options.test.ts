@@ -658,7 +658,7 @@ describe('buildAcpSelectorOptions', () => {
           provenance: 'runtime',
           modes: [],
           models: [
-            { modelId: 'deepseek-chat', name: 'DeepSeek Chat' },
+            { modelId: 'deepseek-flash', name: 'DeepSeek Flash' },
             { modelId: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
           ],
           configOptions: [],
@@ -669,7 +669,7 @@ describe('buildAcpSelectorOptions', () => {
 
     expect(options.capabilityAuthority).toBe('authoritative');
     expect(options.modelOptions.map((option) => option.value)).toEqual([
-      'deepseek-chat',
+      'deepseek-flash',
       'deepseek-v4-pro',
     ]);
     expect(options.defaultModelId).toBe('deepseek-v4-pro');
@@ -694,9 +694,9 @@ describe('buildAcpSelectorOptions', () => {
               name: 'Model',
               category: 'model',
               type: 'select',
-              currentValue: 'deepseek-chat',
+              currentValue: 'deepseek-flash',
               options: [
-                { value: 'deepseek-chat', name: 'DeepSeek Chat' },
+                { value: 'deepseek-flash', name: 'DeepSeek Flash' },
                 { value: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
               ],
             },
@@ -708,7 +708,7 @@ describe('buildAcpSelectorOptions', () => {
 
     expect(options.capabilityAuthority).toBe('authoritative');
     expect(options.modelOptions.map((option) => option.value)).toEqual([
-      'deepseek-chat',
+      'deepseek-flash',
       'deepseek-v4-pro',
     ]);
     expect(options.defaultModelId).toBe('deepseek-v4-pro');
@@ -727,8 +727,8 @@ describe('buildAcpSelectorOptions', () => {
           provenance: 'runtime',
           modes: [],
           models: [
-            { modelId: 'deepseek-chat', name: 'DeepSeek Chat' },
-            { modelId: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
+            { modelId: 'deepseek-flash', name: 'DeepSeek Flash' },
+            { modelId: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash' },
           ],
           configOptions: [],
           fetchedAt: 1,
@@ -737,10 +737,10 @@ describe('buildAcpSelectorOptions', () => {
     });
 
     expect(options.modelOptions.map((option) => option.value)).toEqual([
-      'deepseek-chat',
-      'deepseek-reasoner',
+      'deepseek-flash',
+      'deepseek-v4-flash',
     ]);
-    expect(options.defaultModelId).toBe('deepseek-chat');
+    expect(options.defaultModelId).toBe('deepseek-flash');
   });
 
   it('exposes static builtin selectors for title-generation settings', () => {
