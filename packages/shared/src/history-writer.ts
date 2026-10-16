@@ -1,4 +1,5 @@
 import { Immer } from 'immer';
+import { sessionHistoryUserTurnId } from './session-history-order';
 import { isContainer, LoroMap, type LoroDoc, type LoroList } from 'loro-crdt';
 import { z } from 'zod';
 import type { SessionHistory, SessionHistoryInput } from './schema';
@@ -508,31 +509,38 @@ export function createHistoryWriter(doc: LoroDoc, readHistory?: () => readonly S
       return list.toJSON() as SessionHistoryInput[];
     },
     repairTurnOrder(userTurnId) {
-      const user = locate(userTurnId);
-      if (!user || (user.map?.get('role') ?? user.inline?.role) !== 'user') return 'waiting';
+      let userIndex = -1;
+      for (let index = 0; index < list.length; index++) {
+        const value = list.get(index);
+        if (
+          storedScalar(storedField(value, 'id')) === userTurnId &&
+          storedScalar(storedField(value, 'role')) === 'user'
+        ) {
+          userIndex = index;
+          break;
+        }
+      }
+      if (userIndex < 0) return 'waiting';
       const inverted: Array<{ map?: LoroMap; inline?: Record<string, unknown>; index: number }> =
         [];
-      for (let index = 0; index < user.index; index++) {
+      for (let index = 0; index < userIndex; index++) {
         const value = list.get(index);
         const map = isContainer(value) && value.kind() === 'Map' ? (value as LoroMap) : undefined;
         const inline = !isContainer(value) && record(value) ? value : undefined;
         if (!map && !inline) continue;
-        const field = (key: string) => (map ? map.get(key) : inline?.[key]);
+        const field = (key: string) => storedScalar(map ? map.get(key) : inline?.[key]);
         if (field('role') === 'user') continue;
-        const associated = field('userTurnId');
         if (
-          associated !== userTurnId &&
-          !(
-            associated == null &&
-            field('role') === 'assistant' &&
-            field('id') === `assistant:${userTurnId}`
-          )
+          sessionHistoryUserTurnId({
+            id: storedScalar(field('id')),
+            role: field('role'),
+            userTurnId: field('userTurnId'),
+          }) !== userTurnId
         )
           continue;
         const items = field('items');
         const storedItems = isContainer(items) ? items.toJSON() : items;
         if (
-          field('finished') !== true &&
           Array.isArray(storedItems) &&
           storedItems.some(
             (item) =>
@@ -547,9 +555,9 @@ export function createHistoryWriter(doc: LoroDoc, readHistory?: () => readonly S
       }
       if (inverted.length === 0) return 'unchanged';
       inverted.forEach(({ map, inline }, offset) => {
-        if (map) list.insertContainer(user.index + 1 + offset, map);
+        if (map) list.insertContainer(userIndex + 1 + offset, map);
         else if (inline)
-          list.insert(user.index + 1 + offset, inline as Parameters<LoroList['insert']>[1]);
+          list.insert(userIndex + 1 + offset, inline as Parameters<LoroList['insert']>[1]);
       });
       for (const { index } of inverted.reverse()) list.delete(index, 1);
       doc.commit();

@@ -490,11 +490,15 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
         // eligibility/goal re-check and the write are one atomic step.
         restoreRange = writer.updateWithRollback((turns) => {
           const next = planEditableTailReplacement(
-            turns as unknown as readonly SessionTurn[],
+            orderSessionHistory(turns) as unknown as readonly SessionTurn[],
             input
           );
           plan = next;
-          return next.turns as unknown as SessionHistoryInput[];
+          const retained = new Set(next.turns.slice(0, -1));
+          return [
+            ...turns.filter((row) => retained.has(row as unknown as SessionTurn)),
+            input.replacement as unknown as SessionHistoryInput,
+          ];
         });
       } catch (error) {
         // A domain refusal proves nothing was written; a `HistoryWriteError` is a

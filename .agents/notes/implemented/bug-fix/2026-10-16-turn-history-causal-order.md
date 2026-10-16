@@ -7,138 +7,129 @@ Translation: current
 
 ## Abstract
 
-An RPC turn can produce reply, notice or upload rows before the user entry reaches
-the executor. The 20-second gate timeout makes their list insertions concurrent,
-so the converged list can place the reply before its prompt. The executing CLI
-now arms document-owned late-user repair when creating the gate, and
-shared readers project causal order for historical inversions. Repair retains
-user containers and defers assistant relocation while a live permission response
-is pending; output remains available and readers show causal order meanwhile.
+RPC output can precede its late user row after the bounded history gate releases.
+The executor arms document-owned repair at gate creation, and shared readers
+project causal order for historical inversions. Repair retains user containers and
+waits for every unresolved permission outcome, including on finished entries,
+because copying an assistant would retire the remote response target. Unresolved
+permissions may leave storage inverted indefinitely; reads remain causal.
 
 ## Evidence and decision
 
-At upstream `8bda5ae33f97fae84e388cb57d6d3ec92566b1f5`, timeout opens the gate and
-unsubscribes permanently. The owning MessageHandler suite reproduces the bad
-merge with real LoroRepo/SessionDocument and a second real Loro replica, assigning
-client peer 2 and executor peer 1. It asserts the raw inverted client list before
-repair and both raw lists after repair and repeated synchronization. Timers are
-fake; replica imports are explicit. The rebased repository pins Loro 1.16.3, matching the reported production
-reproduction. This is local validation, not deployed-client acceptance.
+The base is `8bda5ae33f97fae84e388cb57d6d3ec92566b1f5`, with Loro 1.16.3.
+Real MessageHandler, LoroRepo, SessionDocument and two in-memory replicas reproduce
+the concurrent ordering with executor peer 1 and client peer 2. Gate waits are
+fake-timed and imports explicit. Tests assert the raw inverted list before repair,
+read order immediately, and convergence of both raw lists after repair.
 
-Gate creation arms SessionDocument repair before waiting or creating output.
-Timeout-only arming missed writers released by disposal, including turn replacement.
-Document ownership matters: finalization and turn restart dispose the gate before
-a delayed user might arrive. Only the executing turn arms repair, avoiding
-uncoordinated migrations by every reader. Pending ids share one coalesced
-microtask subscription; the identity index skips repair scans while a user is absent. User arrival plus safe relocation removes an id; document
-destruction releases the subscription. Pending permission resolution and assistant
-finalization also trigger rechecks, independently of turn teardown.
+Gate creation arms repair before any output. Timeout, gate disposal and turn
+replacement release writers without dropping document-owned repair. Failure and
+warning notices capture `userTurnId` before awaits; active-turn file/image fallbacks
+retain their captured owner through upload and gate release. The writer relocates
+associated non-user rows only. User and unrelated rows retain relative order.
+Both repair and projection anchor on the first actual user copy, so a legitimate
+assistant between duplicate user rows stays in place; ordinary targeted lookup
+still selects the last matching identity.
 
-HistoryWriter remains the only history author. Its scoped repair clones inverted
-associated non-user rows after their user and removes their old list occurrences
-in one commit. Copying preserves opaque fields and content, including legacy inline rows.
-Relocated attached containers get new ids; user containers are retained.
-User containers are retained, so a concurrent user status/configuration edit still
-merges into the original row. CLI streaming binds ownership by entry id at enqueue
-and resolves the current container on each write; tests cover chunks before and
-after relocation and turn restart. This relies on existing single-executor ownership.
+`HistoryWriter` copies inverted attached non-user containers after that anchor and
+deletes their old occurrences in one commit, preserving opaque stored fields.
+Copies receive new container ids. The user container retains its identity and
+concurrent status/configuration edits. Streaming producers resolve by entry id on
+every write; tests cover continued streaming and restart after relocation.
 
-Renderer permission responses are a remote writer inside assistant rows. A live
-assistant with an unresolved permission therefore cannot be copied yet. The repair
-waits for the response or terminal assistant state; read ordering applies immediately.
-This preserves the live permission target and copies its accepted outcome. Responses
-to an already finished turn do not authorize more agent execution.
+Finished entries still accept a previously missing permission outcome. A two-replica
+regression holds the original assistant container while its outcome is absent,
+commits the decision on the peer after the attempted repair, and verifies that
+repair then copies the accepted decision and both replicas converge. `finished`
+never releases this guard. Explicit null also defers conservatively, although the
+current single-assignment responder rejects an already present null outcome.
+No response is treated as renewed authorization to execute a finished turn.
 
-`orderSessionHistory` relocates inverted associated non-user rows without mutation.
-Failure/warning notices capture the current user id before any await. Active-turn
-file/image fallbacks retain their captured upload owner across async transfer and
-gate release. User rows and unassociated system rows are never relocation targets.
-It preserves user order and unrelated entries. The shared Loro SessionData
-reader feeds CLI/MCP history and export, plus the renderer ConversationView.
-Directory and positional reads share a shallow canonical index rebuilt on
-structure/id/role/association changes; content-only notifications keep exact ids.
-`readAll` returns canonical order, while writer captures retain raw storage order.
-Invalid legacy slots remain present and cannot crash ordering.
-SessionDocument uses its composed SessionData writer and history observation;
-the control Mirror and useSessionDoc never materialize history. Already ordered histories retain array identity. Explicit
-userTurnId wins over the assistant-only id fallback. Unassociated historical
-notices/files cannot be causally reconstructed and remain in their stored order.
+One association helper serves repair, projection and selected turn output. A
+string `userTurnId` wins; otherwise only `assistant:<userTurnId>` supplies a legacy
+fallback, including malformed non-string associations. User rows never associate
+as executor output. Directory/positional/full reads share causal order without
+rewriting storage; CLI/MCP export and renderer ConversationView consume it.
 
-This extends the [single writer decision](../architecture/2026-09-07-single-history-writer.md)
-with a repair command; arbitrary callback reordering remains forbidden.
+Editable-tail planning now uses the same projected order as eligibility checks.
+It translates retained row references back to their stored positions instead of
+reordering the raw prefix. Conditional rollback restores the original stored order;
+interleaved retained rows remain subject to its conservative changed-range conflict
+check. Import commit hashes already used raw storage, but CLI conflict prechecks
+used projected reads: both prechecks now use the existing storage snapshot surface.
+Cursor baselines remain raw; hashes and storage formats do not change. Complete
+import replacements that reorder retained stored identities still follow the
+writer's existing `unsupported_reorder` refusal; this correction does not relax it.
+
+The repair watcher subscribes directly to its composed Loro document, without an
+unused initial directory. It retries on structure, identity, item structure and
+permission changes, skipping ordinary streamed text. Pending ids share a coalesced
+microtask; the identity index skips absent users. Recomposition drops subscriptions,
+pending ids and obsolete queued work; Roost does not arm this Loro-only repair.
+
 Contract: [history writes](../../../../specs/session-history-writes.md).
+This extends the [single writer decision](../architecture/2026-09-07-single-history-writer.md).
 
-## Alternatives and limits
+## Alternatives and remaining limits
 
-- Keeping only the gate subscription fails once turn teardown disposes the gate.
-- Read ordering alone heals old views but leaves the durable list inverted.
-- Moving the user is rejected: LoroList copies attached containers. A deterministic
-  two-replica experiment showed a concurrent canceled status lost when that user
-  map was replaced. User rows also receive renderer status/configuration writes.
-- Moving an assistant with an unresolved live permission has the same response-loss
-  problem. Deferring only that structural operation retains the remote response target.
-- Holding output until an uplink recovers removes bounded degradation.
-- Changing history to a movable list requires a cross-version storage migration.
+- Timeout-only subscriptions miss dispose-before-open and restart paths.
+- Read ordering alone does not repair durable order, but safely covers historical
+  sessions and permissions whose outcomes never arrive.
+- Moving a user loses concurrent edits because attached LoroList containers copy.
+  Moving a finished assistant with an unresolved permission has the same hazard.
+- Waiting forever at the gate would remove bounded degradation; only relocation waits.
+- A movable-list migration could retain relocated container identity across peers,
+  but requires a cross-version storage change and is outside this correction.
 
-Relocated attached non-user containers receive new ids; supported producers must
-continue resolving by entry id. Arbitrary remote edits to retired assistant
-containers are outside single-executor ownership; live permissions are the known
-exception handled here. Multiple concurrent executors remain outside that contract.
-A closed document loses pending repair registrations. Reopening still reads in
-causal order but does not migrate storage; historical storage is not rewritten by
-readers. No deployed MCP/CLI binary or Android acceptance is claimed.
+No cheap guard proves that an arbitrary peer will never write into a retired
+non-user subtree. Permission responses are protected; other stale remote subtree
+edits and inserts anchored to retired rows remain unverified. Single-executor
+streaming resolves current entries by id. Broader remote mutation safety needs a
+storage/identity design rather than assuming `finished` means immutable.
+
+The insert/delete repair is not an abortable transaction in Loro 1.16.3. Unexpected
+native exceptions partway through mutation can leave pending partial operations;
+a temporary fault-injection probe confirms that a later unrelated commit flushes
+the partial copy. The probe is removed after execution. This follow-up does not
+claim exception-atomic repair. Fork/import staging is
+rejected because local transports upload local events only; full-document revert
+would introduce unrelated compensation writes. An exception-safe move remains deferred.
+Retries still scan on relevant structural/permission events. An id with no actual
+user row (even if a non-user shares its id) stays pending until arrival or document
+disposal. Closing/recomposing drops registrations; reopening projects order but
+does not migrate historical storage. Unassociated historical notices/files cannot
+be reconstructed from timestamps. No deployed-client acceptance is claimed.
 
 ## Verification
 
-Focused tests cover gate timeout, late import after turn cleanup, real two-replica
-convergence, user identity and concurrent edits, streamed content before/after
-repair, repeated imports, turn reuse, pending permission response/finalization,
-opaque stored fields, associated notices/files, disposal-before-open, replacement
-during upload, historical CLI/MCP/export projection, and the renderer's
-shipped windowed ConversationView and streaming update path. The removed
-accepted-history projection implementation is not restored. The gate and repair
-remain in their existing document/Promise lifetime; migrating the broader backend
-and turn lifecycle to Effect is outside this correction. Tests do not replace
-independent Review.
+Before the fixes, the new shared regressions produced six failures covering
+finished permissions, duplicate users, malformed association fallback, selected
+legacy output and two inverted-tail shapes. Two real import-writer regressions
+also failed on the projected/raw baseline split. These executed failures establish
+remove-fix sensitivity; the final focused commands and results are recorded below.
 
-Correction: the original implementation used a stale base. It is rebased onto
-`8bda5ae33f97fae84e388cb57d6d3ec92566b1f5`; current SessionData composition,
-backend subscriptions, and windowed renderer boundaries replace the old full
-Mirror/getHistory interfaces. A subsequent review correction extends repair to notices/upload fallbacks and
-arms it at creation; permission deferral and bounded gate waits remain. Verification below is rerun on this base; prior
-full-workspace check results do not establish the rebased result.
+Independent review is arranged by the host; these checks do not constitute that review.
 
-Environment: Node 22.23.2 and pnpm 10.20.0. Installation and adapter preparation
-preceded this follow-up; final focused verification uses the commands below:
+Environment: Node 22.23.2, pnpm 10.20.0. No dependencies or submodule pins changed.
 
 ```sh
-corepack pnpm install --frozen-lockfile
-corepack pnpm --filter lody prepare:acp-adapters
-TMPDIR="$PWD/.turn-order-followup-tmp" corepack pnpm --filter lody exec vitest run tests/message-handler-turn-history-gate.test.ts src/session/turn-history-gate.test.ts tests/session-history-targeted-write.test.ts src/session/session-backend.test.ts src/lib/session-export/formatters.test.ts tests/message-handler-image-upload.test.ts --maxWorkers=2
+TMPDIR="$PWD/.turn-order-followup-tmp" corepack pnpm --filter lody exec vitest run tests/message-handler-turn-history-gate.test.ts src/session/turn-history-gate.test.ts tests/session-history-targeted-write.test.ts src/session/session-backend.test.ts src/lib/session-export/formatters.test.ts tests/message-handler-image-upload.test.ts tests/local-project-history-sync-writer.test.ts tests/local-project-history-sync-service.test.ts src/session/session-edit-and-resend-service.test.ts --maxWorkers=2
 corepack pnpm --filter @lody/shared exec vitest run tests/history-writer.test.ts tests/session-doc-forward-compat.test.ts tests/session-data-review-boundaries.test.ts tests/session-history-import-port.test.ts tests/session-history-actions.test.ts --maxWorkers=2
 corepack pnpm --filter @lody/components exec vitest run tests/conversation-view-from-reader.test.ts tests/use-session-doc-open.test.tsx tests/latest-frame-subscription.test.ts tests/no-materialized-history-in-components.test.ts --maxWorkers=2
+TMPDIR="$PWD/.turn-order-followup-tmp" corepack pnpm --filter lody exec vitest run tests/message-handler-turn-history-gate.test.ts src/session/turn-history-gate.test.ts --maxWorkers=2
 corepack pnpm --filter lody typecheck
 corepack pnpm --filter @lody/shared typecheck
 corepack pnpm --filter @lody/components typecheck
 corepack pnpm check:local-loro-writer-boundary
 corepack pnpm run docs status
 corepack pnpm run docs check
+corepack pnpm exec oxlint --type-aware --quiet apps/cli/src/lib/local-project-history-sync-service.ts apps/cli/src/lib/loro/doc.ts apps/cli/src/session/turn-history-gate.ts apps/cli/tests/local-project-history-sync-writer.test.ts apps/cli/tests/message-handler-turn-history-gate.test.ts packages/shared/src/history-writer.ts packages/shared/src/session-data/loro.ts packages/shared/src/session-data/read.ts packages/shared/src/session-history-order.ts packages/shared/tests/history-writer.test.ts packages/shared/tests/session-data-review-boundaries.test.ts
+corepack pnpm exec oxfmt --check .agents/notes/implemented/bug-fix/2026-10-16-turn-history-causal-order.md .agents/notes/implemented/bug-fix/2026-10-16-turn-history-causal-order.zh.md apps/cli/src/lib/local-project-history-sync-service.ts apps/cli/src/lib/loro/doc.ts apps/cli/src/session/turn-history-gate.ts apps/cli/tests/local-project-history-sync-writer.test.ts apps/cli/tests/message-handler-turn-history-gate.test.ts packages/shared/src/history-writer.ts packages/shared/src/session-data/AGENTS.md packages/shared/src/session-data/loro.ts packages/shared/src/session-data/read.ts packages/shared/src/session-history-order.ts packages/shared/tests/history-writer.test.ts packages/shared/tests/session-data-review-boundaries.test.ts specs/session-history-writes.md specs/session-history-writes.zh.md
 ```
 
-Focused CLI/shared/renderer results: 78/100/41 tests passed. All three package
-typechecks passed. The image-upload suite retains the existing upload behavior;
-the real MessageHandler/two-replica regression stubs only transfer/validation and
-the failed active-turn append to force the file fallback. It asserts the captured
-association, raw inversion, reader order before repair, both converged raw lists,
-payload retention, user container identity and continued streaming/restart.
-The renderer regression extends its existing windowed reader suite.
-
-Remove-fix checks were executed and restored in `finally`: timeout-only arming
-fails the dispose-before-open regression (1 failed); removing notice/file
-association fails both producer regressions (2 failed); assistant-only repair/read
-ordering fails system, inline notice and projection regressions (3 failed).
-Per-observer prior order retains the earlier shifted-prefix regression.
-Scoped type-aware Oxlint reports 348 warnings and zero errors. Oxfmt checks all
-PR-changed files; documentation checking reports zero errors. Full `pnpm check`
-was not rerun for this follow-up. No deployed-client acceptance or independent
-passing review of this correction is claimed.
+CLI: 9 suites, 168 tests; shared: 5 suites, 106 tests; components: 4 suites, 41 tests.
+All passed; the final gate rerun passes 2 suites / 36 tests. All three package
+typechecks and the local-writer boundary check pass. Scoped type-aware Oxlint has
+164 warnings and zero errors. Oxfmt checks 16 changed files; docs check has zero
+errors with existing repository warnings. Full `pnpm check` was not rerun. No
+partners were dispatched; host-owned independent review remains separate.

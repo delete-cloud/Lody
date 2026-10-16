@@ -786,9 +786,9 @@ describe('single history writer', () => {
     expect(writer.repairTurnOrder('late')).toBe('unchanged');
   });
 
-  it.each(['response', 'finalization'] as const)(
-    'defers assistant relocation until permission %s',
-    (release) => {
+  it.each([false, true])(
+    'defers unresolved permission relocation even when finished=%s',
+    (finished) => {
       const doc = new Loro();
       const mirror = open(doc);
       const assistantId = 'assistant:late';
@@ -796,6 +796,7 @@ describe('single history writer', () => {
         ...entry(assistantId),
         role: 'assistant',
         userTurnId: 'late',
+        finished,
         items: [
           {
             type: 'tool_call',
@@ -815,15 +816,17 @@ describe('single history writer', () => {
       const version = doc.version().toJSON();
       expect(mirror.historyWriter.repairTurnOrder('late')).toBe('waiting');
       expect(doc.version().toJSON()).toEqual(version);
-      if (release === 'response') {
+      expect(orderSessionHistory(mirror.historyWriter.readStored()).map((row) => row.id)).toEqual([
+        'late',
+        assistantId,
+      ]);
+      expect(
         peerMirror.historyWriter.respondPermission('request', {
           outcome: 'selected',
           optionId: 'allow',
-        });
-        doc.import(peer.export({ mode: 'snapshot' }));
-      } else {
-        mirror.historyWriter.setField(assistantId, 'finished', true);
-      }
+        })
+      ).toBe(true);
+      doc.import(peer.export({ mode: 'snapshot' }));
       expect(mirror.historyWriter.repairTurnOrder('late')).toBe('repaired');
       mirror.historyWriter.updateEntry(assistantId, (value) => ({
         ...value,
@@ -837,14 +840,73 @@ describe('single history writer', () => {
           .toJSON()
           .map((row: { id: string }) => row.id)
       ).toEqual(['late', assistantId]);
-      if (release === 'response')
-        expect(mirror.historyWriter.read(assistantId)?.items[0]).toMatchObject({
+      for (const writer of [mirror.historyWriter, peerMirror.historyWriter]) {
+        expect(writer.read(assistantId)?.items[0]).toMatchObject({
           permissionRequest: { outcome: { outcome: 'selected', optionId: 'allow' } },
         });
+      }
       peerMirror.dispose();
       mirror.dispose();
     }
   );
+
+  it('keeps a finalized legacy null permission target attached indefinitely', () => {
+    const doc = new Loro();
+    const writer = open(doc).historyWriter;
+    writer.append({ ...entry('assistant:u'), role: 'assistant', finished: true, items: [] });
+    const assistant = doc.getList('history').get(0) as LoroMap;
+    assistant.set('items', [
+      {
+        type: 'tool_call',
+        toolCallId: 'tool',
+        permissionRequest: { requestId: 'request', options: [], outcome: null },
+      },
+    ]);
+    doc.commit();
+    writer.append(entry('u'));
+    const version = doc.version().toJSON();
+    expect(writer.repairTurnOrder('u')).toBe('waiting');
+    expect(writer.repairTurnOrder('u')).toBe('waiting');
+    expect((doc.getList('history').get(0) as LoroMap).id).toBe(assistant.id);
+    expect(doc.version().toJSON()).toEqual(version);
+    expect(writer.respondPermission('request', { outcome: 'cancelled' })).toBe(false);
+    expect(orderSessionHistory(writer.readStored()).map((row) => row.id)).toEqual([
+      'u',
+      'assistant:u',
+    ]);
+  });
+
+  it('anchors repair and projection on the first user copy, without relocating user rows', () => {
+    const doc = new Loro();
+    const writer = open(doc).historyWriter;
+    const rows = [
+      entry('u'),
+      { ...entry('assistant:u'), role: 'assistant' as const, userTurnId: 'u' },
+      entry('u'),
+    ];
+    rows.forEach((row) => writer.append(row));
+    const version = doc.version().toJSON();
+    const stored = writer.readStored();
+    expect(orderSessionHistory(stored)).toBe(stored);
+    expect(writer.repairTurnOrder('u')).toBe('unchanged');
+    expect(doc.version().toJSON()).toEqual(version);
+    expect(writer.readStored()).toEqual(stored);
+  });
+
+  it('uses the assistant id fallback for malformed associations in repair and projection', () => {
+    const doc = new Loro();
+    const writer = open(doc).historyWriter;
+    writer.append({ ...entry('assistant:u'), role: 'assistant' });
+    (doc.getList('history').get(0) as LoroMap).set('userTurnId', 5);
+    doc.commit();
+    writer.append(entry('u'));
+    expect(orderSessionHistory(writer.readStored()).map((row) => row.id)).toEqual([
+      'u',
+      'assistant:u',
+    ]);
+    expect(writer.repairTurnOrder('u')).toBe('repaired');
+    expect(writer.readStored().map((row) => row.id)).toEqual(['u', 'assistant:u']);
+  });
 
   it('projects historical causal order without mutating or dropping unassociated entries', () => {
     const assistant = (assistantId: string, userTurnId?: string) => ({

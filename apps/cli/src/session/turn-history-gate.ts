@@ -25,8 +25,8 @@ import { formatErrorMessage } from '@/utils/format-error';
  * - The wait is bounded: timeout and disposal both release pending writers.
  *   The caller registers SessionDocument-owned repair when creating the gate,
  *   before any wait or release. Associated non-user rows then follow their user
- *   even after timeout, disposal or turn restart. Live permissions defer copying
- *   until the response arrives or the entry finishes. Repair copies relocated
+ *   even after timeout, disposal or turn restart. Any unresolved permission defers
+ *   copying until its outcome arrives, including on finished entries. Repair copies relocated
  *   containers; user containers retain their identity and concurrent edits.
  *   Shared read ordering also covers historical associated inversions.
  * - Metadata/status writes are NOT gated: they are map-keyed (no list-order

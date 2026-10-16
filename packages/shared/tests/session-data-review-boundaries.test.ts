@@ -315,3 +315,62 @@ it('invalidates the former causal prefix for every observer when an association 
   data.dispose();
   doc.free();
 });
+
+it('reads legacy assistant output through the same id fallback as history ordering', () => {
+  const doc = new LoroDoc(),
+    writer = createHistoryWriter(doc);
+  writer.append({ ...turn('assistant:u'), role: 'assistant' });
+  writer.append(turn('u'));
+  const data = createLoroSessionData({ doc, sessionId, writer });
+  expect(data.history.readTurnOutput('u').map((row) => row.id)).toEqual(['u', 'assistant:u']);
+  data.dispose();
+});
+
+it.each([false, true])(
+  'replaces an inverted editable tail and rolls back with interleaved prefix=%s',
+  async (interleaved) => {
+    const doc = new LoroDoc(),
+      writer = createHistoryWriter(doc);
+    const prefix = [
+      turn('previous'),
+      {
+        ...turn('assistant:previous'),
+        role: 'assistant' as const,
+        userTurnId: 'previous',
+        finished: true,
+        acpTurnId: 'boundary',
+      },
+    ];
+    const answer = {
+      ...turn('assistant:u'),
+      role: 'assistant' as const,
+      userTurnId: 'u',
+      finished: true,
+      acpTurnId: 'wrong-boundary',
+    };
+    const rows = interleaved ? [answer, ...prefix, turn('u')] : [...prefix, answer, turn('u')];
+    rows.forEach((row) => writer.append(row));
+    const before = writer.readStored();
+    const data = createLoroSessionData({ doc, sessionId, writer });
+    const result = await data.commands.replaceEditableTail({
+      expectedUserTurnId: 'u',
+      expectedForkTurnId: 'boundary',
+      replacement: turn('replacement'),
+    });
+    expect(result.status).toBe('accepted');
+    if (result.status !== 'accepted') throw new Error('Expected accepted replacement');
+    expect(writer.readStored().map((row) => row.id)).toEqual([
+      'previous',
+      'assistant:previous',
+      'replacement',
+    ]);
+    expect(data.history.readAll().map((row) => row.id)).toEqual([
+      'previous',
+      'assistant:previous',
+      'replacement',
+    ]);
+    await result.rollback();
+    expect(writer.readStored()).toEqual(before);
+    data.dispose();
+  }
+);

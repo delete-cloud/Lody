@@ -1970,6 +1970,7 @@ export class SessionDocument implements LoroDocument<Omit<SessionDocMeta, 'histo
   private readonly pendingTurnOrderRepairs = new Set<string>();
   private turnOrderRepairUnsubscribe: (() => void) | undefined;
   private turnOrderRepairScheduled = false;
+  private turnOrderRepairDoc: LoroDoc | undefined;
 
   get isDestroyed(): boolean {
     return this.destroyed;
@@ -2003,6 +2004,11 @@ export class SessionDocument implements LoroDocument<Omit<SessionDocMeta, 'histo
     initialState?: SessionDocInitialState,
     options: { historyBackend?: SessionHistoryBackendKind } = {}
   ): void {
+    this.turnOrderRepairUnsubscribe?.();
+    this.turnOrderRepairUnsubscribe = undefined;
+    this.pendingTurnOrderRepairs.clear();
+    this.turnOrderRepairScheduled = false;
+    this.turnOrderRepairDoc = undefined;
     this.modelSummary?.dispose();
     this.modelSummary = null;
     this.historyAutoReadHandle?.dispose();
@@ -2038,6 +2044,7 @@ export class SessionDocument implements LoroDocument<Omit<SessionDocMeta, 'histo
       }
       // Seed a brand-new document's history through the shared writer. A persisted
       // document already holds its history; the control Mirror never reads it.
+      this.turnOrderRepairDoc = doc;
       const writer = createHistoryWriter(doc);
       if (initialHistory.length > 0 && doc.getList('history').length === 0) {
         writer.update(() => initialHistory);
@@ -3044,17 +3051,20 @@ export class SessionDocument implements LoroDocument<Omit<SessionDocMeta, 'histo
   }
 
   watchTurnHistoryOrder(userTurnId: string): void {
-    if (!this.sessionDataInstance || this.destroyed) return;
+    const data = this.sessionDataInstance;
+    const doc = this.turnOrderRepairDoc;
+    if (!data || !doc || this.destroyed) return;
     this.pendingTurnOrderRepairs.add(userTurnId);
     const repair = () => {
       if (this.turnOrderRepairScheduled) return;
       this.turnOrderRepairScheduled = true;
       void Promise.resolve().then(() => {
+        if (this.sessionDataInstance !== data) return;
         try {
-          if (!this.sessionDataInstance || this.destroyed) return;
+          if (this.destroyed) return;
           for (const id of this.pendingTurnOrderRepairs) {
-            if (this.sessionDataInstance.history.readTurn(id).state === 'missing') continue;
-            if (this.sessionDataInstance.writer.repairTurnOrder(id) !== 'waiting') {
+            if (data.history.readTurn(id).state === 'missing') continue;
+            if (data.writer.repairTurnOrder(id) !== 'waiting') {
               this.pendingTurnOrderRepairs.delete(id);
             }
           }
@@ -3072,8 +3082,27 @@ export class SessionDocument implements LoroDocument<Omit<SessionDocMeta, 'histo
       });
     };
     if (!this.turnOrderRepairUnsubscribe) {
-      const observation = this.sessionDataInstance.history.observe(repair);
-      this.turnOrderRepairUnsubscribe = () => observation.unsubscribe();
+      this.turnOrderRepairUnsubscribe = doc.subscribe((batch) => {
+        if (
+          batch.events.some((event) => {
+            if (event.path[0] !== 'history') return false;
+            if (event.path.length === 1) return true;
+            const diff = event.diff;
+            if (
+              diff.type === 'map' &&
+              ['id', 'role', 'userTurnId', 'items', 'permissionRequest'].some((key) =>
+                Object.hasOwn(diff.updated, key)
+              )
+            )
+              return true;
+            return (
+              event.path.includes('permissionRequest') ||
+              (event.path.length === 3 && event.path[2] === 'items' && event.diff.type === 'list')
+            );
+          })
+        )
+          repair();
+      });
     }
     repair();
   }

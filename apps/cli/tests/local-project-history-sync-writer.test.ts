@@ -20,6 +20,7 @@ import {
 } from '@lody/shared';
 import {
   HASH_VERSION_V1,
+  createImportCursor,
   hashHistoryEntryForVersion,
   hashText,
   readSessionHistory,
@@ -423,6 +424,68 @@ describe('history import through the real SessionDocument writer', () => {
     expect(loro.version().toJSON()).toEqual(version);
     expect((await h.importTurns(3)).summary).toMatchObject({ refreshed: 1, conflicted: 0 });
   });
+
+  it.each(['synced', 'resolved-during-replay'] as const)(
+    'compares inverted %s history against its stored import baseline',
+    async (status) => {
+      const h = await createHarness();
+      await h.importTurns(1);
+      const { doc, sessionId } = h.getOnlyDoc();
+      const loro = await h.rawDoc();
+      const list = loro.getList('history');
+      const user = list.get(0) as LoroMap;
+      const assistant = list.get(1) as LoroMap;
+      assistant.set('userTurnId', user.get('id'));
+      list.insertContainer(0, assistant);
+      list.delete(2, 1);
+      loro.commit();
+      const cursor = await doc.getExternalHistoryCursor();
+      if (!cursor?.importedTurnHashes || cursor.hashVersion === undefined)
+        throw new Error('Missing import cursor');
+      await doc.setExternalHistoryCursor(
+        createImportCursor(
+          cursor.importedTurnHashes,
+          doc.sessionData.writer.readStored(),
+          cursor.hashVersion
+        )
+      );
+      const meta = await h.getMeta(sessionId);
+      await h.repo.upsertDocMeta(getSessionRoomId(sessionId), {
+        externalHistory: {
+          ...meta.externalHistory!,
+          status: status === 'synced' ? 'synced' : 'sync_conflict',
+        },
+      });
+      if (status === 'resolved-during-replay') {
+        providerMocks.replay.mockImplementationOnce(async () => {
+          await h.repo.upsertDocMeta(getSessionRoomId(sessionId), {
+            externalHistory: { ...meta.externalHistory!, status: 'synced' },
+          });
+          return { notifications: notifications(1) };
+        });
+      }
+      expect(readSessionHistory(doc.sessionData.history).map((row) => row.role)).toEqual([
+        'user',
+        'assistant',
+      ]);
+      const before = loro.version().toJSON();
+      expect(
+        (
+          await h.service.resolveHistoryConflict({
+            localProjectId,
+            rootPath,
+            sessionId,
+            acpSessionId,
+          })
+        ).status
+      ).toBe('resolved');
+      expect(loro.version().toJSON()).toEqual(before);
+      expect(doc.sessionData.writer.readStored().map((row) => row.role)).toEqual([
+        'assistant',
+        'user',
+      ]);
+    }
+  );
 
   it('preserves legacy storage/CIDs while appending projected new turns', async () => {
     const h = await createHarness();

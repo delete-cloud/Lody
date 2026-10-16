@@ -635,55 +635,150 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
     }
   });
 
-  it('keeps repairing after a late user arrives while a permission response is pending', async () => {
-    const sessionId = 's-gate-permission' as SessionId;
-    const userTurnId = 'permission-user';
-    const { repo, doc, handler } = await createHandlerHarness(sessionId);
-    const turnId = handler.beginConversationTurn(sessionId, userTurnId, {
-      dispatchSource: 'rpc',
-      sessionDoc: doc,
-    });
-    try {
-      await vi.advanceTimersByTimeAsync(DEFAULT_TURN_HISTORY_GATE_TIMEOUT_MS);
-      await updateTestHistory(doc, (history) => {
-        const assistant = history.find((row) => row.id === turnId);
-        if (!assistant) throw new Error('Missing timeout assistant');
-        assistant.items = [
-          {
-            type: 'tool_call',
-            toolCallId: 'tool',
-            status: 'pending',
-            permissionRequest: {
-              requestId: 'request',
-              options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
+  it.each([false, true])(
+    'keeps pending permissions attached after late sync with finished=%s',
+    async (finished) => {
+      const sessionId = 's-gate-permission' as SessionId;
+      const userTurnId = 'permission-user';
+      const { repo, doc, handler } = await createHandlerHarness(sessionId);
+      const turnId = handler.beginConversationTurn(sessionId, userTurnId, {
+        dispatchSource: 'rpc',
+        sessionDoc: doc,
+      });
+      try {
+        await vi.advanceTimersByTimeAsync(DEFAULT_TURN_HISTORY_GATE_TIMEOUT_MS);
+        await updateTestHistory(doc, (history) => {
+          const assistant = history.find((row) => row.id === turnId);
+          if (!assistant) throw new Error('Missing timeout assistant');
+          assistant.finished = finished;
+          assistant.items = [
+            {
+              type: 'tool_call',
+              toolCallId: 'tool',
+              status: 'pending',
+              permissionRequest: {
+                requestId: 'request',
+                options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
+              },
             },
-          },
-        ];
-        return [...history, userEntry(userTurnId)];
+          ];
+          return [...history, userEntry(userTurnId)];
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(doc.sessionData.writer.readStored().map((row) => row.id)).toEqual([
+          turnId,
+          userTurnId,
+        ]);
+        expect(readSessionHistory(doc.sessionData.history).map((row) => row.id)).toEqual([
+          userTurnId,
+          turnId,
+        ]);
+        const daemon = doc.handle?.doc;
+        if (!daemon) throw new Error('Missing real session document');
+        const peer = new LoroDoc();
+        peer.import(daemon.export({ mode: 'snapshot' }));
+        const peerMirror = createSessionMirror({ doc: peer, initialState: {} });
+        try {
+          expect(
+            peerMirror.historyWriter.respondPermission('request', {
+              outcome: 'selected',
+              optionId: 'allow',
+            })
+          ).toBe(true);
+          daemon.import(peer.export({ mode: 'snapshot' }));
+        } finally {
+          peerMirror.dispose();
+        }
+        await vi.advanceTimersByTimeAsync(0);
+        expect(doc.sessionData.writer.readStored().map((row) => row.id)).toEqual([
+          userTurnId,
+          turnId,
+        ]);
+        expect(readSessionHistory(doc.sessionData.history)[1]?.items[0]).toMatchObject({
+          permissionRequest: { outcome: { outcome: 'selected', optionId: 'allow' } },
+        });
+      } finally {
+        handler.store.clearTurnState(sessionId);
+        await destroyRepoOnRealTimers(repo);
+      }
+    }
+  );
+
+  it('arms without a directory snapshot and skips ordinary streamed text rechecks', async () => {
+    const sessionId = 's-gate-repair-events' as SessionId;
+    const { repo, doc } = await createHandlerHarness(sessionId);
+    try {
+      await updateTestHistory(doc, () => [
+        {
+          ...userEntry('assistant:u'),
+          role: 'assistant',
+          items: [
+            {
+              type: 'tool_call',
+              toolCallId: 'tool',
+              status: 'pending',
+              permissionRequest: { requestId: 'request', options: [] },
+            },
+            { type: 'text', text: 'start' },
+          ],
+        },
+        userEntry('u'),
+      ]);
+      const observe = vi.spyOn(doc.sessionData.history, 'observe');
+      const repair = vi.spyOn(doc.sessionData.writer, 'repairTurnOrder');
+      doc.watchTurnHistoryOrder('u');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(observe).not.toHaveBeenCalled();
+      expect(repair).toHaveBeenCalledTimes(1);
+      await updateTestHistory(doc, (history) => {
+        history[0]!.items[1] = { type: 'text', text: 'streamed text' };
+        return history;
       });
       await vi.advanceTimersByTimeAsync(0);
-      expect(doc.sessionData.writer.readStored().map((row) => row.id)).toEqual([
-        turnId,
-        userTurnId,
-      ]);
-      expect(readSessionHistory(doc.sessionData.history).map((row) => row.id)).toEqual([
-        userTurnId,
-        turnId,
-      ]);
-      doc.sessionData.writer.respondPermission('request', {
-        outcome: 'selected',
-        optionId: 'allow',
-      });
+      expect(repair).toHaveBeenCalledTimes(1);
+      doc.sessionData.writer.respondPermission('request', { outcome: 'cancelled' });
       await vi.advanceTimersByTimeAsync(0);
+      expect(repair).toHaveBeenCalledTimes(2);
       expect(doc.sessionData.writer.readStored().map((row) => row.id)).toEqual([
-        userTurnId,
-        turnId,
+        'u',
+        'assistant:u',
       ]);
-      expect(readSessionHistory(doc.sessionData.history)[1]?.items[0]).toMatchObject({
-        permissionRequest: { outcome: { outcome: 'selected', optionId: 'allow' } },
-      });
     } finally {
-      handler.store.clearTurnState(sessionId);
+      await doc.destroy({ preserveStatus: true });
+      await destroyRepoOnRealTimers(repo);
+    }
+  });
+
+  it('drops old repair subscriptions and queued work when composing another document', async () => {
+    const sessionId = 's-gate-repair-swap' as SessionId;
+    const { repo } = await createHandlerHarness(sessionId);
+    const doc = new SessionDocument(repo, sessionId, async () => {});
+    const oldDoc = new LoroDoc(),
+      newDoc = new LoroDoc();
+    try {
+      doc.composeSessionData(oldDoc);
+      doc.watchTurnHistoryOrder('old');
+      doc.composeSessionData(newDoc);
+      doc.sessionData.writer.append({ ...userEntry('assistant:new'), role: 'assistant' });
+      doc.sessionData.writer.append(userEntry('new'));
+      const repair = vi.spyOn(doc.sessionData.writer, 'repairTurnOrder');
+      doc.watchTurnHistoryOrder('new');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(repair.mock.calls).toEqual([['new']]);
+      expect(doc.sessionData.writer.readStored().map((row) => row.id)).toEqual([
+        'new',
+        'assistant:new',
+      ]);
+      oldDoc.getList('history').insert(0, userEntry('old'));
+      oldDoc.commit();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(repair).toHaveBeenCalledTimes(1);
+      doc.composeSessionData(newDoc, undefined, { historyBackend: 'roost' });
+      doc.watchTurnHistoryOrder('unavailable');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(repair).toHaveBeenCalledTimes(1);
+    } finally {
+      await doc.destroy({ preserveStatus: true });
       await destroyRepoOnRealTimers(repo);
     }
   });
