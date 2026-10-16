@@ -22,10 +22,13 @@ import { formatErrorMessage } from '@/utils/format-error';
  * - Turn-scoped history LIST writes (assistant entry creation, ACP update
  *   flushes, finalization, failure notices) wait until the user turn entry is
  *   visible in the CLI-local history doc, so they are causally ordered after it.
- * - The wait is bounded: after `timeoutMs` the gate opens anyway (degrades to
- *   the pre-gate behavior — possible misorder — instead of holding output
- *   hostage to a broken uplink). A timeout implies the web→CLI doc sync is
- *   stalled, in which case that client cannot see our output either way.
+ * - The wait is bounded: timeout and disposal both release pending writers.
+ *   The caller registers SessionDocument-owned repair when creating the gate,
+ *   before any wait or release. Associated non-user rows then follow their user
+ *   even after timeout, disposal or turn restart. Live permissions defer copying
+ *   until the response arrives or the entry finishes. Repair copies relocated
+ *   containers; user containers retain their identity and concurrent edits.
+ *   Shared read ordering also covers historical associated inversions.
  * - Metadata/status writes are NOT gated: they are map-keyed (no list-order
  *   race) and some sit on the prompt-start critical path.
  *
@@ -39,15 +42,15 @@ export type TurnHistoryGateArgs = {
   logger: Logger;
   sessionId: SessionId;
   userTurnId: string;
-  /** Read the CLI-local session history (mirror state; cheap). */
+  /** Read the CLI-local history through the selected session backend. */
   readHistory: () => Promise<SessionHistoryInput[]>;
   /** Subscribe to local doc changes (remote imports included); returns unsubscribe. */
   subscribeHistory: (listener: () => void) => (() => void) | undefined;
   /**
    * Runs exactly once, right before waiters are released (skipped on dispose).
    * Used to create the turn's assistant entry so every gated writer resumes
-   * against an existing, correctly-ordered entry. Errors are logged and do not
-   * keep the gate closed — downstream flushes self-create the entry by id.
+   * against an existing entry. Late user sync repairs order after timeout or disposal.
+   * Errors do not keep the gate closed; downstream flushes self-create by id.
    */
   onBeforeOpen?: (reason: TurnHistoryGateOpenReason) => Promise<void>;
   timeoutMs?: number;
@@ -176,7 +179,7 @@ export class TurnHistoryGate {
       const waitedMs = Date.now() - this.createdAtMs;
       if (reason === 'timeout') {
         args.logger.warn(
-          `[${args.sessionId}] User turn ${args.userTurnId} did not sync within ${waitedMs}ms; releasing turn history writes (output may order before the user message)`
+          `[${args.sessionId}] User turn ${args.userTurnId} did not sync within ${waitedMs}ms; releasing turn history writes with late-user order repair`
         );
       } else {
         args.logger.debug(

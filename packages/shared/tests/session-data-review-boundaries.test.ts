@@ -210,3 +210,108 @@ it('distinguishes turn identity edits from nested IDs and ordinary content chang
     doc.free();
   }
 });
+
+it('reads causal positions without rewriting raw history and invalidates order on association edits', async () => {
+  const doc = new LoroDoc();
+  const data = createLoroSessionData({ doc, sessionId });
+  data.writer.append({ ...turn('assistant:late'), role: 'assistant', userTurnId: 'other' });
+  data.writer.append(turn('late'));
+  expect(data.history.readDirectory(0, 2).map((row) => row.turnId)).toEqual([
+    'assistant:late',
+    'late',
+  ]);
+  const changes: SessionDataChange[] = [];
+  const observation = data.history.observe((change) => changes.push(change));
+  await observation.initial;
+  data.writer.updateEntry('assistant:late', (entry) => ({ ...entry, userTurnId: 'late' }));
+  expect(data.history.readDirectory(0, 2).map((row) => [row.position, row.turnId])).toEqual([
+    [0, 'late'],
+    [1, 'assistant:late'],
+  ]);
+  expect(changes.at(-1)).toEqual({ kind: 'structure', from: 0, to: 2 });
+  const ids = data.history
+    .readRange(0, 2)
+    .map((read) => (read.state === 'ready' ? read.turn.id : read.state));
+  expect(ids).toEqual(['late', 'assistant:late']);
+  expect(data.history.readAt(0)).toMatchObject({ state: 'ready', turn: { id: 'late' } });
+  expect(data.history.readTurn('assistant:late')).toMatchObject({
+    state: 'ready',
+    turn: { id: 'assistant:late' },
+  });
+  expect(data.history.readAll().map((entry) => entry.id)).toEqual(ids);
+  expect(data.history.readTurnOutput('late').map((entry) => entry.id)).toEqual(ids);
+  expect(data.writer.readStored().map((entry) => entry.id)).toEqual(['assistant:late', 'late']);
+  data.writer.updateEntry('assistant:late', (entry) => ({ ...entry, userTurnId: 'other' }));
+  expect(data.history.readDirectory(0, 2).map((row) => row.turnId)).toEqual([
+    'assistant:late',
+    'late',
+  ]);
+  observation.unsubscribe();
+  data.dispose();
+  doc.free();
+});
+
+it('preserves invalid raw slots in canonical reads without rewriting storage', () => {
+  const doc = new LoroDoc();
+  const list = doc.getList('history');
+  list.insert(0, null);
+  list.insert(1, 7);
+  list.insert(2, { ...turn('assistant:late'), role: 'assistant' });
+  list.insert(3, turn('late'));
+  doc.commit();
+  const data = createLoroSessionData({ doc, sessionId });
+  expect(
+    data.history.readAll().map((entry) => (entry && typeof entry === 'object' ? entry.id : entry))
+  ).toEqual([null, 7, 'late', 'assistant:late']);
+  expect(data.history.readDirectory(0, 4).map((row) => row.turnId)).toEqual([
+    undefined,
+    undefined,
+    'late',
+    'assistant:late',
+  ]);
+  expect(data.history.readAt(0)).toEqual({ state: 'invalid' });
+  expect(data.history.count()).toBe(4);
+  expect(
+    list
+      .toJSON()
+      .map((entry: unknown) =>
+        entry && typeof entry === 'object' ? (entry as { id: string }).id : entry
+      )
+  ).toEqual([null, 7, 'assistant:late', 'late']);
+  data.dispose();
+  doc.free();
+});
+
+it('repairs an assistant after a legacy inline user without replacing the user slot', () => {
+  const doc = new LoroDoc();
+  const writer = createHistoryWriter(doc);
+  writer.append({ ...turn('assistant:late'), role: 'assistant' });
+  const list = doc.getList('history');
+  list.insert(1, turn('late'));
+  doc.commit();
+  const user = list.get(1);
+  expect(writer.repairTurnOrder('late')).toBe('repaired');
+  expect(list.get(0)).toEqual(user);
+  expect(writer.readStored().map((entry) => entry.id)).toEqual(['late', 'assistant:late']);
+  expect(writer.repairTurnOrder('late')).toBe('unchanged');
+  doc.free();
+});
+
+it('invalidates the former causal prefix for every observer when an association disappears', async () => {
+  const doc = new LoroDoc();
+  const data = createLoroSessionData({ doc, sessionId });
+  data.writer.append({ ...turn('assistant:late'), role: 'assistant' });
+  data.writer.append(turn('late'));
+  const changes: SessionDataChange[][] = [[], []];
+  const observations = changes.map((events) => data.history.observe((event) => events.push(event)));
+  await Promise.all(observations.map((observation) => observation.initial));
+  data.writer.updateEntry('late', (entry) => ({ ...entry, role: 'system' }));
+  for (const events of changes) expect(events).toEqual([{ kind: 'structure', from: 0, to: 2 }]);
+  expect(data.history.readDirectory(0, 2).map((row) => row.turnId)).toEqual([
+    'assistant:late',
+    'late',
+  ]);
+  observations.forEach((observation) => observation.unsubscribe());
+  data.dispose();
+  doc.free();
+});

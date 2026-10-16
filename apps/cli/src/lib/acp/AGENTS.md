@@ -120,3 +120,6 @@ first `await awaitTurnHistoryGate(sessionId)` — see
 `../../session/turn-history-gate.ts`. Add the same await to any NEW code path that
 appends or positions history entries during a turn; map-keyed status/meta writes stay
 ungated.
+
+Every new turn-scoped row, including notices and upload fallbacks, carries the captured
+`userTurnId` before waiting. Never resolve its owner again after gate release.
