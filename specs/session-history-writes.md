@@ -168,6 +168,29 @@ This adds optional cursor metadata, not a body migration. Old readers can ignore
 old importers do not understand the stored baseline and may still report conflicts
 on projected history. This is not arbitrary downgrade safety.
 
+## Causal history order
+
+RPC turn execution starts immediately; history output waits at most 20 seconds for
+its user row. The executing CLI registers document-owned repair when creating the
+gate, so timeout, disposal and turn restart cannot release unprotected writes.
+Every executor-authored turn-scoped row captures `userTurnId` before waiting or
+finalization clears the turn; queued notices capture it before enqueue,
+including failure/warning notices and active-turn file/image fallback entries.
+When the user arrives, the writer moves inverted associated non-user rows after
+it, retaining user containers and their concurrent edits. Relocated attached
+containers are copied with new container ids; streaming resolves by entry id on
+every write. Any unresolved permission defers copying until its outcome arrives,
+even on finished entries; an outcome that never arrives leaves storage inverted
+while reads remain causal. Turn teardown retains repair; document disposal cancels it.
+Association uses `userTurnId`, with `assistant:<userTurnId>` as a fallback only for
+assistant rows. Repair and projection anchor on the first matching user copy.
+User rows never move; unrelated rows retain relative order. Editable-tail planning
+uses projected order and maps retained rows back to storage; import baseline
+comparisons use stored snapshots.
+Shared read ordering covers historical associated inversions for CLI/MCP transcripts
+and the renderer without rewriting storage. Unassociated historical system/file
+rows have no recoverable causal link; timestamps never decide association.
+
 ## Limits and review questions
 
 ### Backend selection and display reads

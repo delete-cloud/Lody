@@ -698,7 +698,7 @@ export class LocalProjectHistorySyncService {
 
     const sessionDoc = await this.manager.getOrCreateSessionDoc(args.sessionId);
     const backend = await createSessionBackend(sessionDoc, meta);
-    const currentHistoryBeforeReplay = await backend.readHistory();
+    const currentHistoryBeforeReplay = (await backend.captureForkSnapshot()).history;
     if (hasPendingDispatchHistory(currentHistoryBeforeReplay)) {
       throw new Error(
         'Cannot replace history while the imported session has a pending local turn.'
@@ -758,7 +758,7 @@ export class LocalProjectHistorySyncService {
       importedTurnHashVersion: latestImportedTurnHashVersion,
     } = await readSessionImportedTurnHashes(sessionDoc, latestExternalHistory);
     const latestCursor = await sessionDoc.getExternalHistoryCursor();
-    const latestHistory = await backend.readHistory();
+    const latestHistory = (await backend.captureForkSnapshot()).history;
     const decision = decideHistoryConflictResolution({
       externalHistory: latestExternalHistory,
       importedTurnHashes: latestImportedTurnHashes,

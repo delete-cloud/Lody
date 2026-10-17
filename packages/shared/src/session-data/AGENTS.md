@@ -13,6 +13,14 @@
   the directory; explicit export/replay uses one consistent `readAll` observation.
   `readTurnOutput` reads the selected assistant and relevant failure notices in
   one observation instead of serializing the transcript on every token.
+- Executor-only order repair covers associated non-user rows, including notices and
+  upload fallbacks. Arm at gate creation; preserve user containers, defer pending
+  permissions even on finished rows, and retain repair through turn teardown until
+  doc disposal.
+- Loro directory, positional reads and `readAll` project `orderSessionHistory` without
+  rewriting storage. Share a shallow order index; body edits must not rebuild it.
+  Association edits invalidate structural positions. Writer captures retain raw order.
+  Repair/projection anchor at the first user copy; targeted identity lookup stays last-copy.
 - Repeated identity lookups reuse an unchanged pending transaction. Reads must not
   commit writes; uncommitted structural/ID edits and checkout still invalidate lookup.
 - Subscribe and capture the initial directory without a gap. Notifications carry
@@ -31,7 +39,9 @@
   invalidate a capture held by a fork. Do not add a second handle registry,
   backend capabilities, store tokens or source-lifetime coupling.
 - Tail replacement rechecks the expected user/provider boundary and active goal
-  inside the write. Await conditional rollback before persisting follow-up meta;
+  inside the write using projected order; translate retained rows to stored positions.
+  Import baseline comparisons use stored snapshots. Await conditional rollback
+  before persisting follow-up meta;
   rollback retains later appends and refuses to overwrite concurrent edits.
 - Import inputs are explicit data. Recheck current history/cursor and bind the
   stored baseline and cursor in the same synchronous write, without an await gap.
