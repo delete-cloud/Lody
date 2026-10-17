@@ -173,7 +173,8 @@ on projected history. This is not arbitrary downgrade safety.
 RPC turn execution starts immediately; history output waits at most 20 seconds for
 its user row. The executing CLI registers document-owned repair when creating the
 gate, so timeout, disposal and turn restart cannot release unprotected writes.
-Every executor-authored turn-scoped row captures `userTurnId` before waiting,
+Every executor-authored turn-scoped row captures `userTurnId` before waiting or
+finalization clears the turn; queued notices capture it before enqueue,
 including failure/warning notices and active-turn file/image fallback entries.
 When the user arrives, the writer moves inverted associated non-user rows after
 it, retaining user containers and their concurrent edits. Relocated attached

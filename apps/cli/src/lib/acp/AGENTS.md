@@ -121,5 +121,5 @@ first `await awaitTurnHistoryGate(sessionId)` — see
 appends or positions history entries during a turn; map-keyed status/meta writes stay
 ungated.
 
-Every new turn-scoped row, including notices and upload fallbacks, carries the captured
-`userTurnId` before waiting. Never resolve its owner again after gate release.
+Turn-scoped rows capture `userTurnId` before waits; failures/notices capture before
+finalization/enqueue. Never re-resolve ownership after clear or release.

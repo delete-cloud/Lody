@@ -26,6 +26,7 @@ import type {
 } from '@lody/shared';
 
 import { MessageHandler } from '../src/lib/message-handler';
+import type { SessionTransientStore } from '../src/lib/session-transient-store';
 import { SessionDocument } from '../src/lib/loro/doc';
 import type { LoroDocumentManager } from '../src/lib/loro/doc';
 import type { SessionManager } from '../src/session/session-manager';
@@ -63,12 +64,14 @@ type MessageHandlerHost = {
   applyAcpModeAndModel(
     session: AcpSessionConfigTarget,
     config: AcpSessionRunConfig,
-    context: { sessionDoc: SessionDocument }
+    context: { sessionDoc: SessionDocument; basedOnUserTurnId?: string }
   ): Promise<void>;
   recordChatFailure(
     sessionDoc: SessionDocument,
     reason: 'agent_disconnected',
-    message?: string
+    message?: string,
+    code?: undefined,
+    association?: { userTurnId?: string }
   ): Promise<void>;
   handleSessionFileUpload(
     message: { type: 'session/file-upload'; sessionId: SessionId; paths: string[] },
@@ -82,7 +85,11 @@ type MessageHandlerHost = {
     sessionId: SessionId;
     sessionDoc: SessionDocument;
   }): Promise<string>;
-  recordAgentWarning(sessionId: SessionId, warning: AgentSessionWarning): Promise<void>;
+  recordAgentWarning(
+    sessionId: SessionId,
+    warning: AgentSessionWarning,
+    association?: { userTurnId?: string }
+  ): Promise<void>;
   appendACPUpdatesToAssistantEntry(...args: unknown[]): Promise<void>;
   flushACPUpdatesNow(sessionId: SessionId): Promise<void>;
   handleAgentPermissionRequest(
@@ -98,7 +105,24 @@ type MessageHandlerHost = {
     gateContext?: { dispatchSource?: SessionDispatchSource; sessionDoc: SessionDocument }
   ): string;
   enqueueACPUpdate(sessionId: SessionId, update: AcpSessionNotification): void;
-  store: { clearTurnState(sessionId: SessionId): void };
+  store: SessionTransientStore;
+  finalizeACPState(sessionId: SessionId, turnId?: string): Promise<void>;
+  executionService: {
+    recordSilentTurnFailure(options: {
+      sessionId: SessionId;
+      sessionDoc: SessionDocument;
+      turnId: string;
+      userTurnId: string;
+    }): Promise<void>;
+  };
+  sessionDispatchWatcher: {
+    markDispatchAccessDenied(
+      sessionId: SessionId,
+      doc: SessionDocument,
+      userTurnId: string,
+      reason: 'not_visible'
+    ): Promise<void>;
+  };
   createAssistantEntryForTurn(
     sessionId: SessionId,
     sessionDoc: SessionDocument,
@@ -164,7 +188,7 @@ const createHandlerHarness = async (sessionId: SessionId) => {
     }
   );
 
-  return { repo, doc, handler: handler as unknown as MessageHandlerHost };
+  return { repo, doc, handler: handler as unknown as MessageHandlerHost, sessionManager };
 };
 
 const userEntry = (id: string): SessionHistoryInput => ({
@@ -186,9 +210,13 @@ const agentChunk = (sessionId: SessionId, text: string): AcpSessionNotification 
 });
 
 describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
-  it.each(['codex', 'claude'])(
-    'persists a rejected %s model as a GUI notice after the driving user turn',
-    async (agentType) => {
+  it.each(
+    ['codex', 'claude'].flatMap((agentType) =>
+      [false, true].map((clearDuringConfig) => ({ agentType, clearDuringConfig }))
+    )
+  )(
+    'persists a rejected $agentType model with clearDuringConfig=$clearDuringConfig',
+    async ({ agentType, clearDuringConfig }) => {
       const sessionId = `model-rejection-${agentType}` as SessionId;
       const { repo, doc, handler } = await createHandlerHarness(sessionId);
       try {
@@ -211,6 +239,7 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
                 { id: 'model', category: 'model', type: 'select', currentValue: 'active-model' },
               ],
               unstable_setSessionModel: async () => {
+                if (clearDuringConfig) handler.store.clearTurnState(sessionId);
                 throw new Error('Requested model is unavailable');
               },
             } as unknown as AgentClient,
@@ -224,6 +253,7 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
         const history = await doc.sessionData.history.readAll();
         expect(history[0]?.id).toBe('user-model-selection');
         const notice = history.find((entry) => entry.role === 'system');
+        expect(notice?.userTurnId).toBe('user-model-selection');
         expect(notice?.items).toEqual([
           expect.objectContaining({
             type: 'system_notice',
@@ -434,11 +464,15 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
     'dispose-warning',
     'supersede',
     'file-restart',
+    'failed-finalized',
+    'silent-finalized',
+    'machine-denied',
+    'warning-after-clear',
   ] as const)('repairs late replica sync for %s', async (path) => {
     const clearTurn = path === 'restart';
     const sessionId = `s-gate-replicas-${path}` as SessionId;
     const userTurnId = 'late-user';
-    const { repo, doc, handler } = await createHandlerHarness(sessionId);
+    const { repo, doc, handler, sessionManager } = await createHandlerHarness(sessionId);
     const daemon = doc.handle?.doc;
     if (!daemon) throw new Error('Missing real session document');
     daemon.setPeerId('1');
@@ -471,6 +505,47 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
         await pendingNotice;
       } else {
         await vi.advanceTimersByTimeAsync(DEFAULT_TURN_HISTORY_GATE_TIMEOUT_MS + 200);
+      }
+      if (['failed-finalized', 'silent-finalized', 'machine-denied'].includes(path)) {
+        vi.spyOn(doc, 'waitUntilSynced').mockResolvedValue(true);
+        await handler.finalizeACPState(sessionId, turnId);
+        expect(handler.store.get(sessionId).turn.phase).toBe('idle');
+        if (path === 'failed-finalized')
+          await handler.recordChatFailure(
+            doc,
+            'agent_disconnected',
+            'post-finalization failure',
+            undefined,
+            { userTurnId }
+          );
+        if (path === 'silent-finalized')
+          await handler.executionService.recordSilentTurnFailure({
+            sessionId,
+            sessionDoc: doc,
+            turnId,
+            userTurnId,
+          });
+        if (path === 'machine-denied')
+          await handler.sessionDispatchWatcher.markDispatchAccessDenied(
+            sessionId,
+            doc,
+            userTurnId,
+            'not_visible'
+          );
+      }
+      if (path === 'warning-after-clear') {
+        let release!: () => void;
+        handler.store.get(sessionId).historyNoticePersistChain = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const onWarning = sessionManager.on.mock.calls.find(
+          ([name]) => name === 'onAgentWarning'
+        )?.[1] as ((id: SessionId, warning: AgentSessionWarning) => void) | undefined;
+        if (!onWarning) throw new Error('Missing warning listener');
+        onWarning(sessionId, { message: 'queued warning' });
+        handler.store.clearTurnState(sessionId);
+        release();
+        await vi.advanceTimersByTimeAsync(0);
       }
       if (path === 'chat-failed')
         await handler.recordChatFailure(doc, 'agent_disconnected', 'synthetic failure');
@@ -529,6 +604,10 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
           'image',
           'dispose-notice',
           'dispose-warning',
+          'failed-finalized',
+          'silent-finalized',
+          'machine-denied',
+          'warning-after-clear',
         ].includes(path)
       ) {
         expect(associatedRows).toHaveLength(1);
@@ -572,7 +651,17 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
         readSessionHistory(doc.sessionData.history).find((row) => row.id === turnId)?.items
       ).toEqual([{ type: 'text', text: 'before sync' }]);
       if (
-        ['dispose', 'dispose-notice', 'dispose-warning', 'supersede', 'file-restart'].includes(path)
+        [
+          'dispose',
+          'dispose-notice',
+          'dispose-warning',
+          'supersede',
+          'file-restart',
+          'failed-finalized',
+          'silent-finalized',
+          'machine-denied',
+          'warning-after-clear',
+        ].includes(path)
       )
         handler.beginConversationTurn(sessionId, userTurnId);
       handler.enqueueACPUpdate(sessionId, agentChunk(sessionId, ' after repair'));

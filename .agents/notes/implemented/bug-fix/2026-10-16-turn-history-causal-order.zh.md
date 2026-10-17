@@ -19,7 +19,7 @@ Translation: current
 即时读取顺序，以及修复后两端原始列表收敛。
 
 创建门禁时先登记修复。超时、门禁销毁及回合替换释放写入，但不撤销文档级修复。
-失败/警告通知在 await 前捕获 `userTurnId`；活跃回合文件/图片回退跨上传与门禁等待保留原所属用户。
+失败通知在失败入口、警告通知在入队时捕获 `userTurnId`，早于 finalization 清理 turn 或任何 await；活跃回合文件/图片回退跨上传与门禁等待保留原所属用户。
 writer 只移动关联非用户条目，用户及无关条目保留相对顺序。修复和读取以第一份真正的用户副本为锚点，
 两份用户副本之间的合法 assistant 不移动；普通定向身份查询仍选择最后一份匹配条目。
 
@@ -30,7 +30,21 @@ writer 只移动关联非用户条目，用户及无关条目保留相对顺序�
 已结束条目仍可接受原先缺失的权限 outcome。双副本回归在 outcome 缺失时保留原 assistant 容器，
 在尝试修复之后由另一副本提交决定，再验证修复复制已接受结果并在两端收敛。`finished` 从不解除等待。
 显式 null 也保守推迟，尽管当前单赋值 responder 会拒绝已有 null 的 outcome。
-回复不构成重新执行已结束回合的授权。
+回复不构成重新执行已结束回合的授权。只要 daemon 的权限等待器仍存活且写入成功，权限超时写入
+`cancelled` outcome 后即可修复；daemon 重启或写入失败的残留仍由读取投影覆盖。
+
+失败处理在 finalization 之后写通知时，已无法从 MessageHandler 的 idle turn 恢复用户身份。
+外层错误 handler 从所持 runtime 对象保留 `userTurnId`，即使 Effect release 已删除 runtime 索引；
+`handleTurnError` 在 finalization 前保存显式关联。静默失败、已知启动失败、机器拒绝及缺失历史恢复也显式透传。预提示设置失败已有输入 runtime，因此同样关联该输入；
+没有人类用户条目的队列 goal 控制失败显式不关联，不借用另一个活跃回合或永久保留的 late ACP target。
+未提供显式 association 的直接调用仍在 live-turn 路径读取当前身份。可选 association 对象即使用户 id
+缺失也保留“调用者已决定无关联”的含义。
+
+warning 的正常 finalization 会排空 notice 队列；若更早的 ACP flush 抛错，会在排空前进入 finally 清理。
+因此事件监听器在入队前捕获身份，排队任务不在执行时重新查询。这也避免旧 warning 借用下一回合身份。
+配置警告在等待模型/配置请求前捕获身份。首次在 idle 后发出的 warning 没有 provider turn id，
+保持无关联，不从 late ACP target 猜测。
+修复调度的实例不匹配检查进入 try/finally，确保调度标记会清理。
 
 修复、读取排序及单回合输出共用关联函数。字符串 `userTurnId` 优先，否则仅 assistant 可使用
 `assistant:<userTurnId>` 回退，包括非字符串的损坏关联。用户不作为执行端输出关联。
@@ -69,7 +83,7 @@ Loro 1.16.3 的插入/删除修复不是可中止事务。原生调用中途异�
 关闭/重新组合丢弃登记；重新打开仅投影顺序，不迁移历史存储。未关联历史通知/文件无法从时间戳恢复。
 未声称已部署客户端验收。
 
-## 验证
+## 通知清理修正之前的验证
 
 修复前新增共享回归实际出现六个失败，覆盖已结束权限、重复用户、损坏关联回退、旧式单回合输出及
 两种倒序编辑尾部。两个真实导入 writer 回归也因投影/原始基线分歧失败。
@@ -99,3 +113,31 @@ CLI 9 套件 / 168 项、共享层 5 套件 / 106 项、components 4 套件 / 41
 聚焦 type-aware Oxlint 为 164 warnings、零 errors；Oxfmt 检查 16 个变更文件；
 docs check 零错误，保留仓库既有警告。未重跑完整 `pnpm check`。本次无伙伴委派，
 host 安排的独立审查与这些自测分开。
+
+## 通知身份跨清理的验证
+
+新增的四个真实 MessageHandler/双副本用例在关联修复前失败：finalization 后失败、静默失败、
+机器拒绝，以及清理前入队而清理后执行的 warning。断言原用户关联、并发原始倒序、读取投影和
+两端持久列表收敛。实际 ACP finalization 仅替代传输同步确认。execution-service 测试另验证
+Effect release 已删除 runtime 索引后的持久通知关联。Codex/Claude 两个模型警告用例在
+配置请求清理 turn 后返回时也先实际失败。定时器与队列释放使用假时钟及显式信号。
+
+本次修正的命令（在 worktree 根目录执行）：
+
+```sh
+TMPDIR="$PWD/.turn-order-followup-tmp" corepack pnpm --filter lody exec vitest run tests/message-handler-turn-history-gate.test.ts src/session/turn-history-gate.test.ts tests/session-execution-service.test.ts tests/session-dispatch-watcher.test.ts tests/session-history-targeted-write.test.ts src/session/session-backend.test.ts src/lib/session-export/formatters.test.ts tests/message-handler-image-upload.test.ts tests/local-project-history-sync-writer.test.ts tests/local-project-history-sync-service.test.ts src/session/session-edit-and-resend-service.test.ts --maxWorkers=2
+corepack pnpm --filter @lody/shared exec vitest run tests/history-writer.test.ts tests/session-doc-forward-compat.test.ts tests/session-data-review-boundaries.test.ts tests/session-history-import-port.test.ts tests/session-history-actions.test.ts --maxWorkers=2
+corepack pnpm --filter lody typecheck
+corepack pnpm check:local-loro-writer-boundary
+corepack pnpm run docs status
+corepack pnpm run docs check
+corepack pnpm exec oxlint --type-aware --quiet apps/cli/src/lib/loro/doc.ts apps/cli/src/lib/message-handler.ts apps/cli/src/session/session-dispatch-watcher.ts apps/cli/src/session/session-execution-service.ts apps/cli/tests/message-handler-turn-history-gate.test.ts apps/cli/tests/session-dispatch-watcher.test.ts apps/cli/tests/session-execution-service.test.ts
+corepack pnpm exec oxfmt --check .agents/notes/implemented/bug-fix/2026-10-16-turn-history-causal-order.md .agents/notes/implemented/bug-fix/2026-10-16-turn-history-causal-order.zh.md apps/cli/src/lib/acp/AGENTS.md apps/cli/src/lib/loro/doc.ts apps/cli/src/lib/message-handler.ts apps/cli/src/session/session-dispatch-watcher.ts apps/cli/src/session/session-execution-service.ts apps/cli/tests/message-handler-turn-history-gate.test.ts apps/cli/tests/session-dispatch-watcher.test.ts apps/cli/tests/session-execution-service.test.ts specs/session-history-writes.md specs/session-history-writes.zh.md
+```
+
+本次最终验证：CLI 11 套件 / 500 项、共享层 5 套件 / 106 项全部通过。CLI typecheck
+与 local-writer 边界检查通过；七个变更 TypeScript 文件的 type-aware Oxlint 为
+454 warnings、零 errors。本次仅修正 CLI，未重跑完整 `pnpm check` 或 renderer 套件，
+此前 renderer 证据仍仅对应已记录版本。未委派伙伴，新提交的 host 独立审查另行进行。
+Oxfmt 检查全部 12 个变更文件；文档检查零错误、68 条既有仓库警告
+（ACP 契约的字节计数发生变化）。

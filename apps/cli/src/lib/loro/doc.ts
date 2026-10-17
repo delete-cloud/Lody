@@ -3059,9 +3059,8 @@ export class SessionDocument implements LoroDocument<Omit<SessionDocMeta, 'histo
       if (this.turnOrderRepairScheduled) return;
       this.turnOrderRepairScheduled = true;
       void Promise.resolve().then(() => {
-        if (this.sessionDataInstance !== data) return;
         try {
-          if (this.destroyed) return;
+          if (this.sessionDataInstance !== data || this.destroyed) return;
           for (const id of this.pendingTurnOrderRepairs) {
             if (data.history.readTurn(id).state === 'missing') continue;
             if (data.writer.repairTurnOrder(id) !== 'waiting') {

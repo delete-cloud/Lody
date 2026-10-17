@@ -24,7 +24,8 @@ read order immediately, and convergence of both raw lists after repair.
 
 Gate creation arms repair before any output. Timeout, gate disposal and turn
 replacement release writers without dropping document-owned repair. Failure and
-warning notices capture `userTurnId` before awaits; active-turn file/image fallbacks
+warning notices capture `userTurnId` at failure entry or notice enqueue, before
+finalization clears the turn or any await; active-turn file/image fallbacks
 retain their captured owner through upload and gate release. The writer relocates
 associated non-user rows only. User and unrelated rows retain relative order.
 Both repair and projection anchor on the first actual user copy, so a legitimate
@@ -43,7 +44,30 @@ commits the decision on the peer after the attempted repair, and verifies that
 repair then copies the accepted decision and both replicas converge. `finished`
 never releases this guard. Explicit null also defers conservatively, although the
 current single-assignment responder rejects an already present null outcome.
-No response is treated as renewed authorization to execute a finished turn.
+No response is treated as renewed authorization to execute a finished turn. While
+the daemon permission waiter remains alive and its write succeeds, permission
+timeout writes a `cancelled` outcome and permits repair; restart or write-failure
+residuals remain covered by projection.
+
+Failure handling writes notices after finalization, when MessageHandler's idle
+turn no longer carries user identity. The outer error handler retains `userTurnId`
+from its runtime object even after Effect release deletes the runtime index;
+`handleTurnError` captures that explicit association before finalization. Silent failures, known
+startup failures, machine denial and missing-history recovery also forward it. Pre-prompt setup
+failures already have an input runtime, so they associate with that input. Queued
+goal-control failures without a human user row explicitly remain unassociated;
+they do not borrow another live turn or the permanently retained late ACP target.
+Direct callers without an explicit association still capture the current live-turn
+identity. An optional association object also preserves an explicitly absent id.
+
+Normal warning finalization drains the notice queue; an earlier ACP flush failure
+can jump to cleanup before that drain. The warning listener therefore captures
+identity before enqueue, and queued tasks never re-read it during execution. This
+also prevents an old warning borrowing the next turn's identity. Configuration
+warnings capture identity before awaiting the model/configuration request. A
+warning first emitted after the turn is idle has no provider turn id and remains
+unassociated instead of guessing from the late ACP target. The repair
+instance-mismatch check runs inside try/finally so its scheduled flag is cleared.
 
 One association helper serves repair, projection and selected turn output. A
 string `userTurnId` wins; otherwise only `assistant:<userTurnId>` supplies a legacy
@@ -100,7 +124,7 @@ disposal. Closing/recomposing drops registrations; reopening projects order but
 does not migrate historical storage. Unassociated historical notices/files cannot
 be reconstructed from timestamps. No deployed-client acceptance is claimed.
 
-## Verification
+## Verification before the notice-finalization correction
 
 Before the fixes, the new shared regressions produced six failures covering
 finished permissions, duplicate users, malformed association fallback, selected
@@ -133,3 +157,37 @@ typechecks and the local-writer boundary check pass. Scoped type-aware Oxlint ha
 164 warnings and zero errors. Oxfmt checks 16 changed files; docs check has zero
 errors with existing repository warnings. Full `pnpm check` was not rerun. No
 partners were dispatched; host-owned independent review remains separate.
+
+## Verification of notice ownership across cleanup
+
+Four new real MessageHandler/two-replica cases failed before association changes:
+post-finalization failure, silent failure, machine denial and a warning queued
+before clear but executed afterward. They assert the original user association,
+raw concurrent inversion, projected order and both converged durable lists.
+Only transport sync acknowledgement is stubbed for actual ACP finalization.
+Execution-service tests additionally verify persisted notice association after
+Effect release has already removed the runtime index. Two Codex/Claude model
+warning cases failed when configuration cleared the turn before returning.
+Timers and queue release use fake clocks and explicit signals.
+
+Current correction commands (run from the worktree root):
+
+```sh
+TMPDIR="$PWD/.turn-order-followup-tmp" corepack pnpm --filter lody exec vitest run tests/message-handler-turn-history-gate.test.ts src/session/turn-history-gate.test.ts tests/session-execution-service.test.ts tests/session-dispatch-watcher.test.ts tests/session-history-targeted-write.test.ts src/session/session-backend.test.ts src/lib/session-export/formatters.test.ts tests/message-handler-image-upload.test.ts tests/local-project-history-sync-writer.test.ts tests/local-project-history-sync-service.test.ts src/session/session-edit-and-resend-service.test.ts --maxWorkers=2
+corepack pnpm --filter @lody/shared exec vitest run tests/history-writer.test.ts tests/session-doc-forward-compat.test.ts tests/session-data-review-boundaries.test.ts tests/session-history-import-port.test.ts tests/session-history-actions.test.ts --maxWorkers=2
+corepack pnpm --filter lody typecheck
+corepack pnpm check:local-loro-writer-boundary
+corepack pnpm run docs status
+corepack pnpm run docs check
+corepack pnpm exec oxlint --type-aware --quiet apps/cli/src/lib/loro/doc.ts apps/cli/src/lib/message-handler.ts apps/cli/src/session/session-dispatch-watcher.ts apps/cli/src/session/session-execution-service.ts apps/cli/tests/message-handler-turn-history-gate.test.ts apps/cli/tests/session-dispatch-watcher.test.ts apps/cli/tests/session-execution-service.test.ts
+corepack pnpm exec oxfmt --check .agents/notes/implemented/bug-fix/2026-10-16-turn-history-causal-order.md .agents/notes/implemented/bug-fix/2026-10-16-turn-history-causal-order.zh.md apps/cli/src/lib/acp/AGENTS.md apps/cli/src/lib/loro/doc.ts apps/cli/src/lib/message-handler.ts apps/cli/src/session/session-dispatch-watcher.ts apps/cli/src/session/session-execution-service.ts apps/cli/tests/message-handler-turn-history-gate.test.ts apps/cli/tests/session-dispatch-watcher.test.ts apps/cli/tests/session-execution-service.test.ts specs/session-history-writes.md specs/session-history-writes.zh.md
+```
+
+Final notice-capture validation: CLI 11 suites / 500 tests and shared 5 suites /
+106 tests pass. The CLI typecheck and local-writer boundary check pass. Scoped
+type-aware Oxlint reports 454 warnings and zero errors on seven changed TypeScript
+files. Full `pnpm check` and renderer suites were not rerun for this CLI-only
+correction; earlier renderer evidence remains qualified to its recorded revision.
+No partners were dispatched. Host review applies independently to this new commit.
+Oxfmt checks all 12 changed files. Documentation checking reports zero errors and
+68 existing repository warnings (the ACP contract's byte count changes).
