@@ -139,25 +139,42 @@ describe('UserMessageRowView undelivered resend dialog', () => {
     expect(document.body.textContent).not.toContain('did not run');
   });
 
-  it('warns that unknown delivery may repeat work and waits for explicit confirmation', async () => {
+  it.each([
+    ['en', 'Outcome unknown', 'may already have acted', 'Cancel', 'Resend message'],
+    ['zh_CN', '执行结果未知', '可能已经执行', '取消', '重新发送上一条消息'],
+  ] as const)('confirms unknown ordinary-turn resend in %s', async (locale, label, warning, cancel, resend) => {
+    await initI18n(locale);
     const submissions: unknown[] = [];
-    await renderRow(
-      async (id, blocks) => {
-        submissions.push({ id, blocks });
-        return true;
-      },
-      { ...undeliveredMessage, status: 'delivery_unknown', read: true }
-    );
-    expect(document.body.textContent).not.toContain('Not delivered');
-    await click(queryBodyButton('Application unknown'));
-    expect(document.body.textContent).toContain('may already have applied');
-    expect(document.body.textContent).toContain('could repeat work');
+    await renderRow(async (id, blocks) => {
+      submissions.push({ id, blocks });
+      return true;
+    }, { ...undeliveredMessage, status: 'delivery_unknown', read: true });
+    await click(queryBodyButton(label));
+    expect(document.body.textContent).toContain(warning);
     expect(document.body.textContent).not.toContain('did not run');
     expect(submissions).toEqual([]);
-    await click(queryBodyButton('Resend message'));
-    expect(submissions).toEqual([
-      { id: missingTurnId, blocks: buildResendInputBlocks(undeliveredMessage) },
-    ]);
+    await click(queryBodyButton(cancel));
+    expect(submissions).toEqual([]);
+    await click(queryBodyButton(label));
+    await click(queryBodyButton(resend));
+    expect(submissions).toEqual([{ id: missingTurnId, blocks: buildResendInputBlocks(undeliveredMessage) }]);
+    expect(document.body.textContent).not.toContain(warning);
+  });
+
+  it.each([
+    ['en', 'Previous attempt ended; outcome unknown', 'Failed before the agent could start'],
+    ['zh_CN', '上次尝试已结束，执行结果未知', 'Agent 启动前失败'],
+  ] as const)('renders accurate restart notice in %s', async (locale, title, falseTitle) => {
+    await initI18n(locale);
+    await renderRow(async () => false, {
+      id: 'interrupted-notice', role: 'system', timestamp: '2026-10-23T00:00:00Z',
+      items: [{ type: 'system_notice', name: 'chat_failed', meta: {
+        reason: 'turn_outcome_unknown', message: 'Work may already have happened; sending it again could repeat work.',
+      } }],
+    } as SessionHistoryParsed);
+    expect(container?.textContent).toContain(title);
+    expect(container?.textContent).toContain('could repeat work');
+    expect(container?.textContent).not.toContain(falseTitle);
   });
 
   it('keeps the label non-interactive without a resend handler', async () => {

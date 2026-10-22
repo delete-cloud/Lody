@@ -58,9 +58,9 @@ Root/CLI rules apply; `specs/session-orchestration.md` owns behavior.
 - Inbox-aware Stop pauses/cancels queued eligibility; legacy Stop only cancels execution.
   Only trusted fresh human receipts clear pause (not role/userId/author). New human
   acceptance cannot revive a canceled execution or discard an already prepared human input.
-- Fixed batch claims and submission fence precede synchronous transport start under the
-  same gate, with no await between. Post-fence uncertainty never replays, including
-  human-plus-batch stale-ACP recovery. Retry failed settlement only, never the request.
+- Persist submission evidence under admission before transport starts; batch fencing shares
+  that gate, with no await gap. Post-fence uncertainty never replays, including stale ACP.
+  Retry settlement only. Missing legacy submission evidence means unknown outcome.
 - Physical request/resource release differs from waiter exit and Scope close. Keep immutable
   execution IDs, shared close receipts, full Cause and retained recovery owners. Unknown
   release blocks successors. Independent recovery proves release before clearing the slot.

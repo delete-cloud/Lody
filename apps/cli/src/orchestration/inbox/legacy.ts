@@ -94,6 +94,8 @@ export const operationInboxLegacy = (options: {
       Effect.runSync(queries.preferredHumanInput(w, s)),
     inputCancellationReason: (w: string, s: string, id: string) =>
       Effect.runSync(queries.inputCancellationReason(w, s, id)),
+    inputSubmissionStarted: (w: string, s: string, id: string) =>
+      Effect.runSync(queries.inputSubmissionStarted(w, s, id)),
     inputEnded: (w: string, s: string, id: string) => Effect.runSync(queries.inputEnded(w, s, id)),
     inputCanceled: (w: string, s: string, id: string) =>
       Effect.runSync(queries.inputCanceled(w, s, id)),

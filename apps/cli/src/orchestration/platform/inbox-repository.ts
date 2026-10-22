@@ -11,6 +11,7 @@ export const inboxRepositoryLayer = (sql: InboxSqlite, ownedConnection = false) 
     deactivate: (w, o) => io(() => sql.deactivate(w, o)),
     cancelExecution: (scope, id, reason) => io(() => sql.cancelExecution(scope, id, reason)),
     adopt: (p, n, id) => io(() => sql.adoptExecution(p, n, id)),
+    markSubmissionStarted: (s, id) => io(() => sql.markSubmissionStarted(s, id)),
     canSubmit: (s, id, o) => io(() => sql.canSubmit(s, id, o)),
     accept: (i) => io(() => sql.accept(i)),
     begin: (s, id, owner) => io(() => sql.begin(s, id, owner)),

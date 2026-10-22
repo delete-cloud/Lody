@@ -10350,7 +10350,7 @@ describe('Operation Inbox execution boundary', () => {
     automaticFinished?: () => void
   ) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lody-inbox-execution-'));
-    const store = new LodyOperationStore(path.join(root, 'operations.sqlite3'), () =>
+    let store = new LodyOperationStore(path.join(root, 'operations.sqlite3'), () =>
       Date.parse('2026-10-12T00:00:00Z')
     );
     const sessionId = 'inbox-session' as SessionId;
@@ -10369,7 +10369,7 @@ describe('Operation Inbox execution boundary', () => {
         meta = { ...meta, ...patch };
       },
     };
-    const doc = new SessionDocument(repo as never, sessionId, async () => {}, createSilentLogger());
+    let doc = new SessionDocument(repo as never, sessionId, async () => {}, createSilentLogger());
     const config = {
       prompt: 'CURRENT_REQUEST',
       cliType: 'builtin' as const,
@@ -10432,6 +10432,14 @@ describe('Operation Inbox execution boundary', () => {
         getOrOpenSessionCode: async () => null,
         updateAcpCapabilities: async () => {},
       } as never,
+      recordChatFailure: async (_doc, reason, message) => {
+        doc.sessionData.writer.append({
+          id: `notice:${reason}`,
+          role: 'system',
+          timestamp: '2026-10-12T00:00:00Z',
+          items: [{ type: 'system_notice', name: 'chat_failed', meta: { reason, message } }],
+        });
+      },
       beginConversationTurn: (_sid, id) => `assistant:${id}`,
       buildAcpPromptBlocks: async (args) =>
         build ? build(args.inputBlocks) : (args.inputBlocks as ContentBlock[]),
@@ -10450,31 +10458,33 @@ describe('Operation Inbox execution boundary', () => {
         });
       },
     });
-    const service = new SessionExecutionService(deps);
+    let service = new SessionExecutionService(deps);
     store.inbox.activate('workspace-1', 'owner');
-    const bridge = operationInboxLegacy({
-      workspaceId: 'workspace-1',
-      owner: 'owner',
-      sql: store.inbox,
-      ready: () => !!automaticFinished && !service.getExecutionSnapshot(sessionId).hasActiveTurn,
-      admit: () => true,
-      launch: async (batch) => {
-        await service.continueSession(
-          {
-            ...message,
-            userTurnId: batch.inputId,
-            acpSessionConfig: {
-              ...config,
-              prompt: 'Review attached completed results',
-              chainDepth: batch.chainDepth,
+    const openBridge = () =>
+      operationInboxLegacy({
+        workspaceId: 'workspace-1',
+        owner: 'owner',
+        sql: store.inbox,
+        ready: () => !!automaticFinished && !service.getExecutionSnapshot(sessionId).hasActiveTurn,
+        admit: () => true,
+        launch: async (batch) => {
+          await service.continueSession(
+            {
+              ...message,
+              userTurnId: batch.inputId,
+              acpSessionConfig: {
+                ...config,
+                prompt: 'Review attached completed results',
+                chainDepth: batch.chainDepth,
+              },
             },
-          },
-          { dispatchSource: 'inbox', inboxBatch: batch }
-        );
-        automaticFinished?.();
-      },
-      report: () => {},
-    });
+            { dispatchSource: 'inbox', inboxBatch: batch }
+          );
+          automaticFinished?.();
+        },
+        report: () => {},
+      });
+    let bridge = openBridge();
     service.setOperationInbox(bridge);
     const message = {
       type: 'session/chat' as const,
@@ -10519,10 +10529,38 @@ describe('Operation Inbox execution boundary', () => {
       store.close();
       fs.rmSync(root, { recursive: true, force: true });
     };
+    const restart = async () => {
+      const snapshot = doc.handle!.doc.export({ mode: 'snapshot' });
+      await bridge.close();
+      store.close();
+      store = new LodyOperationStore(path.join(root, 'operations.sqlite3'), () =>
+        Date.parse('2026-10-12T00:00:00Z')
+      );
+      const { LoroDoc } = await import('loro-crdt');
+      const raw = new LoroDoc();
+      raw.import(snapshot);
+      doc = new SessionDocument(repo as never, sessionId, async () => {}, createSilentLogger());
+      composeTestSessionDoc(doc, { doc: raw });
+      doc.waitUntilSynced = async () => {};
+      service = new SessionExecutionService(deps);
+      store.inbox.activate('workspace-1', 'owner');
+      bridge = openBridge();
+      service.setOperationInbox(bridge);
+    };
     return {
-      service,
-      store,
-      doc,
+      restart,
+      get bridge() {
+        return bridge;
+      },
+      get service() {
+        return service;
+      },
+      get store() {
+        return store;
+      },
+      get doc() {
+        return doc;
+      },
       session,
       client,
       deps,
@@ -10600,64 +10638,112 @@ describe('Operation Inbox execution boundary', () => {
     }
   });
 
-  it('retires a pending turn whose Inbox input already ended so later messages run', async () => {
-    const received: ContentBlock[][] = [];
-    const f = inboxExecutionFixture(async (blocks) => {
-      received.push(structuredClone(blocks));
-      return { stopReason: 'end_turn' };
-    });
-    try {
-      await f.accept();
-      const input = {
-        workspaceId: 'workspace-1',
-        sessionId: f.message.sessionId,
-        userId: 'user-1',
-        inputId: 'human-input',
-        kind: 'human' as const,
-        config: f.message.acpSessionConfig,
-      };
-      // State left by daemons before the withdraw fix: the input ended while its
-      // user turn stayed pending in history.
-      expect(f.store.inbox.begin(input, 'assistant:human-input')).toBe(true);
-      f.store.inbox.release({ ...input, executionId: 'assistant:human-input', outcome: 'failed' });
+  it.each(['unsubmitted', 'submitted', 'legacy', 'receipt-failed'] as const)(
+    'retires %s input after persistent shutdown and restart without replay',
+    async (mode) => {
+      const received: ContentBlock[][] = [];
+      const f = inboxExecutionFixture(async (blocks) => {
+        received.push(structuredClone(blocks));
+        return { stopReason: 'end_turn' };
+      });
+      try {
+        await f.accept();
+        const input = {
+          workspaceId: 'workspace-1',
+          sessionId: f.message.sessionId,
+          userId: 'user-1',
+          inputId: 'human-input',
+          kind: 'human' as const,
+          config: f.message.acpSessionConfig,
+        };
+        const owner = await f.bridge.openExecution(input, 'assistant:human-input');
+        if (mode === 'submitted') {
+          const submitted = await owner.submit(() => Promise.resolve('synthetic completed work'));
+          await submitted.value;
+        }
+        if (mode === 'receipt-failed') {
+          const db = new Database(f.storePath);
+          db.exec(
+            "CREATE TRIGGER reject_submission BEFORE UPDATE OF submission_started ON inbox_inputs BEGIN SELECT RAISE(ABORT,'synthetic storage failure'); END;"
+          );
+          const started: string[] = [];
+          await expect(owner.submit(() => started.push('transport'))).rejects.toThrow();
+          expect(started).toEqual([]);
+          db.exec('DROP TRIGGER reject_submission');
+          db.close();
+        }
+        await owner.finish('failed');
+        if (mode === 'legacy') {
+          const db = new Database(f.storePath);
+          db.exec('ALTER TABLE inbox_inputs DROP COLUMN submission_started');
+          db.close();
+        }
+        await f.restart();
 
-      await expect(f.service.continueSession(f.message)).resolves.toBeUndefined();
-      const backend = await createSessionBackend(f.doc);
-      const old = (await backend.readHistory()).find((turn) => turn.id === 'human-input');
-      expect(old).toMatchObject({ status: 'failed' });
-      if (!old) throw new Error('Missing original human input');
-      expect(f.service.getExecutionSnapshot(f.message.sessionId).hasActiveTurn).toBe(false);
-      expect(received).toEqual([]);
+        await expect(f.service.continueSession(f.message)).resolves.toBeUndefined();
+        let backend = await createSessionBackend(f.doc);
+        const old = (await backend.readHistory()).find((turn) => turn.id === 'human-input');
+        expect(old).toMatchObject({
+          status: mode === 'submitted' || mode === 'legacy' ? 'delivery_unknown' : 'failed',
+        });
+        const notices = (await backend.readHistory())
+          .flatMap((entry) => entry.items)
+          .filter((item) => item.type === 'system_notice');
+        expect(notices).toMatchObject([
+          {
+            name: 'chat_failed',
+            meta: {
+              reason:
+                mode === 'submitted' || mode === 'legacy'
+                  ? 'turn_outcome_unknown'
+                  : 'turn_pre_prompt_failed',
+            },
+          },
+        ]);
+        if (mode === 'submitted' || mode === 'legacy')
+          expect(JSON.stringify(notices)).toContain('could repeat work');
+        await f.restart();
+        backend = await createSessionBackend(f.doc);
+        await f.service.continueSession(f.message, { dispatchSource: 'crdt' });
+        expect(await backend.readTurn('human-input')).toMatchObject({
+          turn: {
+            status: mode === 'submitted' || mode === 'legacy' ? 'delivery_unknown' : 'failed',
+          },
+        });
+        if (!old) throw new Error('Missing original human input');
+        expect(f.service.getExecutionSnapshot(f.message.sessionId).hasActiveTurn).toBe(false);
+        expect(received).toEqual([]);
 
-      await f.doc.sessionData.commands.applyHistoryAction({
-        kind: 'upsert-turn',
-        turn: {
-          ...old,
-          id: 'next-human',
-          status: 'pending',
-          items: [{ type: 'text', text: 'NEXT_REQUEST' }],
-        },
-      });
-      const history = await backend.readHistory();
-      expect(
-        findNextDispatchableUserTurn(history, { id: f.message.sessionId } as SessionMeta)?.id
-      ).toBe('next-human');
-      await f.service.acceptInboxHumanInput({
-        sessionId: f.message.sessionId,
-        inputId: 'next-human',
-        userId: 'user-1',
-        config: { ...f.message.acpSessionConfig, prompt: 'NEXT_REQUEST' },
-      });
-      await f.service.continueSession({
-        ...f.message,
-        userTurnId: 'next-human',
-        acpSessionConfig: { ...f.message.acpSessionConfig, prompt: 'NEXT_REQUEST' },
-      });
-      expect(received).toEqual([[{ type: 'text', text: 'NEXT_REQUEST' }]]);
-    } finally {
-      await f.close();
+        await f.doc.sessionData.commands.applyHistoryAction({
+          kind: 'upsert-turn',
+          turn: {
+            ...old,
+            id: 'next-human',
+            status: 'pending',
+            items: [{ type: 'text', text: 'NEXT_REQUEST' }],
+          },
+        });
+        const history = await backend.readHistory();
+        expect(
+          findNextDispatchableUserTurn(history, { id: f.message.sessionId } as SessionMeta)?.id
+        ).toBe('next-human');
+        await f.service.acceptInboxHumanInput({
+          sessionId: f.message.sessionId,
+          inputId: 'next-human',
+          userId: 'user-1',
+          config: { ...f.message.acpSessionConfig, prompt: 'NEXT_REQUEST' },
+        });
+        await f.service.continueSession({
+          ...f.message,
+          userTurnId: 'next-human',
+          acpSessionConfig: { ...f.message.acpSessionConfig, prompt: 'NEXT_REQUEST' },
+        });
+        expect(received).toEqual([[{ type: 'text', text: 'NEXT_REQUEST' }]]);
+      } finally {
+        await f.close();
+      }
     }
-  });
+  );
 
   it('journals later resources through the active Session adapter before releasing execution', async () => {
     const started = createDeferred<void>();
@@ -11078,7 +11164,7 @@ describe('Operation Inbox execution boundary', () => {
       };
       const id = (item as Extract<typeof item, { type: 'operation_completion_batch' }>).batchId;
       expect(f.store.inbox.getBatch(id, scope)?.state).toBe('unknown');
-      const other = new LodyOperationStore(f.storePath);
+      const other = new LodyOperationStore(f.storePath, () => Date.parse('2026-10-12T00:00:00Z'));
       try {
         other.inbox.activate('workspace-1', 'replacement');
         expect(other.inbox.getBatch(id, scope)?.state).toBe('unknown');
