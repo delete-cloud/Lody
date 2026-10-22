@@ -312,6 +312,7 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
   let reordered = false;
   let indexedLength = -1;
   let indexedOpCount = -1;
+  let appendFrom: number | undefined;
   const indexedUsers = new Set<string>();
   const awaitingUsers = new Set<string>();
   const unsubscribeIdentity = doc.subscribe((batch) => {
@@ -320,9 +321,9 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
     );
     const identityEdits = batch.events.filter(isTurnIdentityEdit);
     if (structural.length === 0 && identityEdits.length === 0) return;
+    appendFrom = undefined;
     let appendOnly =
       !identityDirty &&
-      !reordered &&
       list.length > indexedLength &&
       identityEdits.every(
         (event) => typeof event.path[1] === 'number' && event.path[1] >= indexedLength
@@ -357,6 +358,7 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
       if (id !== undefined) positions.set(id, position);
       orderedPositions.push(position);
     }
+    appendFrom = indexedLength;
     indexedLength = list.length;
     indexedOpCount = doc.opCount();
     identityDirty = false;
@@ -368,6 +370,7 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
     if (!identityDirty && indexedLength === list.length) {
       if (doc.getPendingTxnLength() === 0 || indexedOpCount === doc.opCount()) return;
     }
+    appendFrom = undefined;
     positions.clear();
     const entries = Array.from({ length: list.length }, (_, position) => {
       const value = list.get(position);
@@ -473,7 +476,12 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
         if (!scope) return;
         if (scope.structural) {
           ensureIdentityIndex();
-          const from = previouslyReordered || reordered ? 0 : scope.from;
+          const from =
+            appendFrom !== undefined && scope.from >= appendFrom
+              ? appendFrom
+              : previouslyReordered || reordered
+                ? 0
+                : scope.from;
           previouslyReordered = reordered;
           listener({ kind: 'structure', from, to: scope.to });
         } else {

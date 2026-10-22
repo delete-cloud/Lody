@@ -33,12 +33,22 @@ body edits retain the index and report the original turn id. Editable-tail plann
 reader order and translates retained rows back to storage; import comparisons use raw
 captures. Failure notices, warnings and file/image fallbacks keep their captured owner.
 
-Ordinary tail appends extend the existing shallow index. A new user matching an
-orphan output, insertion/deletion, identity edit, or existing inversion rebuilds it.
+Ordinary tail appends extend the existing shallow index even when the stored prefix
+remains inverted. The shared index records the unchanged display-prefix length, so
+every observer receives only the appended suffix. A new user matching an orphan
+output, middle insertion/deletion, or identity edit still rebuilds the projection;
+a mixed prefix-content edit and append also invalidates the affected prefix.
 Legacy text association edits invalidate positions too. The previous eager observer
 rescanned every prefix during synchronous history seeding: 128 appends performed
 8256 slot reads. The deterministic regression fails before this correction and passes
-with the incremental path, while still checking late-user causal order. Browser
+with the incremental path, while still checking late-user causal order. Independent review found that the initial append optimization excluded permanently
+inverted storage and still notified from zero. With 1000 existing rows, three appends
+therefore caused 1001/1002/1003 internal slot reads and 3003/3006/3009 reads including
+two consumers. The correction keeps those reads at one for the shared index and one
+per consumer, with notifications from 1000/1001/1002. Native Loro regressions cover
+128/1000-row prefixes, both subscriptions and invalidating mutations without moving
+stored containers. This performance defect is separate from the direct-array mobile
+created-session story's wheel failure. Browser
 acceptance is needed to classify the old CI timeout conclusively.
 
 ## Verification and limits

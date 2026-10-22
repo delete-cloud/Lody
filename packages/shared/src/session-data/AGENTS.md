@@ -15,6 +15,8 @@
   one observation instead of serializing the transcript on every token.
 - Loro directory, positional reads and `readAll` project `orderSessionHistory` without
   rewriting storage. Share a shallow order index; body edits must not rebuild it.
+  Stable suffix appends retain the projected prefix even if storage remains inverted;
+  notify every observer only from the previous display length.
   Association edits invalidate structural positions. Writer captures retain raw order and existing containers; never copy/delete rows to repair order.
   Ordering anchors at the first user copy; targeted identity lookup stays last-copy.
 - Repeated identity lookups reuse an unchanged pending transaction. Reads must not

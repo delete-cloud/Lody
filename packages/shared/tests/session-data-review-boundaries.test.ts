@@ -451,6 +451,176 @@ it('extends the causal index during ordinary tail appends without rescanning the
   doc.free();
 });
 
+it.each([128, 1000])(
+  'extends a permanently inverted %i-row prefix with suffix reads for two observers',
+  async (prefixRows) => {
+    const doc = new LoroDoc();
+    const data = createLoroSessionData({ doc, sessionId });
+    data.writer.append({ ...turn('assistant:u'), role: 'assistant', userTurnId: 'u' });
+    data.writer.append(turn('u'));
+    for (let index = 2; index < prefixRows; index++) data.writer.append(turn(`prefix-${index}`));
+    const list = doc.getList('history');
+    const originalContainer = (list.get(0) as LoroMap).id;
+    const initialIds = [
+      'u',
+      'assistant:u',
+      ...Array.from({ length: prefixRows - 2 }, (_, i) => `prefix-${i + 2}`),
+    ];
+    const directories: string[][] = [[], []];
+    const notices: SessionDataChange[][] = [[], []];
+    let consumer: number | undefined;
+    const observations = directories.map((_directory, subscriber) =>
+      data.history.observe((change) => {
+        notices[subscriber]!.push(change);
+        if (change.kind !== 'structure') return;
+        consumer = subscriber;
+        try {
+          const suffix = data.history.readDirectory(change.from, change.to);
+          directories[subscriber]!.splice(
+            change.from,
+            Infinity,
+            ...suffix.map((row) => row.turnId!)
+          );
+        } finally {
+          consumer = undefined;
+        }
+      })
+    );
+    for (const [index, observation] of observations.entries()) {
+      directories[index] = (await observation.initial).map((row) => row.turnId!);
+      expect(directories[index]).toEqual(initialIds);
+    }
+    let previousLength = prefixRows;
+    let record = { internal: 0, consumers: [0, 0], prefixReads: 0 };
+    const records: (typeof record)[] = [];
+    const originalGet = LoroList.prototype.get;
+    const get = vi.spyOn(LoroList.prototype, 'get').mockImplementation(function (index) {
+      if (this.id === list.id) {
+        if (consumer === undefined) record.internal++;
+        else record.consumers[consumer]!++;
+        if (index < previousLength) record.prefixReads++;
+      }
+      return originalGet.call(this, index);
+    });
+    try {
+      for (let append = 0; append < 3; append++) {
+        previousLength = prefixRows + append;
+        record = { internal: 0, consumers: [0, 0], prefixReads: 0 };
+        data.writer.append(turn(`suffix-${append}`));
+        records.push(record);
+      }
+    } finally {
+      get.mockRestore();
+    }
+    try {
+      const expected = [...initialIds, 'suffix-0', 'suffix-1', 'suffix-2'];
+      expect(directories).toEqual([expected, expected]);
+      expect
+        .soft(records)
+        .toEqual(
+          Array.from({ length: 3 }, () => ({ internal: 1, consumers: [1, 1], prefixReads: 0 }))
+        );
+      const suffixNotices = Array.from({ length: 3 }, (_, index) => ({
+        kind: 'structure',
+        from: prefixRows + index,
+        to: prefixRows + index + 1,
+      }));
+      expect.soft(notices).toEqual([suffixNotices, suffixNotices]);
+      expect(
+        data.writer
+          .readStored()
+          .slice(0, 2)
+          .map((row) => row.id)
+      ).toEqual(['assistant:u', 'u']);
+      expect((list.get(0) as LoroMap).id).toBe(originalContainer);
+    } finally {
+      for (const observation of observations) observation.unsubscribe();
+      data.dispose();
+      doc.free();
+    }
+  }
+);
+
+it.each([
+  'late user',
+  'middle insert',
+  'middle delete',
+  'identity',
+  'mixed content append',
+] as const)('invalidates a projected prefix after %s for both observers', async (mutation) => {
+  const doc = new LoroDoc();
+  const data = createLoroSessionData({ doc, sessionId });
+  data.writer.append({ ...turn('assistant:u'), role: 'assistant', userTurnId: 'u' });
+  data.writer.append(turn('u'));
+  data.writer.append({ ...turn('assistant:late'), role: 'assistant', userTurnId: 'late' });
+  data.writer.append(turn('other'));
+  const cached: { id?: string; status?: unknown }[][] = [[], []];
+  const changes: SessionDataChange[][] = [[], []];
+  const observations = cached.map((_rows, subscriber) =>
+    data.history.observe((change) => {
+      changes[subscriber]!.push(change);
+      if (change.kind === 'structure') {
+        cached[subscriber]!.splice(
+          change.from,
+          Infinity,
+          ...data.history
+            .readDirectory(change.from, change.to)
+            .map((row) => ({ id: row.turnId, status: row.scalars?.status }))
+        );
+      }
+    })
+  );
+  for (const [index, observation] of observations.entries())
+    cached[index] = (await observation.initial).map((row) => ({
+      id: row.turnId,
+      status: row.scalars?.status,
+    }));
+  try {
+    data.writer.append(turn('ordinary'));
+    const list = doc.getList('history');
+    let expected: string[];
+    switch (mutation) {
+      case 'late user':
+        data.writer.append(turn('late'));
+        expected = ['u', 'assistant:u', 'other', 'ordinary', 'late', 'assistant:late'];
+        break;
+      case 'middle insert':
+        list.insert(2, turn('middle'));
+        doc.commit();
+        expected = ['u', 'assistant:u', 'middle', 'assistant:late', 'other', 'ordinary'];
+        break;
+      case 'middle delete':
+        list.delete(1, 1);
+        doc.commit();
+        expected = ['assistant:u', 'assistant:late', 'other', 'ordinary'];
+        break;
+      case 'identity':
+        data.writer.updateEntry('assistant:u', (row) => ({ ...row, userTurnId: 'other' }));
+        expected = ['u', 'assistant:late', 'other', 'assistant:u', 'ordinary'];
+        break;
+      case 'mixed content append':
+        (list.get(1) as LoroMap).set('status', 'handled');
+        data.writer.append(turn('mixed'));
+        expected = ['u', 'assistant:u', 'assistant:late', 'other', 'ordinary', 'mixed'];
+        break;
+    }
+    for (const [subscriber, rows] of cached.entries()) {
+      expect(rows.map((row) => row.id)).toEqual(expected);
+      expect(changes[subscriber]!.at(-1)).toEqual({
+        kind: 'structure',
+        from: 0,
+        to: expected.length,
+      });
+      if (mutation === 'mixed content append') expect(rows[0]?.status).toBe('handled');
+    }
+    expect(data.history.readAll().map((row) => row.id)).toEqual(expected);
+  } finally {
+    for (const observation of observations) observation.unsubscribe();
+    data.dispose();
+    doc.free();
+  }
+});
+
 it('reorders legacy text associations after an in-place remote-style edit', () => {
   const doc = new LoroDoc();
   const data = createLoroSessionData({ doc, sessionId });
