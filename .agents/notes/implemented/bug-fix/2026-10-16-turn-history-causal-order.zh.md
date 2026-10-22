@@ -1,4 +1,4 @@
-# RPC 历史门禁释放后的因果顺序修复
+# 用户消息延迟同步后的因果历史读取
 
 Status: implemented
 Translation: current
@@ -7,137 +7,20 @@ Translation: current
 
 ## 摘要
 
-有界历史门禁释放后，RPC 输出可能排在迟到用户条目之前。执行端创建门禁时登记文档级修复，
-共享读取为已有倒序提供因果顺序。修复保留用户容器，等待所有未决权限 outcome，包括已结束条目，
-因为复制 assistant 会废弃远程回复所指向的容器。权限一直未决时存储可长期倒序，读取仍保持因果顺序。
+RPC 回合可能在用户消息同步前产生输出。20 秒等待结束后，普通 LoroList 可能收敛为输出在前的顺序。共享读取器将关联输出返回在用户消息之后，不修改存储。回合内写入方在异步操作或清理前捕获用户消息 id。原始快照保留存储顺序，用于导入基线与回滚。
 
-## 证据与决策
+## 决定与修正
 
-基线为 `8bda5ae33f97fae84e388cb57d6d3ec92566b1f5`，Loro 为 1.16.3。
-测试使用真实 MessageHandler、LoroRepo、SessionDocument 和两个内存副本，以执行端 peer 1、
-客户端 peer 2 复现并发倒序。门禁使用假时钟，副本通过显式 import 同步；断言修复前原始倒序、
-即时读取顺序，以及修复后两端原始列表收敛。
+本次删除先前由执行端复制再删除容器的修复。复制已挂载的 LoroList 容器会产生新身份；离线副本仍可能更新旧的回复、工具或权限容器，删除后这些更新不可见。等待权限回复并不能证明所有副本已经停止写入。读取排序是较简单且安全的替代方案，不需要存储迁移。本次不迁移 LoroMovableList。
 
-创建门禁时先登记修复。超时、门禁销毁及回合替换释放写入，但不撤销文档级修复。
-失败通知在失败入口、警告通知在入队时捕获 `userTurnId`，早于 finalization 清理 turn 或任何 await；活跃回合文件/图片回退跨上传与门禁等待保留原所属用户。
-writer 只移动关联非用户条目，用户及无关条目保留相对顺序。修复和读取以第一份真正的用户副本为锚点，
-两份用户副本之间的合法 assistant 不移动；普通定向身份查询仍选择最后一份匹配条目。
+`session-history-order.ts` 使用 `userTurnId` 关联非用户行，只有 assistant 可回退到 `assistant:<userTurnId>`。倒置行放在首个匹配用户之后，无关行保持相对顺序。没有关联的历史通知不能通过时间戳推断。按身份读取仍选择最后一个重复副本。
 
-`HistoryWriter` 将倒置的关联非用户附着容器复制到锚点之后，并在同次提交删除旧位置，保留未知字段。
-复制产生新容器 id；用户容器保留原身份及并发状态/配置修改。流式写入每次按业务条目 id 重新定位，
-测试覆盖移动后的继续输出与重启。
+Loro 读取器在目录、窗口、模型摘要、选定输出及完整导出中共用浅层顺序索引。关联编辑使位置失效；正文编辑保留索引并报告原回合 id。末尾编辑按读取顺序规划，再将保留行对应回存储；导入比较使用原始快照。失败通知、警告及文件和图片回退保留捕获的用户归属。
 
-已结束条目仍可接受原先缺失的权限 outcome。双副本回归在 outcome 缺失时保留原 assistant 容器，
-在尝试修复之后由另一副本提交决定，再验证修复复制已接受结果并在两端收敛。`finished` 从不解除等待。
-显式 null 也保守推迟，尽管当前单赋值 responder 会拒绝已有 null 的 outcome。
-回复不构成重新执行已结束回合的授权。只要 daemon 的权限等待器仍存活且写入成功，权限超时写入
-`cancelled` outcome 后即可修复；daemon 重启或写入失败的残留仍由读取投影覆盖。
+普通尾部追加增量扩展浅层索引。新用户匹配此前缺少用户的输出、插入或删除、身份修改、现有倒置时才重建。旧式文本关联修改也会使位置失效。此前观察器在同步初始化时每次追加都重扫前缀，128 次追加读取了 8256 个槽位。确定性回归在修正前失败，增量路径通过，且仍检查迟到用户的因果顺序。旧 CI 超时的最终分类仍需要浏览器验收。
 
-失败处理在 finalization 之后写通知时，已无法从 MessageHandler 的 idle turn 恢复用户身份。
-外层错误 handler 从所持 runtime 对象保留 `userTurnId`，即使 Effect release 已删除 runtime 索引；
-`handleTurnError` 在 finalization 前保存显式关联。静默失败、已知启动失败、机器拒绝及缺失历史恢复也显式透传。预提示设置失败已有输入 runtime，因此同样关联该输入；
-没有人类用户条目的队列 goal 控制失败显式不关联，不借用另一个活跃回合或永久保留的 late ACP target。
-未提供显式 association 的直接调用仍在 live-turn 路径读取当前身份。可选 association 对象即使用户 id
-缺失也保留“调用者已决定无关联”的含义。
+## 验证与限制
 
-warning 的正常 finalization 会排空 notice 队列；若更早的 ACP flush 抛错，会在排空前进入 finally 清理。
-因此事件监听器在入队前捕获身份，排队任务不在执行时重新查询。这也避免旧 warning 借用下一回合身份。
-配置警告在等待模型/配置请求前捕获身份。首次在 idle 后发出的 warning 没有 provider turn id，
-保持无关联，不从 late ACP target 猜测。
-修复调度的实例不匹配检查进入 try/finally，确保调度标记会清理。
+确定性测试通过假时钟与两个真实 Loro 副本驱动 MessageHandler，覆盖清理、重启、终结、通知、上传及权限回复，并覆盖实际窗口读取器、转录消费者和末尾编辑回滚。断言原始顺序与容器身份不变，同时读取顺序正确且同步后可继续编辑。浏览器与 daemon 验收在授权 VM 单独执行。未实现该排序的旧读取器仍显示物理顺序。纯排序计算无需 Effect 迁移；现有等待门与 Session 编排依赖保持原样。
 
-修复、读取排序及单回合输出共用关联函数。字符串 `userTurnId` 优先，否则仅 assistant 可使用
-`assistant:<userTurnId>` 回退，包括非字符串的损坏关联。用户不作为执行端输出关联。
-目录、位置及完整读取共享因果顺序，不改存储；CLI/MCP 导出和 renderer ConversationView 使用该读取层。
-
-编辑尾部规划现在与资格检查使用相同的投影顺序，再将保留行引用映射回存储位置，避免重排原始前缀。
-条件回滚恢复原始存储顺序；交错的保留行仍受保守的变更区间冲突检查保护。导入提交哈希原本使用原始存储，
-但 CLI 冲突预检查使用投影读取；两处预检查现改用已有存储快照接口，cursor 基线保持原始顺序，
-不改变哈希或存储格式。若完整导入替换要重排保留的存储身份，仍沿用 writer 既有
-`unsupported_reorder` 拒绝规则，本次不放宽该限制。
-
-修复观察器直接订阅所组合的 Loro 文档，不再生成未使用的初始目录。结构、身份、item 结构及权限变化
-触发重试，普通流式文本不触发。待处理 id 共用合并微任务，用户缺失时先查身份索引。
-重新组合会清理订阅、待处理 id 和旧队列工作；Roost 不登记这项仅适用于 Loro 的修复。
-
-契约：[历史写入](../../../../specs/session-history-writes.zh.md)。
-本决策扩展[单写入者约束](../architecture/2026-09-07-single-history-writer.zh.md)。
-
-## 替代方案与剩余限制
-
-- 仅超时登记会遗漏打开前销毁和重启路径。
-- 仅读取排序不修复持久顺序，但可安全覆盖历史会话及 outcome 永不到达的权限。
-- 移动用户会因 LoroList 复制附着容器而丢失并发编辑；移动带未决权限的已结束 assistant 也有同类风险。
-- 门禁无限等待会破坏有界退化，因此只推迟结构移动。
-- 改为 movable list 可跨副本保留移动容器身份，但需要跨版本存储迁移，超出本次修正。
-
-没有简单守卫能证明任意副本以后不会写入旧非用户子树。这里保护权限回复；其他旧副本子树编辑及
-锚定旧条目的插入仍未验证。单执行端流式写入按 id 找当前条目。更广泛的远程修改安全需要存储/身份设计，
-不能假定 `finished` 意味着不可变。
-
-Loro 1.16.3 的插入/删除修复不是可中止事务。原生调用中途异常可能留下待提交的部分操作，
-临时故障注入探针确认后续无关提交会刷出部分复制；探针在执行后移除。
-本次不声称修复具备异常原子性。fork/import 暂存会绕过仅上传本地事件的传输契约，整文档 revert
-会引入无关补偿写入，因此延后处理异常安全移动。相关结构/权限事件仍可能触发扫描。
-没有真正用户条目的 id（即使非用户条目同 id）持续等待到用户到达或文档销毁。
-关闭/重新组合丢弃登记；重新打开仅投影顺序，不迁移历史存储。未关联历史通知/文件无法从时间戳恢复。
-未声称已部署客户端验收。
-
-## 通知清理修正之前的验证
-
-修复前新增共享回归实际出现六个失败，覆盖已结束权限、重复用户、损坏关联回退、旧式单回合输出及
-两种倒序编辑尾部。两个真实导入 writer 回归也因投影/原始基线分歧失败。
-这些已执行失败证明移除修复会失败；最终聚焦命令与结果如下。
-
-独立审查由 host 安排，自测不替代独立审查。
-
-环境：Node 22.23.2、pnpm 10.20.0；未改依赖或 submodule 锁定版本。
-
-```sh
-TMPDIR="$PWD/.turn-order-followup-tmp" corepack pnpm --filter lody exec vitest run tests/message-handler-turn-history-gate.test.ts src/session/turn-history-gate.test.ts tests/session-history-targeted-write.test.ts src/session/session-backend.test.ts src/lib/session-export/formatters.test.ts tests/message-handler-image-upload.test.ts tests/local-project-history-sync-writer.test.ts tests/local-project-history-sync-service.test.ts src/session/session-edit-and-resend-service.test.ts --maxWorkers=2
-corepack pnpm --filter @lody/shared exec vitest run tests/history-writer.test.ts tests/session-doc-forward-compat.test.ts tests/session-data-review-boundaries.test.ts tests/session-history-import-port.test.ts tests/session-history-actions.test.ts --maxWorkers=2
-corepack pnpm --filter @lody/components exec vitest run tests/conversation-view-from-reader.test.ts tests/use-session-doc-open.test.tsx tests/latest-frame-subscription.test.ts tests/no-materialized-history-in-components.test.ts --maxWorkers=2
-TMPDIR="$PWD/.turn-order-followup-tmp" corepack pnpm --filter lody exec vitest run tests/message-handler-turn-history-gate.test.ts src/session/turn-history-gate.test.ts --maxWorkers=2
-corepack pnpm --filter lody typecheck
-corepack pnpm --filter @lody/shared typecheck
-corepack pnpm --filter @lody/components typecheck
-corepack pnpm check:local-loro-writer-boundary
-corepack pnpm run docs status
-corepack pnpm run docs check
-corepack pnpm exec oxlint --type-aware --quiet apps/cli/src/lib/local-project-history-sync-service.ts apps/cli/src/lib/loro/doc.ts apps/cli/src/session/turn-history-gate.ts apps/cli/tests/local-project-history-sync-writer.test.ts apps/cli/tests/message-handler-turn-history-gate.test.ts packages/shared/src/history-writer.ts packages/shared/src/session-data/loro.ts packages/shared/src/session-data/read.ts packages/shared/src/session-history-order.ts packages/shared/tests/history-writer.test.ts packages/shared/tests/session-data-review-boundaries.test.ts
-corepack pnpm exec oxfmt --check .agents/notes/implemented/bug-fix/2026-10-16-turn-history-causal-order.md .agents/notes/implemented/bug-fix/2026-10-16-turn-history-causal-order.zh.md apps/cli/src/lib/local-project-history-sync-service.ts apps/cli/src/lib/loro/doc.ts apps/cli/src/session/turn-history-gate.ts apps/cli/tests/local-project-history-sync-writer.test.ts apps/cli/tests/message-handler-turn-history-gate.test.ts packages/shared/src/history-writer.ts packages/shared/src/session-data/AGENTS.md packages/shared/src/session-data/loro.ts packages/shared/src/session-data/read.ts packages/shared/src/session-history-order.ts packages/shared/tests/history-writer.test.ts packages/shared/tests/session-data-review-boundaries.test.ts specs/session-history-writes.md specs/session-history-writes.zh.md
-```
-
-CLI 9 套件 / 168 项、共享层 5 套件 / 106 项、components 4 套件 / 41 项全部通过；
-最后门禁复跑 2 套件 / 36 项通过。三包 typecheck、local-writer 边界检查均通过。
-聚焦 type-aware Oxlint 为 164 warnings、零 errors；Oxfmt 检查 16 个变更文件；
-docs check 零错误，保留仓库既有警告。未重跑完整 `pnpm check`。本次无伙伴委派，
-host 安排的独立审查与这些自测分开。
-
-## 通知身份跨清理的验证
-
-新增的四个真实 MessageHandler/双副本用例在关联修复前失败：finalization 后失败、静默失败、
-机器拒绝，以及清理前入队而清理后执行的 warning。断言原用户关联、并发原始倒序、读取投影和
-两端持久列表收敛。实际 ACP finalization 仅替代传输同步确认。execution-service 测试另验证
-Effect release 已删除 runtime 索引后的持久通知关联。Codex/Claude 两个模型警告用例在
-配置请求清理 turn 后返回时也先实际失败。定时器与队列释放使用假时钟及显式信号。
-
-本次修正的命令（在 worktree 根目录执行）：
-
-```sh
-TMPDIR="$PWD/.turn-order-followup-tmp" corepack pnpm --filter lody exec vitest run tests/message-handler-turn-history-gate.test.ts src/session/turn-history-gate.test.ts tests/session-execution-service.test.ts tests/session-dispatch-watcher.test.ts tests/session-history-targeted-write.test.ts src/session/session-backend.test.ts src/lib/session-export/formatters.test.ts tests/message-handler-image-upload.test.ts tests/local-project-history-sync-writer.test.ts tests/local-project-history-sync-service.test.ts src/session/session-edit-and-resend-service.test.ts --maxWorkers=2
-corepack pnpm --filter @lody/shared exec vitest run tests/history-writer.test.ts tests/session-doc-forward-compat.test.ts tests/session-data-review-boundaries.test.ts tests/session-history-import-port.test.ts tests/session-history-actions.test.ts --maxWorkers=2
-corepack pnpm --filter lody typecheck
-corepack pnpm check:local-loro-writer-boundary
-corepack pnpm run docs status
-corepack pnpm run docs check
-corepack pnpm exec oxlint --type-aware --quiet apps/cli/src/lib/loro/doc.ts apps/cli/src/lib/message-handler.ts apps/cli/src/session/session-dispatch-watcher.ts apps/cli/src/session/session-execution-service.ts apps/cli/tests/message-handler-turn-history-gate.test.ts apps/cli/tests/session-dispatch-watcher.test.ts apps/cli/tests/session-execution-service.test.ts
-corepack pnpm exec oxfmt --check .agents/notes/implemented/bug-fix/2026-10-16-turn-history-causal-order.md .agents/notes/implemented/bug-fix/2026-10-16-turn-history-causal-order.zh.md apps/cli/src/lib/acp/AGENTS.md apps/cli/src/lib/loro/doc.ts apps/cli/src/lib/message-handler.ts apps/cli/src/session/session-dispatch-watcher.ts apps/cli/src/session/session-execution-service.ts apps/cli/tests/message-handler-turn-history-gate.test.ts apps/cli/tests/session-dispatch-watcher.test.ts apps/cli/tests/session-execution-service.test.ts specs/session-history-writes.md specs/session-history-writes.zh.md
-```
-
-本次最终验证：CLI 11 套件 / 500 项、共享层 5 套件 / 106 项全部通过。CLI typecheck
-与 local-writer 边界检查通过；七个变更 TypeScript 文件的 type-aware Oxlint 为
-454 warnings、零 errors。本次仅修正 CLI，未重跑完整 `pnpm check` 或 renderer 套件，
-此前 renderer 证据仍仅对应已记录版本。未委派伙伴，新提交的 host 独立审查另行进行。
-Oxfmt 检查全部 12 个变更文件；文档检查零错误、68 条既有仓库警告
-（ACP 契约的字节计数发生变化）。
+相关决定：[单一写入方](../architecture/2026-09-07-single-history-writer.md)、[读取规则](../../../../packages/shared/src/session-data/AGENTS.md)。

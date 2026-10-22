@@ -468,7 +468,7 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
     'silent-finalized',
     'machine-denied',
     'warning-after-clear',
-  ] as const)('repairs late replica sync for %s', async (path) => {
+  ] as const)('reads late replica sync causally for %s', async (path) => {
     const clearTurn = path === 'restart';
     const sessionId = `s-gate-replicas-${path}` as SessionId;
     const userTurnId = 'late-user';
@@ -630,19 +630,23 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
       ).toEqual(expected);
       daemon.import(client.export({ mode: 'snapshot' }));
       await vi.advanceTimersByTimeAsync(0);
-      expect(storedIds(daemon)).toEqual(expected);
+      expect(readSessionHistory(doc.sessionData.history).map((row) => row.id)).toEqual(expected);
       expect(
         doc.sessionData.writer
           .readStored()
           .filter((row) => row.id !== userTurnId && row.id !== turnId)
       ).toEqual(associatedRows);
-      expect((daemon.getList('history').get(0) as LoroMap).id).toBe(clientUserContainer.id);
+      expect((daemon.getList('history').get(expected.length - 1) as LoroMap).id).toBe(
+        clientUserContainer.id
+      );
       clientUserContainer.set('inputConfig', { modelId: 'concurrent-model' });
       client.commit();
       client.import(daemon.export({ mode: 'snapshot' }));
       daemon.import(client.export({ mode: 'snapshot' }));
       await vi.advanceTimersByTimeAsync(0);
-      expect(storedIds(client)).toEqual(expected);
+      expect(
+        readSessionHistoryFromReplica(client, clientMirror.historyWriter).map((row) => row.id)
+      ).toEqual(expected);
       expect(storedIds(daemon)).toEqual(storedIds(client));
       expect(readSessionHistory(doc.sessionData.history)[0]?.inputConfig?.modelId).toBe(
         'concurrent-model'
@@ -675,7 +679,9 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
       handler.enqueueACPUpdate(sessionId, agentChunk(sessionId, ' after restart'));
       await vi.advanceTimersByTimeAsync(200);
       client.import(daemon.export({ mode: 'snapshot' }));
-      expect(storedIds(client)).toEqual(expected);
+      expect(
+        readSessionHistoryFromReplica(client, clientMirror.historyWriter).map((row) => row.id)
+      ).toEqual(expected);
       expect(
         readSessionHistory(doc.sessionData.history).find((row) => row.id === turnId)?.items
       ).toEqual([{ type: 'text', text: 'before sync after repair after restart' }]);
@@ -686,7 +692,7 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
     }
   });
 
-  it('releases document-owned repair on disposal without changing late imported entries', async () => {
+  it('keeps stored entries unchanged after disposal and late import', async () => {
     const sessionId = 's-gate-doc-dispose' as SessionId;
     const { repo, doc, handler } = await createHandlerHarness(sessionId);
     const daemon = doc.handle?.doc;
@@ -780,8 +786,8 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
         }
         await vi.advanceTimersByTimeAsync(0);
         expect(doc.sessionData.writer.readStored().map((row) => row.id)).toEqual([
-          userTurnId,
           turnId,
+          userTurnId,
         ]);
         expect(readSessionHistory(doc.sessionData.history)[1]?.items[0]).toMatchObject({
           permissionRequest: { outcome: { outcome: 'selected', optionId: 'allow' } },
@@ -792,85 +798,6 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
       }
     }
   );
-
-  it('arms without a directory snapshot and skips ordinary streamed text rechecks', async () => {
-    const sessionId = 's-gate-repair-events' as SessionId;
-    const { repo, doc } = await createHandlerHarness(sessionId);
-    try {
-      await updateTestHistory(doc, () => [
-        {
-          ...userEntry('assistant:u'),
-          role: 'assistant',
-          items: [
-            {
-              type: 'tool_call',
-              toolCallId: 'tool',
-              status: 'pending',
-              permissionRequest: { requestId: 'request', options: [] },
-            },
-            { type: 'text', text: 'start' },
-          ],
-        },
-        userEntry('u'),
-      ]);
-      const observe = vi.spyOn(doc.sessionData.history, 'observe');
-      const repair = vi.spyOn(doc.sessionData.writer, 'repairTurnOrder');
-      doc.watchTurnHistoryOrder('u');
-      await vi.advanceTimersByTimeAsync(0);
-      expect(observe).not.toHaveBeenCalled();
-      expect(repair).toHaveBeenCalledTimes(1);
-      await updateTestHistory(doc, (history) => {
-        history[0]!.items[1] = { type: 'text', text: 'streamed text' };
-        return history;
-      });
-      await vi.advanceTimersByTimeAsync(0);
-      expect(repair).toHaveBeenCalledTimes(1);
-      doc.sessionData.writer.respondPermission('request', { outcome: 'cancelled' });
-      await vi.advanceTimersByTimeAsync(0);
-      expect(repair).toHaveBeenCalledTimes(2);
-      expect(doc.sessionData.writer.readStored().map((row) => row.id)).toEqual([
-        'u',
-        'assistant:u',
-      ]);
-    } finally {
-      await doc.destroy({ preserveStatus: true });
-      await destroyRepoOnRealTimers(repo);
-    }
-  });
-
-  it('drops old repair subscriptions and queued work when composing another document', async () => {
-    const sessionId = 's-gate-repair-swap' as SessionId;
-    const { repo } = await createHandlerHarness(sessionId);
-    const doc = new SessionDocument(repo, sessionId, async () => {});
-    const oldDoc = new LoroDoc(),
-      newDoc = new LoroDoc();
-    try {
-      doc.composeSessionData(oldDoc);
-      doc.watchTurnHistoryOrder('old');
-      doc.composeSessionData(newDoc);
-      doc.sessionData.writer.append({ ...userEntry('assistant:new'), role: 'assistant' });
-      doc.sessionData.writer.append(userEntry('new'));
-      const repair = vi.spyOn(doc.sessionData.writer, 'repairTurnOrder');
-      doc.watchTurnHistoryOrder('new');
-      await vi.advanceTimersByTimeAsync(0);
-      expect(repair.mock.calls).toEqual([['new']]);
-      expect(doc.sessionData.writer.readStored().map((row) => row.id)).toEqual([
-        'new',
-        'assistant:new',
-      ]);
-      oldDoc.getList('history').insert(0, userEntry('old'));
-      oldDoc.commit();
-      await vi.advanceTimersByTimeAsync(0);
-      expect(repair).toHaveBeenCalledTimes(1);
-      doc.composeSessionData(newDoc, undefined, { historyBackend: 'roost' });
-      doc.watchTurnHistoryOrder('unavailable');
-      await vi.advanceTimersByTimeAsync(0);
-      expect(repair).toHaveBeenCalledTimes(1);
-    } finally {
-      await doc.destroy({ preserveStatus: true });
-      await destroyRepoOnRealTimers(repo);
-    }
-  });
 
   it('reads a historical inversion in causal order through the CLI/MCP transcript boundary', async () => {
     const sessionId = 's-gate-historical' as SessionId;

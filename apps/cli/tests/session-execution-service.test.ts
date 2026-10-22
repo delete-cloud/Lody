@@ -11135,7 +11135,7 @@ describe('Operation Inbox execution boundary', () => {
       };
       const id = (item as Extract<typeof item, { type: 'operation_completion_batch' }>).batchId;
       expect(f.store.inbox.getBatch(id, scope)?.state).toBe('unknown');
-      const other = new LodyOperationStore(f.storePath);
+      const other = new LodyOperationStore(f.storePath, () => Date.parse('2026-10-12T00:00:00Z'));
       try {
         other.inbox.activate('workspace-1', 'replacement');
         expect(other.inbox.getBatch(id, scope)?.state).toBe('unknown');

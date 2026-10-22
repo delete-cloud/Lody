@@ -1,4 +1,4 @@
-import { orderSessionHistory } from '../session-history-order';
+import { orderSessionHistory, sessionHistoryUserTurnId } from '../session-history-order';
 import { selectTurnOutput } from './read';
 import { applyHistoryAction, historyActionTarget } from './history-actions';
 import {
@@ -215,12 +215,14 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
   };
 
   const isTurnIdentityEdit = (event: LoroEventBatch['events'][number]) => {
+    if (event.path[0] !== HISTORY_ROOT_KEY) return false;
     const { diff } = event;
+    const fields = ['id', 'role', 'userTurnId'];
     return (
-      event.path[0] === HISTORY_ROOT_KEY &&
-      event.path.length === 2 &&
-      diff.type === 'map' &&
-      ['id', 'role', 'userTurnId'].some((key) => Object.hasOwn(diff.updated, key))
+      (event.path.length === 2 &&
+        diff.type === 'map' &&
+        fields.some((key) => Object.hasOwn(diff.updated, key))) ||
+      (event.path.length === 3 && fields.includes(String(event.path[2])) && diff.type === 'text')
     );
   };
 
@@ -310,14 +312,54 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
   let reordered = false;
   let indexedLength = -1;
   let indexedOpCount = -1;
+  const indexedUsers = new Set<string>();
+  const awaitingUsers = new Set<string>();
   const unsubscribeIdentity = doc.subscribe((batch) => {
-    if (
-      batch.events.some(
-        (event) =>
-          (event.target === list.id && event.diff.type === 'list') || isTurnIdentityEdit(event)
-      )
-    )
-      identityDirty = true;
+    const structural = batch.events.filter(
+      (event) => event.target === list.id && event.diff.type === 'list'
+    );
+    const identityEdits = batch.events.filter(isTurnIdentityEdit);
+    if (structural.length === 0 && identityEdits.length === 0) return;
+    let appendOnly =
+      !identityDirty &&
+      !reordered &&
+      list.length > indexedLength &&
+      identityEdits.every(
+        (event) => typeof event.path[1] === 'number' && event.path[1] >= indexedLength
+      );
+    for (const event of structural) {
+      if (event.diff.type !== 'list') continue;
+      let cursor = 0;
+      for (const delta of event.diff.diff) {
+        if (delta.retain !== undefined) cursor += delta.retain;
+        if (delta.delete !== undefined || (delta.insert !== undefined && cursor < indexedLength))
+          appendOnly = false;
+        if (delta.insert !== undefined) cursor += delta.insert.length;
+      }
+    }
+    identityDirty = true;
+    if (!appendOnly || structural.length === 0) return;
+    for (let position = indexedLength; position < list.length; position++) {
+      const value = list.get(position);
+      const id = readIdentity(value)?.turnId;
+      const entry = {
+        id: id ?? '',
+        role: readString(readField(value, 'role')),
+        userTurnId: readString(readField(value, 'userTurnId')),
+      };
+      if (entry.role === 'user' && id !== undefined) {
+        if (awaitingUsers.has(id)) return;
+        indexedUsers.add(id);
+      } else {
+        const owner = sessionHistoryUserTurnId(entry);
+        if (owner !== undefined && !indexedUsers.has(owner)) awaitingUsers.add(owner);
+      }
+      if (id !== undefined) positions.set(id, position);
+      orderedPositions.push(position);
+    }
+    indexedLength = list.length;
+    indexedOpCount = doc.opCount();
+    identityDirty = false;
   });
   const ensureIdentityIndex = () => {
     // Pending writes are readable before subscription delivery. Reuse the scan
@@ -338,6 +380,13 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
         position,
       };
     });
+    indexedUsers.clear();
+    awaitingUsers.clear();
+    for (const entry of entries) if (entry.role === 'user') indexedUsers.add(entry.id);
+    for (const entry of entries) {
+      const owner = sessionHistoryUserTurnId(entry);
+      if (owner !== undefined && !indexedUsers.has(owner)) awaitingUsers.add(owner);
+    }
     const ordered = orderSessionHistory(entries);
     reordered = ordered !== entries;
     orderedPositions = ordered.map((entry) => entry.position);
@@ -601,6 +650,8 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
     unsubscribeIdentity();
     positions.clear();
     orderedPositions = [];
+    indexedUsers.clear();
+    awaitingUsers.clear();
     identityDirty = true;
   };
 

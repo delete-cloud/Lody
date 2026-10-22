@@ -1967,10 +1967,6 @@ export class SessionDocument implements LoroDocument<Omit<SessionDocMeta, 'histo
    * Mirror and container ids stay inside the adapter.
    */
   private sessionDataInstance: LoroSessionData | null = null;
-  private readonly pendingTurnOrderRepairs = new Set<string>();
-  private turnOrderRepairUnsubscribe: (() => void) | undefined;
-  private turnOrderRepairScheduled = false;
-  private turnOrderRepairDoc: LoroDoc | undefined;
 
   get isDestroyed(): boolean {
     return this.destroyed;
@@ -2004,11 +2000,6 @@ export class SessionDocument implements LoroDocument<Omit<SessionDocMeta, 'histo
     initialState?: SessionDocInitialState,
     options: { historyBackend?: SessionHistoryBackendKind } = {}
   ): void {
-    this.turnOrderRepairUnsubscribe?.();
-    this.turnOrderRepairUnsubscribe = undefined;
-    this.pendingTurnOrderRepairs.clear();
-    this.turnOrderRepairScheduled = false;
-    this.turnOrderRepairDoc = undefined;
     this.modelSummary?.dispose();
     this.modelSummary = null;
     this.historyAutoReadHandle?.dispose();
@@ -2044,7 +2035,6 @@ export class SessionDocument implements LoroDocument<Omit<SessionDocMeta, 'histo
       }
       // Seed a brand-new document's history through the shared writer. A persisted
       // document already holds its history; the control Mirror never reads it.
-      this.turnOrderRepairDoc = doc;
       const writer = createHistoryWriter(doc);
       if (initialHistory.length > 0 && doc.getList('history').length === 0) {
         writer.update(() => initialHistory);
@@ -3050,62 +3040,6 @@ export class SessionDocument implements LoroDocument<Omit<SessionDocMeta, 'histo
     this.logger.debug(`[${this.sessionId}] setStatus: upsertDocMeta complete`);
   }
 
-  watchTurnHistoryOrder(userTurnId: string): void {
-    const data = this.sessionDataInstance;
-    const doc = this.turnOrderRepairDoc;
-    if (!data || !doc || this.destroyed) return;
-    this.pendingTurnOrderRepairs.add(userTurnId);
-    const repair = () => {
-      if (this.turnOrderRepairScheduled) return;
-      this.turnOrderRepairScheduled = true;
-      void Promise.resolve().then(() => {
-        try {
-          if (this.sessionDataInstance !== data || this.destroyed) return;
-          for (const id of this.pendingTurnOrderRepairs) {
-            if (data.history.readTurn(id).state === 'missing') continue;
-            if (data.writer.repairTurnOrder(id) !== 'waiting') {
-              this.pendingTurnOrderRepairs.delete(id);
-            }
-          }
-        } catch (error) {
-          this.logger.warn(
-            `[${this.sessionId}] Late-user order repair failed: ${formatErrorMessage(error)}`
-          );
-        } finally {
-          this.turnOrderRepairScheduled = false;
-          if (this.pendingTurnOrderRepairs.size === 0) {
-            this.turnOrderRepairUnsubscribe?.();
-            this.turnOrderRepairUnsubscribe = undefined;
-          }
-        }
-      });
-    };
-    if (!this.turnOrderRepairUnsubscribe) {
-      this.turnOrderRepairUnsubscribe = doc.subscribe((batch) => {
-        if (
-          batch.events.some((event) => {
-            if (event.path[0] !== 'history') return false;
-            if (event.path.length === 1) return true;
-            const diff = event.diff;
-            if (
-              diff.type === 'map' &&
-              ['id', 'role', 'userTurnId', 'items', 'permissionRequest'].some((key) =>
-                Object.hasOwn(diff.updated, key)
-              )
-            )
-              return true;
-            return (
-              event.path.includes('permissionRequest') ||
-              (event.path.length === 3 && event.path[2] === 'items' && event.diff.type === 'list')
-            );
-          })
-        )
-          repair();
-      });
-    }
-    repair();
-  }
-
   async getPreviewState(): Promise<SessionPreviewDocState | undefined> {
     if (!this.mirror) {
       return undefined;
@@ -3407,9 +3341,6 @@ export class SessionDocument implements LoroDocument<Omit<SessionDocMeta, 'histo
 
     this.modelSummary?.dispose();
     this.modelSummary = null;
-    this.turnOrderRepairUnsubscribe?.();
-    this.turnOrderRepairUnsubscribe = undefined;
-    this.pendingTurnOrderRepairs.clear();
 
     this.historyAutoReadHandle?.dispose();
     this.historyAutoReadHandle = null;

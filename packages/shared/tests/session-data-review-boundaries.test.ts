@@ -1,5 +1,5 @@
 import { it, expect, vi } from 'vitest';
-import { LoroDoc, LoroList, LoroMap } from 'loro-crdt';
+import { LoroDoc, LoroList, LoroMap, LoroText } from 'loro-crdt';
 import { createLoroSessionData, type SessionDataChange } from '../src/session-data';
 import { createHistoryWriter } from '../src/history-writer';
 import type { SessionId } from '../src/ids';
@@ -282,21 +282,6 @@ it('preserves invalid raw slots in canonical reads without rewriting storage', (
   doc.free();
 });
 
-it('repairs an assistant after a legacy inline user without replacing the user slot', () => {
-  const doc = new LoroDoc();
-  const writer = createHistoryWriter(doc);
-  writer.append({ ...turn('assistant:late'), role: 'assistant' });
-  const list = doc.getList('history');
-  list.insert(1, turn('late'));
-  doc.commit();
-  const user = list.get(1);
-  expect(writer.repairTurnOrder('late')).toBe('repaired');
-  expect(list.get(0)).toEqual(user);
-  expect(writer.readStored().map((entry) => entry.id)).toEqual(['late', 'assistant:late']);
-  expect(writer.repairTurnOrder('late')).toBe('unchanged');
-  doc.free();
-});
-
 it('invalidates the former causal prefix for every observer when an association disappears', async () => {
   const doc = new LoroDoc();
   const data = createLoroSessionData({ doc, sessionId });
@@ -374,3 +359,121 @@ it.each([false, true])(
     data.dispose();
   }
 );
+
+it('keeps remote tool edits and permission responses on the same containers during causal reads', () => {
+  const daemon = new LoroDoc();
+  const data = createLoroSessionData({ doc: daemon, sessionId });
+  data.writer.append({
+    ...turn('assistant:u'),
+    role: 'assistant',
+    userTurnId: 'u',
+    items: [
+      {
+        type: 'tool_call',
+        toolCallId: 'tool',
+        status: 'pending',
+        permissionRequest: {
+          requestId: 'request',
+          options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
+        },
+      },
+    ],
+  });
+  const peer = new LoroDoc();
+  peer.import(daemon.export({ mode: 'snapshot' }));
+  const remote = createLoroSessionData({ doc: peer, sessionId });
+  const assistant = daemon.getList('history').get(0) as LoroMap;
+  const identity = assistant.id;
+  remote.writer.append(turn('u'));
+  daemon.import(peer.export({ mode: 'snapshot' }));
+  expect(data.history.readDirectory(0, 2).map((row) => row.turnId)).toEqual(['u', 'assistant:u']);
+  data.writer.updateEntry('assistant:u', (row) => ({ ...row, finished: true }));
+  expect(
+    remote.writer.respondPermission('request', { outcome: 'selected', optionId: 'allow' })
+  ).toBe(true);
+  remote.writer.updateEntry('assistant:u', (row) => ({
+    ...row,
+    items: row.items.map((item) =>
+      item.type === 'tool_call' ? { ...item, status: 'completed' as const } : item
+    ),
+  }));
+  daemon.import(peer.export({ mode: 'snapshot' }));
+  peer.import(daemon.export({ mode: 'snapshot' }));
+  for (const reader of [data.history, remote.history]) {
+    expect(reader.readRange(0, 1)).toMatchObject([{ turn: { id: 'u' } }]);
+    expect(reader.readRange(1, 2)).toMatchObject([
+      {
+        turn: {
+          id: 'assistant:u',
+          finished: true,
+          items: [{ status: 'completed', permissionRequest: { outcome: { optionId: 'allow' } } }],
+        },
+      },
+    ]);
+    expect(reader.readAll().map((row) => row.id)).toEqual(['u', 'assistant:u']);
+  }
+  expect((daemon.getList('history').get(0) as LoroMap).id).toBe(identity);
+  expect((peer.getList('history').get(0) as LoroMap).id).toBe(identity);
+  expect(data.writer.readStored()).toEqual(remote.writer.readStored());
+  expect(data.writer.readStored().map((row) => row.id)).toEqual(['assistant:u', 'u']);
+  data.dispose();
+  remote.dispose();
+  daemon.free();
+  peer.free();
+});
+
+it('extends the causal index during ordinary tail appends without rescanning the prefix', async () => {
+  const doc = new LoroDoc();
+  const data = createLoroSessionData({ doc, sessionId });
+  const changes: SessionDataChange[] = [];
+  const observation = data.history.observe((event) => changes.push(event));
+  await observation.initial;
+  const get = vi.spyOn(LoroList.prototype, 'get');
+  try {
+    for (let index = 0; index < 128; index++) data.writer.append(turn(`user-${index}`));
+    expect(get.mock.calls.length).toBeLessThan(512);
+  } finally {
+    get.mockRestore();
+  }
+  expect(changes).toHaveLength(128);
+  expect(data.history.readDirectory(0, 128).map((row) => row.turnId)).toEqual(
+    Array.from({ length: 128 }, (_, index) => `user-${index}`)
+  );
+  data.writer.append({ ...turn('assistant:late'), role: 'assistant' });
+  data.writer.append(turn('late'));
+  expect(data.history.readDirectory(128, 130).map((row) => row.turnId)).toEqual([
+    'late',
+    'assistant:late',
+  ]);
+  expect(data.history.readTurn('user-0')).toMatchObject({ turn: { id: 'user-0' } });
+  observation.unsubscribe();
+  data.dispose();
+  doc.free();
+});
+
+it('reorders legacy text associations after an in-place remote-style edit', () => {
+  const doc = new LoroDoc();
+  const data = createLoroSessionData({ doc, sessionId });
+  data.writer.append({ ...turn('custom-assistant'), role: 'assistant', userTurnId: 'first' });
+  data.writer.append(turn('first'));
+  data.writer.append(turn('second'));
+  const row = doc.getList('history').get(0) as LoroMap;
+  const owner = row.setContainer('userTurnId', new LoroText());
+  owner.insert(0, 'second');
+  doc.commit();
+  expect(data.history.readDirectory(0, 3).map((entry) => entry.turnId)).toEqual([
+    'first',
+    'second',
+    'custom-assistant',
+  ]);
+  owner.delete(0, owner.length);
+  owner.insert(0, 'first');
+  doc.commit();
+  expect(data.history.readDirectory(0, 3).map((entry) => entry.turnId)).toEqual([
+    'first',
+    'custom-assistant',
+    'second',
+  ]);
+  data.dispose();
+  doc.free();
+});

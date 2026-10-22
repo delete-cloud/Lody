@@ -715,3 +715,32 @@ export const ConversationWithNotices: Story = {
     />
   ),
 };
+
+export const LateUserArrival: Story = {
+  render: () => (
+    <WindowedStream
+      streamSessionId={'synthetic-late-user-arrival' as SessionId}
+      history={[
+        {
+          id: 'assistant:synthetic-late-user',
+          role: 'assistant',
+          userTurnId: 'synthetic-late-user',
+          timestamp: at(0),
+          finished: true,
+          fileDiff: [],
+          items: [{ type: 'text', text: 'Synthetic reply written before user synchronization.' }],
+        },
+        {
+          id: 'synthetic-late-user',
+          role: 'user',
+          timestamp: at(1),
+          status: 'handled',
+          fileDiff: [],
+          items: [
+            { type: 'text', text: 'Synthetic question arriving after the history gate timed out.' },
+          ],
+        },
+      ]}
+    />
+  ),
+};

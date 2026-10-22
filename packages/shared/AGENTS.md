@@ -13,7 +13,7 @@ Exact deletion bypasses discovery: [relations](../../specs/session-relations.md)
   parsing; `tests/session-doc-forward-compat.test.ts` covers this separately from unknown root keys.
 - Local Loro history has one `HistoryWriter`, composed by SessionData; no raw writes
   or second writer. Read flags never change ownership.
-  [Read and repair rules](src/session-data/AGENTS.md).
+  [Read ordering rules](src/session-data/AGENTS.md).
 - Validate new turns and changed known fields/items before applying a command, never
   unchanged history. Invalid commands preserve the old values and throw content-free
   diagnostics; they must not leave partial history writes. Keep stored unknown fields

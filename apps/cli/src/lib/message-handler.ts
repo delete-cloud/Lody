@@ -5773,10 +5773,6 @@ export class MessageHandler {
    * insertions concurrent — the Loro merge tiebreak can then permanently order
    * the agent reply before the user message. CRDT/queue-sourced turns have the
    * entry locally by construction and need no gate.
-   *
-   * The gate itself creates the turn's assistant entry when it opens, so every
-   * gated writer resumes against an existing entry. SessionDocument owns
-   * order repair from gate creation, including writers released by disposal.
    */
   private setTurnHistoryGate(
     sessionId: SessionId,
@@ -5791,7 +5787,6 @@ export class MessageHandler {
       return;
     }
     const { sessionDoc } = gateContext;
-    sessionDoc.watchTurnHistoryOrder(userTurnId);
     state.turnHistoryGate = TurnHistoryGate.waitForUserTurn({
       logger: this.logger,
       sessionId,

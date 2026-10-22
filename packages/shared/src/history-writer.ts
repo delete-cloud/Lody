@@ -1,5 +1,4 @@
 import { Immer } from 'immer';
-import { sessionHistoryUserTurnId } from './session-history-order';
 import { isContainer, LoroMap, type LoroDoc, type LoroList } from 'loro-crdt';
 import { z } from 'zod';
 import type { SessionHistory, SessionHistoryInput } from './schema';
@@ -358,7 +357,6 @@ export function prepareReplacement(previous: unknown, incoming: unknown): Record
 export interface HistoryWriter {
   /** Detached stored JSON for inspection/hashing; not copy/rollback provenance. */
   readStored(): SessionHistoryInput[];
-  repairTurnOrder(userTurnId: string): 'waiting' | 'unchanged' | 'repaired';
   capture(): StoredHistorySnapshot;
   /** Prepend copied history, retaining target initialization rows; ids must not collide. */
   copyFrom(snapshot: StoredHistorySnapshot, history: SessionHistoryInput[]): void;
@@ -507,61 +505,6 @@ export function createHistoryWriter(doc: LoroDoc, readHistory?: () => readonly S
   const writer: HistoryWriter = {
     readStored() {
       return list.toJSON() as SessionHistoryInput[];
-    },
-    repairTurnOrder(userTurnId) {
-      let userIndex = -1;
-      for (let index = 0; index < list.length; index++) {
-        const value = list.get(index);
-        if (
-          storedScalar(storedField(value, 'id')) === userTurnId &&
-          storedScalar(storedField(value, 'role')) === 'user'
-        ) {
-          userIndex = index;
-          break;
-        }
-      }
-      if (userIndex < 0) return 'waiting';
-      const inverted: Array<{ map?: LoroMap; inline?: Record<string, unknown>; index: number }> =
-        [];
-      for (let index = 0; index < userIndex; index++) {
-        const value = list.get(index);
-        const map = isContainer(value) && value.kind() === 'Map' ? (value as LoroMap) : undefined;
-        const inline = !isContainer(value) && record(value) ? value : undefined;
-        if (!map && !inline) continue;
-        const field = (key: string) => storedScalar(map ? map.get(key) : inline?.[key]);
-        if (field('role') === 'user') continue;
-        if (
-          sessionHistoryUserTurnId({
-            id: storedScalar(field('id')),
-            role: field('role'),
-            userTurnId: field('userTurnId'),
-          }) !== userTurnId
-        )
-          continue;
-        const items = field('items');
-        const storedItems = isContainer(items) ? items.toJSON() : items;
-        if (
-          Array.isArray(storedItems) &&
-          storedItems.some(
-            (item) =>
-              record(item) &&
-              item.type === 'tool_call' &&
-              record(item.permissionRequest) &&
-              item.permissionRequest.outcome == null
-          )
-        )
-          return 'waiting';
-        inverted.push({ map, inline, index });
-      }
-      if (inverted.length === 0) return 'unchanged';
-      inverted.forEach(({ map, inline }, offset) => {
-        if (map) list.insertContainer(userIndex + 1 + offset, map);
-        else if (inline)
-          list.insert(userIndex + 1 + offset, inline as Parameters<LoroList['insert']>[1]);
-      });
-      for (const { index } of inverted.reverse()) list.delete(index, 1);
-      doc.commit();
-      return 'repaired';
     },
     capture() {
       // Read the actual document, not a normalized projection or caller-owned array.

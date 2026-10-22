@@ -41,7 +41,7 @@
 
 ## Turn execution
 
-- Gate LIST writes for 20s; arm doc repair at creation. Status/meta stay ungated.
+- Gate LIST writes for 20s; causal reads handle late users. Status/meta stay ungated.
 - Goals obey [this contract](../../../../specs/session-goal-control.md).
 - Stop ends steer waits, not the owner fiber. Drain raw ACP or confirm termination, then clear
   presence before reuse. [Inbox admission](../orchestration/AGENTS.md); execution IDs stay fixed.
