@@ -88,6 +88,12 @@ submissions; restart Lody and send fresh input from an Inbox-aware client/CLI.
 This is local-account maintenance, not a new MCP tool or remote recovery RPC.
 
 `session-execution-service.ts` calls the actual prompt primitive while holding admission.
+Submission evidence belongs to the current human/task input identity, including after
+an execution owner adopts a new input. Automatic receipt continuations use their batch
+fence and have no `inbox_inputs` row. A steer omits the initial batch, so submission
+must select the evidence path from the owner's current input rather than batch presence.
+Missing human/task receipts still reject transport; marker writes must match that input
+and its active execution.
 A batch is one system history item plus one model input, even when details require pages.
 Inline context intentionally previews at most 50 members and 64 KiB; batch_get reads all fixed members.
 `batch-page.ts` returns complete large members in bounded JSON fragments. The execution

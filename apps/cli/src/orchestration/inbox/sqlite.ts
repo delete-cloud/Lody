@@ -517,14 +517,17 @@ export class InboxSqlite {
       .get(workspaceId, sessionId, inputId) as { submission_started: number | null } | undefined;
     return row?.submission_started == null ? undefined : row.submission_started === 1;
   }
-  markSubmissionStarted(scope: InboxScope, executionId: string): void {
+  markSubmissionStarted(scope: InboxInput, executionId: string): void {
     const result = this.db
       .prepare(
-        'UPDATE inbox_inputs SET submission_started=1 WHERE workspace_id=? AND session_id=? AND input_id=(SELECT active_input FROM inbox_sessions WHERE workspace_id=? AND session_id=? AND user_id=? AND active_execution=?)'
+        'UPDATE inbox_inputs SET submission_started=1 WHERE workspace_id=? AND session_id=? AND user_id=? AND input_id=? AND kind=? AND input_id=(SELECT active_input FROM inbox_sessions WHERE workspace_id=? AND session_id=? AND user_id=? AND active_execution=?)'
       )
       .run(
         scope.workspaceId,
         scope.sessionId,
+        scope.userId,
+        scope.inputId,
+        scope.kind,
         scope.workspaceId,
         scope.sessionId,
         scope.userId,
@@ -548,6 +551,7 @@ export class InboxSqlite {
       !current.blocked &&
       current.active_execution === executionId &&
       !!current.active_input &&
+      (!('inputId' in scope) || current.active_input === scope.inputId) &&
       !this.inputCanceled(scope.workspaceId, scope.sessionId, current.active_input)
     );
   }

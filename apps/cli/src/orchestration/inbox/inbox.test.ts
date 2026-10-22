@@ -1732,3 +1732,158 @@ describe('manual Stop receipts', () => {
     expect(f.sql.pending('workspace')).toHaveLength(1);
   });
 });
+
+it.each([false, true])(
+  'submits and steers a real automatic receipt owner with human adoption=%s',
+  async (adoptHuman) => {
+    const { operationInboxLegacy } = await import('./legacy');
+    const f = fixture(() => Date.parse('2026-10-12T00:00:00.000Z'));
+    f.add('automatic-steer-result');
+    const [intent] = f.sql.pending('workspace');
+    if (!intent) throw new Error('Missing automatic intent');
+    const batch = f.sql.prepare(intent.input, 'owner', intent.intentId);
+    if (!batch) throw new Error('Missing automatic batch');
+    expect(batch.kind).toBe('automatic');
+    const db = new Database(f.filename);
+    const received: string[] = [];
+    const reports: unknown[] = [];
+    const bridge = operationInboxLegacy({
+      workspaceId: 'workspace',
+      owner: 'owner',
+      sql: f.sql,
+      ownsConnection: false,
+      ready: () => false,
+      admit: () => true,
+      launch: async () => {
+        throw new Error('Unexpected background execution');
+      },
+      report: (cause) => reports.push(cause),
+    });
+    const owner = await bridge.openExecution(intent.input, 'automatic-execution', batch);
+    try {
+      expect(db.prepare('SELECT input_id FROM inbox_inputs').all()).toEqual([]);
+      await expect(
+        owner.submit(() => {
+          received.push('automatic-submit');
+          return 'submitted';
+        })
+      ).resolves.toEqual({ value: 'submitted' });
+      expect(f.sql.canSubmit(owner.input, owner.id, 'owner')).toBe(true);
+      await expect(
+        owner.steer(() => {
+          received.push('automatic-steer');
+          return 'steered';
+        })
+      ).resolves.toEqual({ value: 'steered' });
+      expect(db.prepare('SELECT input_id FROM inbox_inputs').all()).toEqual([]);
+      expect(f.sql.getBatch(batch.batchId, intent.input)?.state).toBe('submitted');
+      if (adoptHuman) {
+        const next = { ...f.input, inputId: 'adopted-human' };
+        await owner.adopt(next, () => {});
+        expect(owner.input).toEqual(next);
+        expect(owner.batch?.kind).toBe('automatic');
+        expect(f.sql.inputSubmissionStarted('workspace', 'A', next.inputId)).toBe(false);
+        await owner.steer(() => {
+          expect(f.sql.inputSubmissionStarted('workspace', 'A', next.inputId)).toBe(true);
+          received.push('human-steer');
+        });
+      }
+      expect(received).toEqual([
+        'automatic-submit',
+        'automatic-steer',
+        ...(adoptHuman ? ['human-steer'] : []),
+      ]);
+      expect(reports).toEqual([]);
+    } finally {
+      await owner.finish('normal');
+      await bridge.close();
+      db.close();
+    }
+  }
+);
+
+it.each(['human', 'task'] as const)(
+  'persists the %s owner receipt before initial submission and steer',
+  async (kind) => {
+    const { operationInboxLegacy } = await import('./legacy');
+    const f = fixture();
+    const input = { ...f.input, kind };
+    const bridge = operationInboxLegacy({
+      workspaceId: 'workspace',
+      owner: 'owner',
+      sql: f.sql,
+      ownsConnection: false,
+      ready: () => false,
+      admit: () => true,
+      launch: async () => {},
+      report: () => {},
+    });
+    await bridge.accept(input);
+    const owner = await bridge.openExecution(input, 'execution');
+    const observed: boolean[] = [];
+    try {
+      expect(f.sql.inputSubmissionStarted('workspace', 'A', input.inputId)).toBe(false);
+      for (const action of ['submit', 'steer'] as const) {
+        await owner[action](() => {
+          observed.push(f.sql.inputSubmissionStarted('workspace', 'A', input.inputId) === true);
+        });
+      }
+      expect(observed).toEqual([true, true]);
+    } finally {
+      await owner.finish('normal');
+      await bridge.close();
+    }
+  }
+);
+
+it.each([
+  ['human', 'submit'],
+  ['human', 'steer'],
+  ['task', 'submit'],
+  ['task', 'steer'],
+] as const)('blocks %s %s when the active input receipt is missing', async (kind, action) => {
+  const { operationInboxLegacy } = await import('./legacy');
+  const f = fixture();
+  const input = { ...f.input, kind };
+  const db = new Database(f.filename);
+  const received: string[] = [];
+  const bridge = operationInboxLegacy({
+    workspaceId: 'workspace',
+    owner: 'owner',
+    sql: f.sql,
+    ownsConnection: false,
+    ready: () => false,
+    admit: () => true,
+    launch: async () => {},
+    report: () => {},
+  });
+  await bridge.accept(input);
+  const owner = await bridge.openExecution(input, 'execution');
+  try {
+    if (action === 'steer') await owner.submit(() => received.push('initial'));
+    db.prepare('DELETE FROM inbox_inputs WHERE input_id=?').run(input.inputId);
+    expect(f.sql.canSubmit(input, owner.id, 'owner')).toBe(true);
+    await expect(owner[action](() => received.push('missing-receipt'))).rejects.toThrow(
+      'INBOX_SUBMISSION_INPUT_MISSING'
+    );
+    expect(received).toEqual(action === 'steer' ? ['initial'] : []);
+    expect(f.sql.inputSubmissionStarted('workspace', 'A', input.inputId)).toBeUndefined();
+  } finally {
+    await owner.finish('normal');
+    await bridge.close();
+    db.close();
+  }
+});
+
+it('rejects a different input identity before writing submission evidence', () => {
+  const f = fixture();
+  f.start();
+  const next = { ...f.input, inputId: 'other-input' };
+  expect(f.sql.accept(next)).toBe(true);
+  expect(f.sql.canSubmit(next, 'execution-1', 'owner')).toBe(false);
+  expect(() => f.sql.markSubmissionStarted(next, 'execution-1')).toThrow(
+    'INBOX_SUBMISSION_INPUT_MISSING'
+  );
+  expect(f.sql.inputSubmissionStarted('workspace', 'A', f.input.inputId)).toBe(false);
+  expect(f.sql.inputSubmissionStarted('workspace', 'A', next.inputId)).toBe(false);
+});

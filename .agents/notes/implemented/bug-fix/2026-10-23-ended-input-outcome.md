@@ -49,3 +49,30 @@ migration, submission-evidence write failure, repeat restart with no replay, and
 subsequent message executing. Component tests cover English/Chinese unknown outcomes,
 cancellation and one fresh send after explicit confirmation. These do not replace
 real daemon shutdown/restart and browser screenshot acceptance on the authorized VM.
+
+## Correction: automatic steer admission
+
+Independent review confirmed that the initial marker guard treated an absent batch
+as human/task input. A real automatic receipt owner submits its initial batch, then
+steers without a batch argument; automatic inputs have no `inbox_inputs` receipt.
+The marker therefore rejected the steer before transport. This breaks instant steer
+and can fall back to normal queueing; message loss was not established.
+
+Submission now requires the owner's current `InboxInput` and selects the marker by
+its kind, not the optional initial batch. Adoption atomically updates that identity;
+a later human steer must persist its new receipt even though the owner retains an
+automatic initial batch. Admission checks the supplied input id against `active_input`,
+and the marker update binds input id, kind, user and active execution. Missing
+human/task receipts remain fatal before transport. No missing-row error is ignored.
+
+Threading a separate steer type flag or querying another input kind would duplicate
+the identity already owned by execution admission. Removing the marker or allowing
+all missing rows would weaken persistent human/task evidence, so neither is adopted.
+The existing native Effect service remains native; no lifecycle migration is needed.
+
+The owning real-SQLite Inbox suite covers automatic submit then steer, automatic to
+human adoption, human/task evidence visible inside transport, missing receipts before
+initial submit and steer, and rejection of a different active input id. The automatic
+and mismatched-identity regressions fail before the correction; missing human/task
+receipts remain blocked in both versions. These are synthetic transport-boundary
+checks, not provider or daemon E2E acceptance.

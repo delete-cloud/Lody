@@ -22,3 +22,26 @@ UI 复用结果未知消息的重发确认，不增加新的状态枚举。英�
 仅修改标题无法区分真正未提交的失败，也不会提供重发警告。依赖 assistant 历史或内存中的 promptStarted 无法覆盖提交后没有输出及进程重启。持久证据更准确；旧数据宁可显示未知，不虚构没有开始或已经完成。
 
 测试使用真实 SQLite 文件、原生提交/释放、导出的 Loro 合成历史和新建恢复对象，覆盖提交、未提交、旧模式迁移、提交证据写入失败、二次恢复不重放及下一条消息执行。组件测试检查中英文结果未知状态、取消及明确确认后的单次新发送。它们不替代 VM 上真实 daemon 停止重启与浏览器截图验收。
+
+## 修正：automatic steer 许可
+
+独立审查确认原 marker 条件把缺少 batch 当作 human/task 输入。真实 automatic
+receipt owner 首次提交携带批次，之后 steer 不传 batch，而 automatic 输入没有
+`inbox_inputs` 回执。因此 steer 在调用 transport 前被 marker 拒绝，破坏即时 steer，
+可能退回普通队列；尚未证实消息丢失。
+
+现在提交要求 owner 当前的 `InboxInput`，按其 kind 决定 marker，而不看可选的初始
+batch。adopt 会原子更新该身份；即使 owner 保留 automatic 初始批次，后续 human steer
+仍必须持久记录新输入回执。许可核对 inputId 与 `active_input`，marker 更新同时绑定
+inputId、kind、user 和 active execution。human/task 缺行仍在 transport 前失败，
+不忽略任何缺行错误。
+
+额外传 steer 类型 flag 或查询另一份输入类型会重复 owner 已拥有的身份。移除 marker
+或统一容忍缺行会削弱 human/task 持久提交证据，均不采用。服务已使用原生 Effect，
+本修正不需要生命周期迁移。
+
+所属真实 SQLite Inbox 测试覆盖 automatic 首次提交后 steer、automatic 转 human
+adopt、transport 内可见的 human/task 证据、首次提交及 steer 前回执缺失，以及不同
+active inputId 被拒绝。automatic 与身份不匹配回归在修复前失败；human/task 缺行
+在前后版本都保持阻断。这些使用合成 transport，仅验收传输入口，不冒充 provider
+或 daemon E2E。
