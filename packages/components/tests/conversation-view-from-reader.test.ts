@@ -1543,3 +1543,79 @@ describe('createConversationViewFromReader audit regressions', () => {
     }
   });
 });
+
+it('projects historical inversions through the shipped windowed reader and keeps streaming observable', async () => {
+  const doc = new LoroDoc();
+  const data = createLoroSessionData({ doc, sessionId: FIXTURE_SESSION_ID });
+  data.writer.append({
+    id: 'assistant:user',
+    role: 'assistant',
+    userTurnId: 'user',
+    timestamp: '2026-10-16T00:00:00.000Z',
+    items: [],
+  });
+  for (const role of ['system', 'assistant'] as const) {
+    data.writer.append({
+      id: `${role}-associated`,
+      role,
+      userTurnId: 'user',
+      timestamp: '2026-10-16T00:00:00.000Z',
+      items: [{ type: 'text', text: role }],
+    });
+  }
+  data.writer.append({
+    id: 'user',
+    role: 'user',
+    timestamp: '2026-10-16T00:00:00.000Z',
+    items: [{ type: 'text', text: 'question' }],
+  });
+  const idle = createManualIdle();
+  const view = createConversationViewFromReader(data.history, {
+    sessionId: FIXTURE_SESSION_ID,
+    tailKeep: 4,
+    scheduleIdle: idle.scheduleIdle,
+    yieldToEventLoop: () => Promise.resolve(),
+  });
+  try {
+    await flushReaderChanges();
+    idle.runAll();
+    await view.ready;
+    const lease = view.acquireRange(0, 4);
+    try {
+      await lease.ready;
+      expect(view.indexOf('user')).toBe(0);
+      expect(view.indexOf('assistant:user')).toBe(1);
+      expect(view.indexOf('system-associated')).toBe(2);
+      expect(view.indexOf('assistant-associated')).toBe(3);
+      expect(view.turn(0)?.items).toEqual([{ type: 'text', text: 'question' }]);
+      data.writer.updateEntry('assistant:user', (entry) => ({
+        ...entry,
+        items: [{ type: 'text', text: 'reply' }],
+      }));
+      await flushReaderChanges();
+      expect(view.turn(1)?.items).toEqual([{ type: 'text', text: 'reply' }]);
+      expect(data.writer.readStored().map((entry) => entry.id)).toEqual([
+        'assistant:user',
+        'system-associated',
+        'assistant-associated',
+        'user',
+      ]);
+      data.writer.append({
+        id: 'next',
+        role: 'user',
+        timestamp: '2026-10-16T00:00:01.000Z',
+        items: [],
+      });
+      await flushReaderChanges();
+      expect(view.indexOf('user')).toBe(0);
+      expect(view.indexOf('assistant:user')).toBe(1);
+      expect(view.indexOf('next')).toBe(4);
+    } finally {
+      lease.release();
+    }
+  } finally {
+    view.dispose();
+    data.dispose();
+    doc.free();
+  }
+});

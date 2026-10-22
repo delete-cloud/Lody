@@ -1,3 +1,4 @@
+import { orderSessionHistory, sessionHistoryUserTurnId } from '../session-history-order';
 import { selectTurnOutput } from './read';
 import { applyHistoryAction, historyActionTarget } from './history-actions';
 import {
@@ -170,7 +171,7 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
   };
 
   const readDirectoryRow = (position: number): SessionDirectoryRow => {
-    const value = list.get(position);
+    const value = list.get(storedPosition(position));
     if (isContainer(value)) {
       if (value.kind() !== 'Map') return { position, state: 'invalid' };
       const map = value as LoroMap;
@@ -213,11 +214,17 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
     return rows;
   };
 
-  const isTurnIdentityEdit = (event: LoroEventBatch['events'][number]) =>
-    event.path[0] === HISTORY_ROOT_KEY &&
-    event.path.length === 2 &&
-    event.diff.type === 'map' &&
-    Object.hasOwn(event.diff.updated, 'id');
+  const isTurnIdentityEdit = (event: LoroEventBatch['events'][number]) => {
+    if (event.path[0] !== HISTORY_ROOT_KEY) return false;
+    const { diff } = event;
+    const fields = ['id', 'role', 'userTurnId'];
+    return (
+      (event.path.length === 2 &&
+        diff.type === 'map' &&
+        fields.some((key) => Object.hasOwn(diff.updated, key))) ||
+      (event.path.length === 3 && fields.includes(String(event.path[2])) && diff.type === 'text')
+    );
+  };
 
   /**
    * What a batch touched, for a consumer that re-reads only the affected turns.
@@ -301,16 +308,60 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
   // One shallow identity scan per structural/identity change, never per body.
   const positions = new Map<string, number>();
   let identityDirty = true;
+  let orderedPositions: number[] = [];
+  let reordered = false;
   let indexedLength = -1;
   let indexedOpCount = -1;
+  let appendFrom: number | undefined;
+  const indexedUsers = new Set<string>();
+  const awaitingUsers = new Set<string>();
   const unsubscribeIdentity = doc.subscribe((batch) => {
-    if (
-      batch.events.some(
-        (event) =>
-          (event.target === list.id && event.diff.type === 'list') || isTurnIdentityEdit(event)
-      )
-    )
-      identityDirty = true;
+    const structural = batch.events.filter(
+      (event) => event.target === list.id && event.diff.type === 'list'
+    );
+    const identityEdits = batch.events.filter(isTurnIdentityEdit);
+    if (structural.length === 0 && identityEdits.length === 0) return;
+    appendFrom = undefined;
+    let appendOnly =
+      !identityDirty &&
+      list.length > indexedLength &&
+      identityEdits.every(
+        (event) => typeof event.path[1] === 'number' && event.path[1] >= indexedLength
+      );
+    for (const event of structural) {
+      if (event.diff.type !== 'list') continue;
+      let cursor = 0;
+      for (const delta of event.diff.diff) {
+        if (delta.retain !== undefined) cursor += delta.retain;
+        if (delta.delete !== undefined || (delta.insert !== undefined && cursor < indexedLength))
+          appendOnly = false;
+        if (delta.insert !== undefined) cursor += delta.insert.length;
+      }
+    }
+    identityDirty = true;
+    if (!appendOnly || structural.length === 0) return;
+    for (let position = indexedLength; position < list.length; position++) {
+      const value = list.get(position);
+      const id = readIdentity(value)?.turnId;
+      const entry = {
+        id: id ?? '',
+        role: readString(readField(value, 'role')),
+        userTurnId: readString(readField(value, 'userTurnId')),
+      };
+      if (entry.role === 'user' && id !== undefined) {
+        if (awaitingUsers.has(id)) return;
+        indexedUsers.add(id);
+      } else {
+        const owner = sessionHistoryUserTurnId(entry);
+        if (owner !== undefined && !indexedUsers.has(owner)) awaitingUsers.add(owner);
+      }
+      if (id !== undefined) positions.set(id, position);
+      orderedPositions.push(position);
+    }
+    appendFrom = indexedLength;
+    indexedLength = list.length;
+    indexedOpCount = doc.opCount();
+    identityDirty = false;
   });
   const ensureIdentityIndex = () => {
     // Pending writes are readable before subscription delivery. Reuse the scan
@@ -319,14 +370,37 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
     if (!identityDirty && indexedLength === list.length) {
       if (doc.getPendingTxnLength() === 0 || indexedOpCount === doc.opCount()) return;
     }
+    appendFrom = undefined;
     positions.clear();
-    for (let i = 0; i < list.length; i++) {
-      const id = readIdentity(list.get(i))?.turnId;
-      if (id !== undefined) positions.set(id, i); // newest duplicate wins, like writer.locate
+    const entries = Array.from({ length: list.length }, (_, position) => {
+      const value = list.get(position);
+      const id = readIdentity(value)?.turnId;
+      if (id !== undefined) positions.set(id, position);
+      return {
+        id: id ?? '',
+        role: id === undefined ? undefined : readString(readField(value, 'role')),
+        userTurnId: readString(readField(value, 'userTurnId')),
+        position,
+      };
+    });
+    indexedUsers.clear();
+    awaitingUsers.clear();
+    for (const entry of entries) if (entry.role === 'user') indexedUsers.add(entry.id);
+    for (const entry of entries) {
+      const owner = sessionHistoryUserTurnId(entry);
+      if (owner !== undefined && !indexedUsers.has(owner)) awaitingUsers.add(owner);
     }
+    const ordered = orderSessionHistory(entries);
+    reordered = ordered !== entries;
+    orderedPositions = ordered.map((entry) => entry.position);
     indexedLength = list.length;
     indexedOpCount = doc.opCount();
     identityDirty = false;
+  };
+
+  const storedPosition = (position: number): number => {
+    ensureIdentityIndex();
+    return orderedPositions[position] ?? -1;
   };
 
   const history = {
@@ -335,7 +409,7 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
         list.length,
         userTurnId,
         (index) => {
-          const value = list.get(index);
+          const value = list.get(storedPosition(index));
           return pickDirectoryScalars(
             isContainer(value) && value.kind() === 'Map'
               ? (value as LoroMap).getShallowValue()
@@ -343,7 +417,7 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
           );
         },
         (index) => {
-          const read = readSlot(list, index);
+          const read = readSlot(list, storedPosition(index));
           return read.state === 'ready'
             ? (read.turn as import('./domain').SessionEntry)
             : undefined;
@@ -355,7 +429,7 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
     },
     readModelSummaryAt(position: number) {
       if (position < 0 || position >= list.length) return undefined;
-      const value = list.get(position);
+      const value = list.get(storedPosition(position));
       const model = readField(value, 'modelInfo');
       return {
         role: readString(readField(value, 'role')),
@@ -368,7 +442,7 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
       };
     },
     readAt(position: number) {
-      return readSlot(list, position);
+      return readSlot(list, storedPosition(position));
     },
     readTurn(turnId: string): SessionTurnRead {
       ensureIdentityIndex();
@@ -379,7 +453,8 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
       const lo = Math.max(0, Math.min(from, list.length));
       const hi = Math.max(lo, Math.min(to, list.length));
       const out: SessionTurnRead[] = [];
-      for (let position = lo; position < hi; position += 1) out.push(readSlot(list, position));
+      for (let position = lo; position < hi; position += 1)
+        out.push(readSlot(list, storedPosition(position)));
       return out;
     },
     readDirectory(from: number, to: number) {
@@ -388,9 +463,10 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
     readAll() {
       // One detached synchronous read of the stored list: a single consistent
       // snapshot, never a stitched count + paginated read.
-      return writer.readStored();
+      return orderSessionHistory(writer.readStored());
     },
     observe(listener: import('./types').SessionDataChangeListener) {
+      let previouslyReordered = false;
       // Subscribe first, then snapshot in the same synchronous block: a change
       // can neither be missed between the two nor delivered before `initial`.
       const unsubscribeDoc = doc.subscribe((batch) => {
@@ -399,7 +475,15 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
         // history change; unrelated roots never invalidate the display cache.
         if (!scope) return;
         if (scope.structural) {
-          listener({ kind: 'structure', from: scope.from, to: scope.to });
+          ensureIdentityIndex();
+          const from =
+            appendFrom !== undefined && scope.from >= appendFrom
+              ? appendFrom
+              : previouslyReordered || reordered
+                ? 0
+                : scope.from;
+          previouslyReordered = reordered;
+          listener({ kind: 'structure', from, to: scope.to });
         } else {
           const ids: string[] = [];
           for (const position of scope.positions) {
@@ -410,6 +494,7 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
         }
       });
       const initial = Promise.resolve(directory(0, list.length));
+      previouslyReordered = reordered;
       let active = true;
       return {
         initial,
@@ -462,11 +547,15 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
         // eligibility/goal re-check and the write are one atomic step.
         restoreRange = writer.updateWithRollback((turns) => {
           const next = planEditableTailReplacement(
-            turns as unknown as readonly SessionTurn[],
+            orderSessionHistory(turns) as unknown as readonly SessionTurn[],
             input
           );
           plan = next;
-          return next.turns as unknown as SessionHistoryInput[];
+          const retained = new Set(next.turns.slice(0, -1));
+          return [
+            ...turns.filter((row) => retained.has(row as unknown as SessionTurn)),
+            input.replacement as unknown as SessionHistoryInput,
+          ];
         });
       } catch (error) {
         // A domain refusal proves nothing was written; a `HistoryWriteError` is a
@@ -568,6 +657,9 @@ export function createLoroSessionData(options: LoroSessionDataOptions) {
   const dispose = () => {
     unsubscribeIdentity();
     positions.clear();
+    orderedPositions = [];
+    indexedUsers.clear();
+    awaitingUsers.clear();
     identityDirty = true;
   };
 

@@ -1,3 +1,4 @@
+import { sessionHistoryUserTurnId } from '../session-history-order';
 import { normalizeSessionTurnInputConfig } from '../message-schemas';
 import type { SessionEntry } from './domain';
 import type { SessionHistoryReader } from './types';
@@ -50,7 +51,9 @@ export function selectTurnOutput(
     for (let j = i + 1; j < count; j++) {
       const row = scalars(j);
       const assistant =
-        !assistantFound && row?.role === 'assistant' && row.userTurnId === userTurnId;
+        !assistantFound &&
+        row?.role === 'assistant' &&
+        sessionHistoryUserTurnId(row) === userTurnId;
       if (assistant || (user.status === 'failed' && row?.role === 'system')) {
         const turn = body(j);
         if (turn) selected.push(turn);

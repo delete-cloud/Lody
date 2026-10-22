@@ -6,6 +6,7 @@ import { Mirror } from 'loro-mirror';
 import { z } from 'zod';
 import { parseHistoryWrite } from '../src/history-write-schema';
 import { createSessionMirror } from '../src/session-mirror';
+import { orderSessionHistory } from '../src/session-history-order';
 import { sessionDocSchema, type SessionHistory } from '../src/schema';
 import type { SessionId } from '../src/ids';
 import { createHistoryWriter, type StoredHistorySnapshot } from '../src/history-writer';
@@ -692,6 +693,43 @@ describe('single history writer', () => {
       expect(unrelated.toJSON()).toEqual(before);
     }
   );
+
+  it('projects historical causal order without mutating or dropping unassociated entries', () => {
+    const assistant = (assistantId: string, userTurnId?: string) => ({
+      ...entry(assistantId),
+      role: 'assistant',
+      userTurnId,
+    });
+    const history = [
+      entry('old'),
+      assistant('assistant:late'),
+      assistant('custom', 'late'),
+      assistant('orphan', 'absent'),
+      { ...entry('notice'), role: 'system', userTurnId: 'late' },
+      assistant('assistant-file-upload', 'late'),
+      { ...entry('assistant:other-user'), role: 'system' },
+      { ...entry('other-user'), userTurnId: 'late' },
+      entry('late'),
+      assistant('correct', 'late'),
+    ];
+    const original = [...history];
+    const ordered = orderSessionHistory(history);
+    expect(ordered.map((row) => row.id)).toEqual([
+      'old',
+      'orphan',
+      'assistant:other-user',
+      'other-user',
+      'late',
+      'assistant:late',
+      'custom',
+      'notice',
+      'assistant-file-upload',
+      'correct',
+    ]);
+    expect(history).toEqual(original);
+    expect(orderSessionHistory(ordered)).toBe(ordered);
+    expect(new Set(ordered)).toEqual(new Set(history));
+  });
 
   it('filters nested config extensions on append and resend without rewriting stored input', () => {
     const doc = new Loro();
