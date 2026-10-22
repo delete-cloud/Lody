@@ -16,6 +16,30 @@ afterEach(() => {
   vi.unstubAllEnvs();
   fs.rmSync(directory, { recursive: true, force: true });
 });
+const findNativeGit = (): string => {
+  const names = process.platform === 'win32' ? ['git.exe', 'git.cmd', 'git'] : ['git'];
+  for (const pathDirectory of (process.env.PATH ?? '').split(path.delimiter)) {
+    if (!pathDirectory) continue;
+    for (const name of names) {
+      const candidate = path.join(pathDirectory, name);
+      try {
+        if (!fs.statSync(candidate).isFile()) continue;
+        const source = fs.readFileSync(candidate, 'utf8').slice(0, 8192);
+        if (
+          (source.includes('const REAL_GIT = ') && source.includes('LODY_GIT_NATIVE')) ||
+          (source.includes("const { spawn } = require('child_process');") &&
+            source.includes('GIT_EXEC_PATH: __dirname') &&
+            source.includes('LODY_GIT_NATIVE'))
+        )
+          continue;
+      } catch {
+        continue;
+      }
+      return candidate;
+    }
+  }
+  throw new Error('Native Git executable was not found');
+};
 function harness(
   options: {
     owner?: boolean;
@@ -347,25 +371,61 @@ process.exit(child.status ?? 1);
 
   describe('exec-path probe resilience', () => {
     const markerPath = () => path.join(directory, 'lody-git-transport.json');
+    const realExecPath = () => {
+      const env = { ...process.env };
+      for (const key of Object.keys(env)) if (/^GIT_EXEC_PATH$/i.test(key)) delete env[key];
+      return execFileSync(findNativeGit(), ['--exec-path'], { encoding: 'utf8', env }).trim();
+    };
     const spawnError = (code: string) =>
       Object.assign(new Error(`spawnSync git ${code}`), { code });
+    const writeMarker = (marker: Record<string, unknown>) =>
+      fs.writeFileSync(markerPath(), JSON.stringify(marker));
+    const generatedShim = (filePath: string) =>
+      fs.writeFileSync(
+        filePath,
+        '#!/usr/bin/env node\nconst REAL_GIT = "/native/git";\nconst native = process.env.LODY_GIT_NATIVE;\n',
+        { mode: 0o755 }
+      );
+
+    const runGeneratedWrapper = (output = directory): string => {
+      const wrapper = fs.readFileSync(path.join(output, 'git'), 'utf8');
+      let nativeGit = '';
+      vm.runInNewContext(wrapper, {
+        __dirname: output,
+        require: (name: string) =>
+          name === 'child_process'
+            ? {
+                spawn: (filePath: string) => {
+                  nativeGit = filePath;
+                  return new EventEmitter();
+                },
+              }
+            : path,
+        process: { argv: ['node', path.join(directory, 'git'), 'status'], env: { PATH: '/bin' } },
+      });
+      return nativeGit;
+    };
 
     it('records the resolved layout in a marker after materialization', () => {
-      ensureGitHubGitTransport(directory, '/workspace/broker', 'git');
+      ensureGitHubGitTransport(directory, '/workspace/broker', findNativeGit());
       const marker = JSON.parse(fs.readFileSync(markerPath(), 'utf8'));
-      expect(marker).toMatchObject({ version: 1, realGit: 'git', statePath: '/workspace/broker' });
+      expect(marker).toMatchObject({
+        version: 1,
+        realGit: findNativeGit(),
+        statePath: '/workspace/broker',
+      });
       expect(fs.existsSync(marker.execPath)).toBe(true);
       expect(fs.existsSync(marker.nativeGit)).toBe(true);
     });
 
     it('skips the probe entirely when the recorded layout matches', () => {
-      ensureGitHubGitTransport(directory, '/workspace/broker', 'git');
+      ensureGitHubGitTransport(directory, '/workspace/broker', findNativeGit());
       fs.rmSync(path.join(directory, 'package.json'));
       const probe = vi.fn(() => {
         throw spawnError('EAGAIN');
       });
       expect(() =>
-        ensureGitHubGitTransport(directory, '/workspace/broker', 'git', {
+        ensureGitHubGitTransport(directory, '/workspace/broker', findNativeGit(), {
           probeExecPathOnce: probe,
         })
       ).not.toThrow();
@@ -373,14 +433,70 @@ process.exit(child.status ?? 1);
       expect(fs.existsSync(path.join(directory, 'package.json'))).toBe(true);
     });
 
+    it('clears every GIT_EXEC_PATH spelling before probing and points the wrapper at native Git', () => {
+      const nativeExecPath = realExecPath();
+      const nativeGit = path.join(nativeExecPath, process.platform === 'win32' ? 'git.exe' : 'git');
+      generatedShim(path.join(directory, 'git'));
+      vi.stubEnv('GIT_EXEC_PATH', directory);
+      vi.stubEnv('gIt_ExEc_PaTh', directory);
+      let probeEnv: NodeJS.ProcessEnv | undefined;
+      ensureGitHubGitTransport(directory, '/workspace/broker', findNativeGit(), {
+        probeExecPathOnce: (_realGit, env) => {
+          probeEnv = env;
+          return nativeExecPath;
+        },
+      });
+      expect(probeEnv).toBeDefined();
+      expect(Object.keys(probeEnv ?? {}).filter((key) => /^GIT_EXEC_PATH$/i.test(key))).toEqual([]);
+      expect(runGeneratedWrapper()).toBe(nativeGit);
+      expect(runGeneratedWrapper()).not.toBe(path.join(directory, 'git'));
+    });
+
+    it('uses the real native probe to recover from an inherited wrapper exec path', () => {
+      const nativeExecPath = realExecPath();
+      generatedShim(path.join(directory, 'git'));
+      vi.stubEnv('GIT_EXEC_PATH', directory);
+      ensureGitHubGitTransport(directory, '/workspace/broker', findNativeGit());
+      expect(JSON.parse(fs.readFileSync(markerPath(), 'utf8')).execPath).toBe(nativeExecPath);
+      expect(runGeneratedWrapper()).toBe(
+        path.join(nativeExecPath, process.platform === 'win32' ? 'git.exe' : 'git')
+      );
+      expect(process.env.GIT_EXEC_PATH).toBe(directory);
+    });
+
+    it.each([
+      ['direct', (wrapper: string) => wrapper],
+      [
+        'symlink alias',
+        (wrapper: string) => {
+          const alias = path.join(directory, 'git-alias');
+          fs.symlinkSync(wrapper, alias);
+          return alias;
+        },
+      ],
+    ])(
+      'never probes a generated wrapper passed as realGit through a %s path',
+      (_name, resolvePath) => {
+        const wrapper = path.join(directory, 'git');
+        generatedShim(wrapper);
+        const probe = vi.fn(() => realExecPath());
+        expect(() =>
+          ensureGitHubGitTransport(directory, '/workspace/broker', resolvePath(wrapper), {
+            probeExecPathOnce: probe,
+          })
+        ).toThrow(/not a safe native Git path/);
+        expect(probe).not.toHaveBeenCalled();
+      }
+    );
+
     it('retries transient spawn failures before succeeding', () => {
-      const realExecPath = execFileSync('git', ['--exec-path'], { encoding: 'utf8' }).trim();
+      const safeExecPath = realExecPath();
       let calls = 0;
-      ensureGitHubGitTransport(directory, '/workspace/broker', 'git', {
+      ensureGitHubGitTransport(directory, '/workspace/broker', findNativeGit(), {
         probeExecPathOnce: () => {
           calls++;
           if (calls < 3) throw spawnError('EAGAIN');
-          return realExecPath;
+          return safeExecPath;
         },
       });
       expect(calls).toBe(3);
@@ -390,7 +506,7 @@ process.exit(child.status ?? 1);
     it('does not retry a non-transient probe failure', () => {
       let calls = 0;
       expect(() =>
-        ensureGitHubGitTransport(directory, '/workspace/broker', 'git', {
+        ensureGitHubGitTransport(directory, '/workspace/broker', findNativeGit(), {
           probeExecPathOnce: () => {
             calls++;
             throw spawnError('ENOENT');
@@ -403,7 +519,7 @@ process.exit(child.status ?? 1);
     it('fails session preparation only when no recorded layout survives the probe failure', () => {
       let calls = 0;
       expect(() =>
-        ensureGitHubGitTransport(directory, '/workspace/broker', 'git', {
+        ensureGitHubGitTransport(directory, '/workspace/broker', findNativeGit(), {
           probeExecPathOnce: () => {
             calls++;
             throw spawnError('EAGAIN');
@@ -413,28 +529,124 @@ process.exit(child.status ?? 1);
       expect(calls).toBe(4);
     });
 
-    it('reuses a stale recorded layout and warns when the probe keeps failing', () => {
-      const realExecPath = execFileSync('git', ['--exec-path'], { encoding: 'utf8' }).trim();
-      const nativeGit = path.join(realExecPath, process.platform === 'win32' ? 'git.exe' : 'git');
-      fs.writeFileSync(
-        markerPath(),
-        JSON.stringify({
-          version: 1,
-          realGit: '/previous/git',
-          statePath: '/workspace/broker',
-          execPath: realExecPath,
-          nativeGit: fs.existsSync(nativeGit) ? nativeGit : 'git',
-        })
-      );
-      const warn = vi.fn();
-      ensureGitHubGitTransport(directory, '/workspace/broker', 'git', {
-        logger: { warn },
+    it.each([
+      [
+        'self-referential',
+        (_realPath: string) => ({ execPath: directory, nativeGit: path.join(directory, 'git') }),
+      ],
+      [
+        'cross-workspace',
+        (realPath: string) => {
+          const other = path.join(directory, 'other');
+          fs.mkdirSync(other);
+          fs.writeFileSync(path.join(other, 'lody-git-transport.json'), '{}');
+          return { execPath: other, nativeGit: path.join(realPath, 'git') };
+        },
+      ],
+      [
+        'bad-path',
+        (_realPath: string) => ({
+          execPath: path.join(directory, 'missing'),
+          nativeGit: path.join(directory, 'missing', 'git'),
+        }),
+      ],
+    ])('rejects a %s marker and probes a safe layout', (_name, paths) => {
+      const nativeExecPath = realExecPath();
+      const nativeGit = path.join(nativeExecPath, process.platform === 'win32' ? 'git.exe' : 'git');
+      generatedShim(path.join(directory, 'git'));
+      writeMarker({
+        version: 1,
+        realGit: findNativeGit(),
+        statePath: '/workspace/broker',
+        ...paths(nativeExecPath),
+      });
+      let probes = 0;
+      ensureGitHubGitTransport(directory, '/workspace/broker', findNativeGit(), {
         probeExecPathOnce: () => {
-          throw spawnError('EAGAIN');
+          probes++;
+          return nativeExecPath;
         },
       });
-      expect(warn).toHaveBeenCalledOnce();
-      expect(fs.readFileSync(path.join(directory, 'git'), 'utf8')).toContain(realExecPath);
+      expect(probes).toBe(1);
+      expect(JSON.parse(fs.readFileSync(markerPath(), 'utf8')).nativeGit).toBe(nativeGit);
+      expect(runGeneratedWrapper()).toBe(nativeGit);
+    });
+
+    it('rejects a marker whose native Git reaches a generated wrapper through a symlink', () => {
+      const nativeExecPath = realExecPath();
+      const nativeGit = path.join(nativeExecPath, process.platform === 'win32' ? 'git.exe' : 'git');
+      generatedShim(path.join(directory, 'git'));
+      const alias = path.join(directory, 'git-alias');
+      fs.symlinkSync(path.join(directory, 'git'), alias);
+      writeMarker({
+        version: 1,
+        realGit: findNativeGit(),
+        statePath: '/workspace/broker',
+        execPath: nativeExecPath,
+        nativeGit: alias,
+      });
+      ensureGitHubGitTransport(directory, '/workspace/broker', findNativeGit(), {
+        probeExecPathOnce: () => nativeExecPath,
+      });
+      expect(JSON.parse(fs.readFileSync(markerPath(), 'utf8')).nativeGit).toBe(nativeGit);
+      expect(runGeneratedWrapper()).toBe(nativeGit);
+    });
+
+    it('does not reuse a mismatched marker when the probe fails', () => {
+      const nativeExecPath = realExecPath();
+      const nativeGit = path.join(nativeExecPath, process.platform === 'win32' ? 'git.exe' : 'git');
+      writeMarker({
+        version: 1,
+        realGit: '/previous/git',
+        statePath: '/workspace/broker',
+        execPath: nativeExecPath,
+        nativeGit,
+      });
+      expect(() =>
+        ensureGitHubGitTransport(directory, '/workspace/broker', findNativeGit(), {
+          probeExecPathOnce: () => {
+            throw spawnError('ENOENT');
+          },
+        })
+      ).toThrowError(spawnError('ENOENT'));
+      expect(fs.existsSync(path.join(directory, 'git'))).toBe(false);
+    });
+
+    it('rejects its output directory even before a wrapper or marker exists', () => {
+      expect(() =>
+        ensureGitHubGitTransport(directory, '/workspace/broker', findNativeGit(), {
+          probeExecPathOnce: () => directory,
+        })
+      ).toThrow(/unsafe exec path/);
+      expect(fs.existsSync(path.join(directory, 'git'))).toBe(false);
+    });
+
+    it('rejects a renamed generated wrapper outside a marked layout', () => {
+      const standalone = path.join(directory, 'standalone-wrapper');
+      const output = path.join(directory, 'output');
+      fs.mkdirSync(output);
+      generatedShim(standalone);
+      expect(() =>
+        ensureGitHubGitTransport(output, '/workspace/broker', standalone, {
+          probeExecPathOnce: () => realExecPath(),
+        })
+      ).toThrow(/not a safe native Git path/);
+      expect(fs.existsSync(path.join(directory, 'git'))).toBe(false);
+    });
+
+    it('pins an absolute native target when relative Git has no exec-path core binary', () => {
+      const output = path.join(directory, 'output');
+      const coreless = path.join(directory, 'coreless');
+      fs.mkdirSync(output);
+      fs.mkdirSync(coreless);
+      const native = findNativeGit();
+      ensureGitHubGitTransport(output, '/workspace/broker', path.relative(process.cwd(), native), {
+        probeExecPathOnce: () => coreless,
+      });
+      expect(
+        JSON.parse(fs.readFileSync(path.join(output, 'lody-git-transport.json'), 'utf8')).nativeGit
+      ).toBe(native);
+      expect(runGeneratedWrapper(output)).toBe(native);
     });
   });
 });

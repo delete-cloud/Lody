@@ -11,10 +11,10 @@
 
 - Cloud commands share workspace managers.
 
-- GitHub auth: conversation-owner personal → matching-owner machine → repo App,
-  once per source. Failures advance without a policy RPC; local context grants
-  machine eligibility. Never persist managed tokens or replay uncertain writes.
-  Checkout/LFS share the pinned helper context. Contract: [identity fallback](../../../../specs/github-identity-fallback.md).
+- GitHub auth uses the [identity fallback](../../../../specs/github-identity-fallback.md).
+  Checkout/LFS share its pinned context; never persist tokens or replay uncertain writes.
+- Git transport uses exact-identity safe markers, clears `GIT_EXEC_PATH` for
+  probes, and never targets wrappers. [Decision](../../../../.agents/notes/implemented/bug-fix/2026-10-23-git-transport-recursion.md).
 
 - `cloud-cli-port.ts` is the sole official-build composition root for cloud clients and
   endpoint-derived adapters. Daemon runtime modules must not construct cloud SDK
