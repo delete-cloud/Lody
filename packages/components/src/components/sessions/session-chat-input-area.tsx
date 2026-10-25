@@ -105,6 +105,8 @@ import { getDroppedFileLocalPath, toPathMentionInsertion } from '@/lib/dropped-l
 import { isImeComposingKeyboardEvent } from '@/lib/ime';
 import { toast } from '@/lib/toast';
 import { validateSessionImageFile } from '@/lib/session-image-upload';
+import { formatDocumentSelection, type DocumentSelection } from '@/lib/document-selection';
+import { PendingImageMarkupDialog } from './pending-image-markup-dialog';
 import {
   SESSION_FILE_MAX_SIZE_MB,
   validateSessionFile,
@@ -112,7 +114,7 @@ import {
 } from '@/lib/session-file-upload';
 import { formatFileSize } from '@/lib/session-file-presentation';
 import { SESSION_FILE_MAX_COUNT, SESSION_IMAGE_MAX_SIZE_BYTES } from '@lody/shared';
-import type { SessionFilePayload } from '@lody/shared';
+import type { McpServerId, SessionFilePayload } from '@lody/shared';
 import {
   arePastedTextDraftsEqual,
   createPastedTextFile,
@@ -459,6 +461,8 @@ export interface SessionChatInputAreaProps {
   durableAgentRoleKnownTurnKeys?: readonly string[];
   /** False while this Session's durable document is still hydrating. */
   durableAgentRoleReady?: boolean;
+  /** False while the MCP selection still waits on project defaults that are not read. */
+  mcpSelectionReady?: boolean;
   /** True when the composer run config differs through an unsent user edit. */
   runConfigHasUserEdits?: boolean;
   modeOptions: AcpSessionSelectOption[];
@@ -539,9 +543,15 @@ export type SessionSendMessageOptions = {
   attachments?: SessionAttachmentDraft[];
   /** Swaps the configured busy-send behavior (queue <-> steer) for this send. */
   invertSubmitBehavior?: boolean;
+  /**
+   * The MCP selection shown when the user pressed send. A send that resolves
+   * later dispatches this, not whatever the selection became in between.
+   */
+  mcpServerIds?: readonly McpServerId[];
 };
 
 export type SessionChatInputAreaHandle = {
+  addDocumentSelection: (selection: DocumentSelection) => boolean;
   setInputText: (text: string) => void;
   focusInput: () => void;
   addCommentReference: (reference: CommentReferencePayload) => boolean;
@@ -586,6 +596,7 @@ export const SessionChatInputArea = memo(
       durableAgentRoleSourceTurnKey,
       durableAgentRoleKnownTurnKeys,
       durableAgentRoleReady,
+      mcpSelectionReady,
       runConfigHasUserEdits,
       modeOptions,
       modelOptions,
@@ -1001,6 +1012,21 @@ export const SessionChatInputArea = memo(
       },
       []
     );
+    const [imageMarkup, setImageMarkup] = useState<{
+      sessionId: SessionId;
+      id: string;
+      file: File;
+    } | null>(null);
+    useEffect(() => {
+      if (
+        imageMarkup &&
+        (imageMarkup.sessionId !== session.id ||
+          !pendingImages.some(
+            (image) => image.localId === imageMarkup.id && image.file === imageMarkup.file
+          ))
+      )
+        setImageMarkup(null);
+    }, [session.id, pendingImages, imageMarkup]);
     const setInputText = useCallback(
       (value: string) => {
         if (isArchived) {
@@ -1312,7 +1338,7 @@ export const SessionChatInputArea = memo(
     );
 
     const insertLargePastedTextAtSelection = useCallback(
-      (text: string) => {
+      (text: string, options?: { label: string; append: true }) => {
         if (isArchived) {
           return false;
         }
@@ -1321,16 +1347,23 @@ export const SessionChatInputArea = memo(
           return false;
         }
 
-        const currentValue = textareaRef.current?.value ?? userInput;
-        const selectionStart = textareaRef.current?.selectionStart ?? null;
-        const selectionEnd = textareaRef.current?.selectionEnd ?? null;
+        let currentValue = textareaRef.current?.value ?? userInput;
+        if (options?.append && currentValue && !currentValue.endsWith('\n\n'))
+          currentValue += '\n\n';
+        const selectionStart = options?.append
+          ? currentValue.length
+          : (textareaRef.current?.selectionStart ?? null);
+        const selectionEnd = options?.append
+          ? currentValue.length
+          : (textareaRef.current?.selectionEnd ?? null);
         const result = insertPastedTextDraft({
           currentValue,
           pastedText: normalizedText,
           displayText: wrapPastedTextChipLabel(
-            t('composer.pastedTextInlineLabel', '[Pasted {{charCount}} chars]', {
-              charCount: numberFormatter.format(getPastedTextCharacterCount(normalizedText)),
-            })
+            options?.label ??
+              t('composer.pastedTextInlineLabel', '[Pasted {{charCount}} chars]', {
+                charCount: numberFormatter.format(getPastedTextCharacterCount(normalizedText)),
+              })
           ),
           selectionStart,
           selectionEnd,
@@ -1514,9 +1547,46 @@ export const SessionChatInputArea = memo(
       [isArchived]
     );
 
+    const addDocumentSelection = useCallback(
+      (selection: DocumentSelection) => {
+        if (isArchived || submissionPending) return false;
+        if (
+          selection.image &&
+          (disableImageUpload ||
+            pendingImages.length >= SESSION_IMAGE_MAX_COUNT ||
+            validateSessionImageFile(selection.image))
+        )
+          return false;
+        let text: string;
+        try {
+          text = formatDocumentSelection(selection);
+        } catch {
+          return false;
+        }
+        if (
+          !insertLargePastedTextAtSelection(text, {
+            label: `${selection.path.split(/[\\/]/).at(-1)} · ${selection.location}`,
+            append: true,
+          })
+        )
+          return false;
+        if (selection.image) handleAddFiles([selection.image], 'drop');
+        return true;
+      },
+      [
+        isArchived,
+        submissionPending,
+        disableImageUpload,
+        pendingImages.length,
+        insertLargePastedTextAtSelection,
+        handleAddFiles,
+      ]
+    );
+
     useImperativeHandle(
       ref,
       () => ({
+        addDocumentSelection,
         setInputText,
         focusInput: () => {
           textareaRef.current?.focus();
@@ -1537,6 +1607,7 @@ export const SessionChatInputArea = memo(
           }),
       }),
       [
+        addDocumentSelection,
         setInputText,
         addCommentReference,
         toggleCommentReference,
@@ -1590,7 +1661,7 @@ export const SessionChatInputArea = memo(
           });
           return;
         }
-        if (durableAgentRoleReady === false) {
+        if (durableAgentRoleReady === false || mcpSelectionReady === false) {
           return;
         }
         if (isMachineRemoved) {
@@ -1641,6 +1712,7 @@ export const SessionChatInputArea = memo(
             ]
           : [];
         const attachments = snapshotAttachmentDrafts(pendingImages, pendingFiles);
+        const mcpServerIds = mcp ? [...mcp.selectedIds] : undefined;
         const commentRefBlocks: SessionInputBlock[] = commentReferencesRef.current.map((item) => ({
           type: 'comment_reference' as const,
           ...item.reference,
@@ -1705,6 +1777,7 @@ export const SessionChatInputArea = memo(
           const accepted = await onSendMessage(inputBlocks, agentRoleTurnSelectionRef.current, {
             ...options,
             attachments,
+            ...(mcpServerIds ? { mcpServerIds } : {}),
           });
           if (accepted) {
             captureAgentRoleMentionsApplied(postHog, {
@@ -1754,6 +1827,8 @@ export const SessionChatInputArea = memo(
         freeTurnLimitNotice,
         isArchived,
         durableAgentRoleReady,
+        mcp,
+        mcpSelectionReady,
         isExternalHistoryRefreshing,
         isMachineRemoved,
         isVisible,
@@ -1824,6 +1899,7 @@ export const SessionChatInputArea = memo(
       isArchived ||
       isExternalHistoryRefreshing ||
       durableAgentRoleReady === false ||
+      mcpSelectionReady === false ||
       Boolean(freeTurnLimitNotice && freeTurnLimitNotice.current >= freeTurnLimitNotice.limit);
     const attachmentAddEnabled = !isArchived;
     const mentionSource = useSessionMentionSource({
@@ -2254,6 +2330,15 @@ export const SessionChatInputArea = memo(
         }
         onAttachmentAddClick={attachmentAddEnabled ? handleAttachmentAddClick : undefined}
         onImageRemove={submissionPending || isArchived ? undefined : handleRemoveImage}
+        onImageAnnotate={
+          submissionPending || isArchived
+            ? undefined
+            : (id) => {
+                const image = pendingImages.find((entry) => entry.localId === id);
+                if (image && image.status !== 'uploading')
+                  setImageMarkup({ sessionId: session.id, id, file: image.file });
+              }
+        }
         onImageRetry={submissionPending || isArchived ? undefined : handleRetryImage}
         fileItems={submissionPending ? [] : fileItems}
         mcp={mcp}
@@ -2309,6 +2394,54 @@ export const SessionChatInputArea = memo(
             />
           ) : null}
           {composerNode}
+          {imageMarkup?.sessionId === session.id && !isArchived && !submissionPending ? (
+            <PendingImageMarkupDialog
+              key={imageMarkup.id}
+              file={imageMarkup.file}
+              onClose={() => setImageMarkup(null)}
+              onAdd={(selection) => {
+                const original = getSessionImageDrafts(session.id).find(
+                  (image) => image.localId === imageMarkup.id && image.file === imageMarkup.file
+                );
+                if (
+                  activeSessionIdRef.current !== session.id ||
+                  !original ||
+                  original.status === 'uploading' ||
+                  !selection.image ||
+                  validateSessionImageFile(selection.image)
+                )
+                  return false;
+                const previewUrl = URL.createObjectURL(selection.image);
+                if (selection.comment?.trim()) {
+                  const text = formatDocumentSelection(selection);
+                  if (
+                    !insertLargePastedTextAtSelection(text, { label: selection.path, append: true })
+                  ) {
+                    URL.revokeObjectURL(previewUrl);
+                    return false;
+                  }
+                }
+                updatePendingImagesForSession(session.id, (images) =>
+                  images.map((image) =>
+                    image.localId === original.localId
+                      ? {
+                          ...image,
+                          file: selection.image!,
+                          previewUrl,
+                          status: 'draft',
+                          progress: 0,
+                          error: undefined,
+                          uploaded: undefined,
+                        }
+                      : image
+                  )
+                );
+                URL.revokeObjectURL(original.previewUrl);
+                setImageMarkup(null);
+                return true;
+              }}
+            />
+          ) : null}
         </ConversationColumn>
       </div>
     );

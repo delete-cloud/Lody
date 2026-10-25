@@ -1,3 +1,5 @@
+import { readProjectDefaultMcpIds, syncMcpCatalog } from '@/lib/workspace-mcp-store';
+import { normalizeMcpServerIdSelection, resolveSessionConversationConfig } from '@lody/shared';
 import {
   getMachineRoomId,
   machineSupportsProtocolCapability,
@@ -15,7 +17,6 @@ import { prepareSessionInputAttachments } from '@/lib/session-input-attachments'
 import { buildCommandInputBlocks, type SessionInputAttachment } from '@/lib/session-input-content';
 import { createCommandAttachmentTransfer } from '@/lib/cloud-cli-port';
 import { inputBlocksToHistoryItems, type SessionInputBlock } from '@lody/shared';
-import { resolveSessionConversationConfig } from '@lody/shared';
 import type { MessageAuthor, AgentMessageAuthor } from '@lody/shared';
 import {
   ACP_CAPABILITY_ROW_FAMILIES,
@@ -143,6 +144,7 @@ import { getSessionCommandEnvironment } from '@/lib/session-command-environment'
 import { listMergedAgentConfigs } from '@/lib/agent-config-machine-flock';
 import {
   applyAgentRoleCreateTarget,
+  composeAgentRolePrompt,
   resolveAgentRoleCreateFromCatalog,
 } from '@/lib/agent-role-create';
 import { getLogger, rootLogger, routeLoggerToStderr } from '@/utils/logger';
@@ -229,6 +231,7 @@ export type CreateOptions = CommonOptions &
     mode?: string;
     model?: string;
     configOption?: string[];
+    mcpServerIds?: string;
     env?: string[];
     wait?: boolean;
     timeout?: number;
@@ -243,6 +246,11 @@ export type CreateOptions = CommonOptions &
     agentRoleId?: string;
     agentRoleRevision?: number;
     agentRoleSnapshot?: import('@lody/shared').AgentRoleSnapshot;
+    /**
+     * Role instruction frozen at acceptance. It is prepended to the execution
+     * prompt only; the visible user turn keeps the authored prompt.
+     */
+    agentRolePromptPrefix?: string;
     /** Durable batch Operations intentionally bypass cooperative session quotas. */
     bypassSessionQuota?: boolean;
     /**
@@ -258,6 +266,7 @@ export type ChatOptions = CommonOptions &
     mode?: string;
     model?: string;
     configOption?: string[];
+    mcpServerIds?: string;
     wait?: boolean;
     timeout?: number;
   };
@@ -1027,7 +1036,7 @@ async function checkSessionTurnQuotaAndReadHistory(args: {
 export async function runSessionOperationWithSyncedMetadata(
   manager: LoroDocumentManager,
   sessionId: SessionId,
-  operation: SessionOperation
+  operation: Extract<SessionOperation, 'archive' | 'restore' | 'delete'>
 ): Promise<SessionId[]> {
   const reason = `session.${operation}:${sessionId}`;
   await syncWorkspaceMetaForRead(manager, `${reason}:prewrite`);
@@ -1416,6 +1425,7 @@ export async function appendUserPromptHistory(args: {
 }
 
 function buildCliHistoryInputConfig(args: {
+  mcpServerIds?: string[];
   inputBlocks?: SessionInputBlock[];
   memory?: import('@lody/shared').MemoryBinding;
   prompt: string;
@@ -1428,6 +1438,7 @@ function buildCliHistoryInputConfig(args: {
   chainDepth?: number;
 }): NonNullable<SessionHistoryInput['inputConfig']> {
   return {
+    mcpServerIds: normalizeMcpServerIdSelection(args.mcpServerIds),
     memory: args.memory,
     ...(args.inputBlocks?.some((block) => block.type !== 'text')
       ? { inputBlocks: args.inputBlocks }
@@ -1447,6 +1458,7 @@ function buildCliHistoryInputConfig(args: {
 }
 
 export type ResolvedTurnDispatchConfig = {
+  mcpServerIds?: string[];
   memory?: import('@lody/shared').MemoryBinding;
   modeId?: string;
   modelId?: string;
@@ -1575,6 +1587,7 @@ export function resolveTurnDispatchConfig(args: {
   mode?: string;
   model?: string;
   configOption?: string[];
+  mcpServerIds?: string;
 }): ResolvedTurnDispatchConfig {
   const modeId = normalizeCliValue(args.mode);
   const modelId = normalizeCliValue(args.model);
@@ -1583,7 +1596,22 @@ export function resolveTurnDispatchConfig(args: {
     modeId: modeId ?? undefined,
     modelId: modelId ?? undefined,
     configOptionValues: parseConfigOptionAssignments(args.configOption),
+    ...(args.mcpServerIds !== undefined
+      ? { mcpServerIds: parseCliMcpServerIds(args.mcpServerIds) }
+      : {}),
   };
+}
+
+export function parseCliMcpServerIds(value: string): string[] {
+  const parsed: unknown = JSON.parse(value);
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length > 1000 ||
+    parsed.some((id) => typeof id !== 'string' || !id.trim() || id.length > 256)
+  ) {
+    throw new Error('--mcp-server-ids must be a JSON array of MCP ids (use [] for none).');
+  }
+  return normalizeMcpServerIdSelection(parsed) ?? [];
 }
 
 function findTurnConfigOptionByCategory(
@@ -1657,6 +1685,7 @@ function mergeTurnDispatchConfig(
     capability
   );
   return {
+    mcpServerIds: explicitConfig.mcpServerIds,
     memory: explicitConfig.memory ?? fallbackConfig?.memory,
     modeId: explicitConfig.modeId ?? fallbackConfig?.modeId,
     modelId: explicitConfig.modelId ?? fallbackConfig?.modelId,
@@ -2612,7 +2641,14 @@ export async function confirmDispatchSyncedBestEffort(args: {
       );
       return;
     }
-    await ensureWorkspaceMetaSynced(args.manager, `${args.reason}:meta`);
+    // Best effort, on the synchronous tail of create: keep the short default
+    // wait instead of the failing confirmation budget.
+    if (!(await args.manager.waitUntilMetaSynced({ reason: `${args.reason}:meta` }))) {
+      logger.warn(
+        `Session dispatch not yet confirmed by Loro Streams (${args.reason}:meta); ` +
+          `the durable dispatch pointer will converge on reconnect.`
+      );
+    }
   } catch (error) {
     logger.warn(
       `Session dispatch confirmation did not complete (${args.reason}); ` +
@@ -3359,6 +3395,7 @@ export async function validateSessionCreateOptions(args: {
     manager: args.manager,
     workspaceId: args.workspace.id as WorkspaceId,
     agentConfig: resolved.agentConfig,
+    project: resolved.project,
     openedBySessionId: resolved.openedBySessionId,
     dispatchConfig: args.dispatchConfig ?? resolveTurnDispatchConfig({}),
   });
@@ -3368,6 +3405,7 @@ export async function resolveEffectiveSessionCreateDispatchConfig(args: {
   manager: LoroDocumentManager;
   workspaceId: WorkspaceId;
   agentConfig: AgentConfigMeta;
+  project?: ProjectRef;
   openedBySessionId?: SessionId;
   dispatchConfig: ResolvedTurnDispatchConfig;
   localOnly?: boolean;
@@ -3399,6 +3437,18 @@ export async function resolveEffectiveSessionCreateDispatchConfig(args: {
   // available during materialization so a newly advertised catalog can omit it.
   // Keep explicit modes and all other selections on their normal validation path.
   if (frozenBuiltinDefault) delete dispatchConfig.modeId;
+  const mcpServerIds =
+    dispatchConfig.mcpServerIds !== undefined
+      ? [...dispatchConfig.mcpServerIds]
+      : await (async () => {
+          if (!args.localOnly) await syncMcpCatalog(args.manager, args.workspaceId);
+          return readProjectDefaultMcpIds(
+            args.manager.repo,
+            args.workspaceId,
+            args.project,
+            args.agentConfig.machineId
+          );
+        })();
   if (dispatchConfig.memory) {
     const machine = (await listMachineMetasForWorkspace(args.manager)).find(
       (entry) => entry.id === args.agentConfig.machineId
@@ -3532,6 +3582,7 @@ export async function resolveEffectiveSessionCreateDispatchConfig(args: {
     ...(Object.keys(inheritedSnapshot).length
       ? { inheritedDispatchConfig: inheritedSnapshot }
       : {}),
+    mcpServerIds,
     inheritSessionDefaults: false,
   };
 }
@@ -3676,6 +3727,7 @@ export async function prepareSessionInput(
     manager,
     workspaceId: workspace.id as WorkspaceId,
     agentConfig,
+    project,
     ...(openedBySessionId ? { openedBySessionId } : {}),
     dispatchConfig,
     localOnly: ownerTarget !== undefined,
@@ -3765,10 +3817,14 @@ export async function prepareSessionInput(
           }
         : {}),
       ...buildCliHistoryInputConfig({
-        prompt: buildAgentPrompt(prompt, agentConfig.prompt ?? ''),
+        prompt: buildAgentPrompt(
+          composeAgentRolePrompt(options.agentRolePromptPrefix, prompt),
+          agentConfig.prompt ?? ''
+        ),
         inputBlocks,
         cliType: agentConfig.cliType,
         agentType: agentConfig.agentType,
+        mcpServerIds: effectiveDispatchConfig.mcpServerIds,
         memory: effectiveDispatchConfig.memory,
         modeId: effectiveDispatchConfig.modeId ?? undefined,
         modelId: effectiveDispatchConfig.modelId ?? undefined,
@@ -4033,6 +4089,10 @@ export async function sendSessionChatResult(
     capability,
     freshness,
   });
+  effectiveDispatchConfig.mcpServerIds =
+    dispatchConfig.mcpServerIds !== undefined
+      ? [...dispatchConfig.mcpServerIds]
+      : (resolveSessionConversationConfig(historyForDefaults).mcpServerIds ?? []);
   // An unconfigured follow-up retains the target's selected Role, never the sender's.
   // Explicit execution changes clear it rather than claiming an unchanged preset.
   const roleSelection =
@@ -4076,6 +4136,7 @@ export async function sendSessionChatResult(
         prompt,
         cliType: session.cliType,
         agentType: session.agentType,
+        mcpServerIds: effectiveDispatchConfig.mcpServerIds,
         memory: effectiveDispatchConfig.memory,
         modeId: effectiveDispatchConfig.modeId,
         modelId: effectiveDispatchConfig.modelId,
@@ -4555,6 +4616,7 @@ const sessionCreateCommand = new Command('create')
   .option('--worktree', 'Create an isolated git worktree for --local-project')
   .option('--branch <name>', 'Git branch to use for GitHub repos or local git projects')
   .option('--mode <modeId>', 'ACP mode override')
+  .option('--mcp-server-ids <json>', 'MCP ids as a JSON array; [] disables all')
   .option('--model <modelId>', 'ACP model override')
   .option(
     '--config-option <keyValue>',
@@ -4619,6 +4681,9 @@ const sessionCreateCommand = new Command('create')
               model: options.model,
               configOption: options.configOption,
             });
+          }
+          if (options.mcpServerIds !== undefined) {
+            dispatchConfig.mcpServerIds = parseCliMcpServerIds(options.mcpServerIds);
           }
           const shouldWaitForCompletion = shouldWaitForSessionCompletion(options);
           const result = await createSessionResult(
@@ -4753,6 +4818,7 @@ const sessionChatCommand = new Command('chat')
   .description('Send a new user prompt to an existing session')
   .option('--workspace <selector>', 'Target workspace id, slug, or name')
   .option('--mode <modeId>', 'ACP mode override')
+  .option('--mcp-server-ids <json>', 'MCP ids as a JSON array; [] disables all')
   .option('--model <modelId>', 'ACP model override')
   .option(
     '--config-option <keyValue>',
@@ -4814,6 +4880,7 @@ const sessionChatCommand = new Command('chat')
             mode: options.mode,
             model: options.model,
             configOption: options.configOption,
+            mcpServerIds: options.mcpServerIds,
           });
           const shouldWaitForCompletion = shouldWaitForSessionCompletion(options);
           const result = await sendSessionChatResult(
@@ -4907,6 +4974,80 @@ const sessionChatCommand = new Command('chat')
     }
   );
 
+/** Cancel a Session's running turn through the caller's workspace manager. */
+export async function cancelSessionTurn(args: {
+  auth: AuthContext;
+  workspaceId: WorkspaceId;
+  manager: LoroDocumentManager;
+  sessionId: SessionId;
+  turnId?: string;
+  operationCancel?: boolean;
+}) {
+  const { auth, workspaceId, manager, sessionId } = args;
+  await syncSessionReadData(manager, sessionId, undefined, `session.cancel:${sessionId}`);
+  const session = await resolveSessionMetaOrThrow(manager, sessionId);
+  await assertMachineAccess({
+    auth,
+    workspaceId,
+    machineId: session.machineId,
+    requester: resolveSessionRequester(auth),
+    localProjectId: session.project?.kind === 'local' ? session.project.localProjectId : undefined,
+  });
+  // Already-stopped cancellation stays idempotent even when the daemon is offline.
+  const turnId = await resolveRunningAssistantTurnId(manager, sessionId);
+  if (!turnId) return { ok: true as const, sessionId, alreadyStopped: true as const };
+  const expectedTurnId = normalizeCliValue(args.turnId);
+  if (expectedTurnId && turnId !== expectedTurnId)
+    return {
+      ok: true as const,
+      sessionId,
+      alreadyStopped: true as const,
+      expectedTurnId,
+      activeTurnId: turnId,
+    };
+
+  await ensureTargetMachineOnline({ auth, workspaceId, machineId: session.machineId });
+
+  const machine = await manager.repo.getDocMeta(getMachineRoomId(session.machineId));
+  const inboxCancel = getSessionCancelProtocolFields(
+    machine?.meta,
+    uuidV4(),
+    !args.operationCancel
+  );
+  const response =
+    session.machineId === auth.machineId
+      ? extractCancelResponse(
+          await dispatchLocalControl({
+            type: 'session/cancel',
+            sessionId,
+            machineId: auth.machineId,
+            workspaceId,
+            turnId,
+            ...inboxCancel,
+          })
+        )
+      : await withMachineRpcClient(
+          { auth, workspaceId, machineId: session.machineId },
+          async (client) =>
+            await client.requestSessionCancel({
+              sessionId,
+              turnId,
+              timeoutMs: 10_000,
+              ...inboxCancel,
+            })
+        );
+
+  if (!response) {
+    throw new Error(`Machine ${session.machineId} did not answer the cancel request.`);
+  }
+
+  if (!response.success) {
+    throw new Error(response.error ?? `Failed to cancel ${sessionId}.`);
+  }
+
+  return { ok: true as const, sessionId, response };
+}
+
 const sessionCancelCommand = new Command('cancel')
   .description('Cancel the current running turn for a session')
   .option('--workspace <selector>', 'Target workspace id, slug, or name')
@@ -4933,94 +5074,25 @@ const sessionCancelCommand = new Command('cancel')
           sessionId,
           options.workspace
         );
-        await withWorkspaceManager(auth, workspace, async (manager) => {
-          await syncSessionReadData(manager, sessionId, undefined, `session.cancel:${sessionId}`);
-          const session = await resolveSessionMetaOrThrow(manager, sessionId);
-          const workspaceId = workspace.id as WorkspaceId;
-          await assertMachineAccess({
+        const result = await withWorkspaceManager(auth, workspace, (manager) =>
+          cancelSessionTurn({
             auth,
-            workspaceId,
-            machineId: session.machineId,
-            requester: resolveSessionRequester(auth),
-            localProjectId:
-              session.project?.kind === 'local' ? session.project.localProjectId : undefined,
-          });
-          // Already-stopped cancellation stays idempotent even when the daemon is offline.
-          const turnId = await resolveRunningAssistantTurnId(manager, sessionId);
-          if (!turnId) {
-            if (options.json) {
-              printJson({ ok: true, sessionId, alreadyStopped: true });
-            } else {
-              console.log(`Session ${sessionId} has no active turn.`);
-            }
-            return;
-          }
-          const expectedTurnId = normalizeCliValue(options.turnId);
-          if (expectedTurnId && turnId !== expectedTurnId) {
-            if (options.json) {
-              printJson({
-                ok: true,
-                sessionId,
-                alreadyStopped: true,
-                expectedTurnId,
-                activeTurnId: turnId,
-              });
-            } else {
-              console.log(`Target turn ${expectedTurnId} is no longer active in ${sessionId}.`);
-            }
-            return;
-          }
-
-          await ensureTargetMachineOnline({ auth, workspaceId, machineId: session.machineId });
-
-          const machine = await manager.repo.getDocMeta(getMachineRoomId(session.machineId));
-          const inboxCancel = getSessionCancelProtocolFields(
-            machine?.meta,
-            uuidV4(),
-            !options.operationCancel
-          );
-          const response =
-            session.machineId === auth.machineId
-              ? extractCancelResponse(
-                  await dispatchLocalControl({
-                    type: 'session/cancel',
-                    sessionId,
-                    machineId: auth.machineId,
-                    workspaceId,
-                    turnId,
-                    ...inboxCancel,
-                  })
-                )
-              : await withMachineRpcClient(
-                  { auth, workspaceId, machineId: session.machineId },
-                  async (client) =>
-                    await client.requestSessionCancel({
-                      sessionId,
-                      turnId,
-                      timeoutMs: 10_000,
-                      ...inboxCancel,
-                    })
-                );
-
-          if (!response) {
-            throw new Error(`Machine ${session.machineId} did not answer the cancel request.`);
-          }
-
-          if (!response.success) {
-            throw new Error(response.error ?? `Failed to cancel ${sessionId}.`);
-          }
-
-          if (options.json) {
-            printJson({
-              ok: true,
-              sessionId,
-              response,
-            });
-            return;
-          }
-
+            workspaceId: workspace.id as WorkspaceId,
+            manager,
+            sessionId,
+            turnId: options.turnId,
+            operationCancel: options.operationCancel,
+          })
+        );
+        if (options.json) {
+          printJson(result);
+        } else if (result.response) {
           console.log(`Cancelled ${sessionId}`);
-        });
+        } else if (result.expectedTurnId) {
+          console.log(`Target turn ${result.expectedTurnId} is no longer active in ${sessionId}.`);
+        } else {
+          console.log(`Session ${sessionId} has no active turn.`);
+        }
       });
     }
   );
@@ -5602,3 +5674,15 @@ export const sessionCommand = new Command('session')
   .addCommand(sessionRestoreCommand)
   .addCommand(sessionInboxRecoveryCommand)
   .addCommand(sessionDeleteCommand);
+
+export async function readSessionMcpIdsForAuthoring(
+  manager: LoroDocumentManager,
+  sessionId: SessionId,
+  explicitIds?: readonly string[]
+): Promise<string[]> {
+  if (explicitIds !== undefined) return [...explicitIds];
+  await syncDocForRead(manager, getSessionRoomId(sessionId), 'session-mcp-selection');
+  const doc = await manager.getOrCreateSessionDoc(sessionId);
+  const backend = await createSessionBackend(doc, await doc.getMetaState());
+  return resolveSessionConversationConfig(await backend.readHistory()).mcpServerIds ?? [];
+}

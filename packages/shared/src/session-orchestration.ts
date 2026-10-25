@@ -217,11 +217,14 @@ export type FrozenOperationContinuationConfig = {
   inputConfig: SessionTurnInputConfig;
   /** Frozen causal Turn for delegated Operations; recovery must not re-resolve it. */
   sourceTurnId?: string;
+  /** Human requests whose result this requester is still assembling. Not authorization. */
+  notificationOriginTurnIds?: string[];
   /**
    * Effective per-target create config captured at acceptance. Null entries
    * correspond to batch items rejected before a target was accepted.
    */
   targetDispatchConfigs?: Array<{
+    mcpServerIds?: string[];
     /** Internal derived-default provenance; never accepted from public MCP input. */
     builtinDefaultModeId?: string;
     /** Legacy inherited-mode provenance, retained for stored config compatibility. */

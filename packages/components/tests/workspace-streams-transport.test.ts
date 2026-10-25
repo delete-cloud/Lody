@@ -16,14 +16,15 @@ import {
   Bytes,
   contentSigningBytes,
   encodeContentHeader,
+  inspectContentFrame,
   deriveContentKey,
   sealContentAead,
   openContentAead,
   verifyContentSignature,
   type ContentScope,
-} from '@lody/e2ee-core';
-import { hashRecordBytes, recordSigningBytes, verifyLedger } from '@lody/e2ee-core/ledger';
-import { encodeCbor } from '@lody/e2ee-core';
+} from '@lody/e2ee-core/protocol';
+import { hashRecordBytes, recordSigningBytes, verifyLedger } from '@lody/e2ee-core/protocol';
+import { encodeCbor } from '@lody/e2ee-core/protocol';
 import { encodeStreamsRoomAdditionalData } from 'loro-repo/transport/streams';
 import { PayloadProtectionError } from '@loro-dev/streams-crdt';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -125,6 +126,7 @@ async function openTab(workspaceId: WorkspaceId, storage?: IndexedDBStorageAdapt
 
 async function syncMeta(tab: Tab) {
   const transport = createWorkspaceStreamsTransport({
+    content: { mode: 'plaintext' },
     repo: tab.repo,
     workspaceId: tab.workspaceId,
     documentRemoteCursorStore: createResilientRemoteCursorStore({ dbName: tab.cursorDbName }),
@@ -139,10 +141,23 @@ async function syncMeta(tab: Tab) {
   }
 }
 
+/** Drain cooperative zero-delay tasks without advancing snapshot debounce timers. */
+async function settle<T>(operation: Promise<T>, timeout = 5_000): Promise<T> {
+  if (!vi.isFakeTimers()) return await operation;
+  const completion = operation.then(
+    (value) => ({ value }),
+    (error: unknown) => ({ error })
+  );
+  const result = await vi.waitFor(() => completion, { interval: 0, timeout });
+  if ('error' in result) throw result.error;
+  return result.value;
+}
+
 afterEach(async () => {
-  for (const transport of openTransports) await transport.close();
+  for (const transport of openTransports)
+    await settle(transport.close(), 10_000);
   openTransports.clear();
-  for (const tab of openTabs) await tab.repo.destroy();
+  for (const tab of openTabs) await settle(tab.repo.destroy(), 10_000);
   openTabs.clear();
   vi.unstubAllGlobals();
   vi.useRealTimers();
@@ -190,6 +205,7 @@ function transportFor(
   cursorStore?: RemoteCursorStore
 ) {
   const transport = createWorkspaceStreamsTransport({
+
     repo: tab.repo,
     workspaceId: tab.workspaceId,
     documentRemoteCursorStore:
@@ -197,7 +213,7 @@ function transportFor(
     auth: async () => 'streams-jwt',
     streamsBaseUrl,
     shardHostSuffix: undefined,
-    content,
+    content: content === undefined ? { mode: 'plaintext' } : content,
   });
   openTransports.add(transport);
   return transport;
@@ -705,13 +721,13 @@ describe('workspace Streams content boundary', () => {
     });
     const transport = transportFor(tab, content);
     const subscription = transport.joinDocRoom('doc-a', doc);
-    await subscription.firstSyncedWithRemote;
+    await settle(subscription.firstSyncedWithRemote);
     const path = new URL(docUrl(tab.workspaceId, 'doc-a')).pathname;
     for (const nextPermission of ['deny', 'throw', 'allow'] as const) {
       permission = nextPermission;
       doc.getMap('data').set('value', permission);
       doc.commit();
-      await subscription.waitUntilSynced();
+      await settle(subscription.waitUntilSynced());
       await vi.advanceTimersByTimeAsync(10);
       if (permission !== 'allow') expect(server.room(path).snapshot).toBeUndefined();
     }
@@ -722,7 +738,7 @@ describe('workspace Streams content boundary', () => {
     const reader = await openTab(`snapshot-reader-${++sequence}` as WorkspaceId);
     reader.workspaceId = tab.workspaceId;
     const restored = (await reader.repo.openPersistedDoc('doc-a')).doc;
-    expect((await transportFor(reader, content).syncDoc('doc-a', restored)).ok).toBe(true);
+    expect((await settle(transportFor(reader, content).syncDoc('doc-a', restored))).ok).toBe(true);
     expect(restored.toJSON()).toEqual({ data: { value: 'allow' } });
     subscription.unsubscribe();
   });
@@ -733,7 +749,7 @@ describe('workspace Streams content boundary', () => {
     const tab = await openTab(`ordinary-upload-${++sequence}` as WorkspaceId);
     const doc = (await tab.repo.openPersistedDoc('doc-a')).doc;
     const subscription = transportFor(tab).joinDocRoom('doc-a', doc);
-    await subscription.firstSyncedWithRemote;
+    await settle(subscription.firstSyncedWithRemote);
     let seed = 123456;
     const text = Array.from({ length: 200_000 }, () => {
       seed ^= seed << 13;
@@ -743,7 +759,7 @@ describe('workspace Streams content boundary', () => {
     }).join('');
     doc.getMap('data').set('text', text);
     doc.commit();
-    await subscription.waitUntilSynced();
+    await settle(subscription.waitUntilSynced());
     const path = new URL(docUrl(tab.workspaceId, 'doc-a')).pathname;
     expect(Number(server.tail(path))).toBeGreaterThan(102400);
     await vi.advanceTimersByTimeAsync(10_000);
@@ -864,7 +880,7 @@ const syntheticScope = {
 type CryptoFault = 'signature' | 'tag' | 'missing-key';
 
 /** Independently compose public P07 primitives; never accept a verifier callback.
- * Header 3/4, whole-batch v0 and encrypted snapshot offset follow the existing
+ * Header 3/4, whole-batch v0 and authenticated content-frame snapshot offset follow the current
  * content contract. Missing production signing/history ports remain blockers.
  */
 function cryptoTestProtection(
@@ -888,31 +904,26 @@ function cryptoTestProtection(
     seal(input) {
       const snapshot = input.context.kind === 'snapshot';
       const scope = scopeFor(snapshot);
-      const trustedHeader = { ...scope, docEpoch: 0 as const, device: syntheticDevice };
+      const trustedHeader = {
+        ...scope,
+        docEpoch: 0 as const,
+        device: syntheticDevice,
+        ...(snapshot ? { continuationOffset: input.context.continuationOffset } : {}),
+      };
       const header = Uint8Array.of(snapshot ? 4 : 3);
       const binding = input.additionalData(header);
-      const offset = snapshot
-        ? new TextEncoder().encode(input.context.continuationOffset!)
-        : new Uint8Array();
-      const plaintext = snapshot
-        ? new Uint8Array(2 + offset.length + input.plaintext.length)
-        : input.plaintext;
-      if (snapshot) {
-        new DataView(plaintext.buffer).setUint16(0, offset.length);
-        plaintext.set(offset, 2);
-        plaintext.set(input.plaintext, 2 + offset.length);
-      }
+      const prefix = unwrap(encodeContentHeader(trustedHeader), 'encrypt_failed');
       const key = unwrap(deriveContentKey(syntheticEpochKey, scope), 'encrypt_failed');
       const encrypted = unwrap(
-        sealContentAead(key, trustedHeader, plaintext, binding),
+        sealContentAead(key, trustedHeader, input.plaintext, binding),
         'encrypt_failed'
       );
       if (options.fault === 'tag' && (!options.snapshotOnly || snapshot))
         encrypted.ciphertext[0] ^= 1;
-      const unsigned = new Uint8Array(39 + 24 + encrypted.ciphertext.length);
-      unsigned.set(unwrap(encodeContentHeader(trustedHeader), 'encrypt_failed'));
-      unsigned.set(encrypted.nonce, 39);
-      unsigned.set(encrypted.ciphertext, 63);
+      const unsigned = new Uint8Array(prefix.length + 24 + encrypted.ciphertext.length);
+      unsigned.set(prefix);
+      unsigned.set(encrypted.nonce, prefix.length);
+      unsigned.set(encrypted.ciphertext, prefix.length + 24);
       const signature = sign(
         null,
         unwrap(contentSigningBytes(scope, unsigned, binding), 'encrypt_failed'),
@@ -929,29 +940,35 @@ function cryptoTestProtection(
       expect(syntheticAuthority.inspectState().devices.has(syntheticDevice)).toBe(true);
       // Scope and signer are supplied independently; frame metadata never
       // selects a trusted Org, purpose, document, epoch or public key.
-      unwrap(
+      const metadata = unwrap(
         verifyContentSignature(input.sealed, scope, syntheticSigner, input.additionalData),
         'decrypt_failed'
       );
       if (options.fault === 'missing-key')
         throw new PayloadProtectionError('missing_read_key', 'synthetic key detail');
+      const trustedHeader = {
+        ...scope,
+        docEpoch: 0 as const,
+        device: syntheticDevice,
+        ...(snapshot ? { continuationOffset: metadata.continuationOffset } : {}),
+      };
+      const prefix = unwrap(encodeContentHeader(trustedHeader), 'decrypt_failed');
       const key = unwrap(deriveContentKey(syntheticEpochKey, scope), 'decrypt_failed');
       const bytes = unwrap(
         openContentAead(
           key,
-          { ...scope, docEpoch: 0, device: syntheticDevice },
-          input.sealed.slice(39, 63),
-          input.sealed.slice(63, -64),
+          trustedHeader,
+          input.sealed.slice(prefix.length, prefix.length + 24),
+          input.sealed.slice(prefix.length + 24, -64),
           input.additionalData
         ),
         'decrypt_failed'
       );
-      if (!snapshot) return bytes;
-      const length = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(0);
-      const offset = new TextDecoder().decode(bytes.slice(2, 2 + length));
-      if (offset !== input.context.continuationOffset)
+      if (snapshot && metadata.continuationOffset !== input.context.continuationOffset) {
+        bytes.fill(0);
         throw new PayloadProtectionError('decrypt_failed');
-      return bytes.slice(2 + length);
+      }
+      return bytes;
     },
   };
 }
@@ -1105,10 +1122,10 @@ describe('P10 public crypto and published SDK preparation', () => {
         snapshotUpload: { canUpload: () => true, debounceMs: 10, minBytesSinceRemoteSnapshot: 0 },
       });
       const subscription = transportFor(writer, content).joinDocRoom('doc-a', doc);
-      await subscription.firstSyncedWithRemote;
+      await settle(subscription.firstSyncedWithRemote);
       doc.getMap('data').set('snapshot', 'verified before decompression');
       doc.commit();
-      await subscription.waitUntilSynced();
+      await settle(subscription.waitUntilSynced());
       await vi.advanceTimersByTimeAsync(10);
       const url = docUrl(writer.workspaceId, 'doc-a');
       const snapshot = server.room(new URL(url).pathname).snapshot;
@@ -1135,8 +1152,13 @@ describe('P10 public crypto and published SDK preparation', () => {
           )
         )
       ).toBe(fault !== 'signature');
-      // SDK prefix/header remain public; continuationOffset is encrypted.
+      // Provider field stays [4]; the continuation follows the signer inside
+      // the signed/AEAD-bound content frame, not the encrypted plaintext.
       expect([snapshot!.body[10], snapshot!.body[11]]).toEqual([4, 0]);
+      expect(
+        Result.getOrThrow(inspectContentFrame(snapshot!.body.slice(11), 'doc-snapshot'))
+          .continuationOffset
+      ).toBe(snapshot!.offset);
       if (fault === 'position') snapshot!.offset = server.offset(Number(snapshot!.offset) + 1);
       subscription.unsubscribe();
       const readerId = `v0-snapshot-r-${sequence}` as WorkspaceId;
@@ -1163,14 +1185,14 @@ describe('P10 public crypto and published SDK preparation', () => {
           },
         },
       });
-      const result = await transportFor(reader, readerContent, {
+      const result = await settle(transportFor(reader, readerContent, {
         load: (key) => cursor.load(key),
         async save(value) {
           const disk = await openTab(readerId);
           expect((await disk.repo.openPersistedDoc('doc-a')).doc.toJSON()).toEqual(doc.toJSON());
           await cursor.save(value);
         },
-      }).syncDoc('doc-a', restored);
+      }).syncDoc('doc-a', restored));
       expect(result.ok).toBe(fault === 'valid');
       if (fault === 'valid') {
         expect(decompressed).toHaveLength(1);

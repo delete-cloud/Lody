@@ -8,9 +8,13 @@
 export type MachineProtocolCapabilities = Record<string, number>;
 
 export const MACHINE_PROTOCOL_CAPABILITIES = {
+  multiRepoProject: 'multiRepoProject',
+  projectFileRoots: 'projectFileRoots',
+  projectRepositoryMembers: 'projectRepositoryMembers',
   operationInbox: 'operationInbox',
   magpieImport: 'magpieImport',
   dshProviderIsolation: 'dshProviderIsolation',
+  terminalNotifications: 'terminalNotifications',
   memoryProviders: 'memoryProviders',
   mcpToolDiscovery: 'mcpToolDiscovery',
   localProjectHistoryProvider: 'localProjectHistoryProvider',
@@ -26,6 +30,7 @@ export const MACHINE_PROTOCOL_CAPABILITIES = {
   preparedSessionInput: 'preparedSessionInput',
   sessionInputAttachments: 'sessionInputAttachments',
   localFileResources: 'localFileResources',
+  markdownFileLinks: 'markdownFileLinks',
   acpProtocolAuthentication: 'acpProtocolAuthentication',
   previewControl: 'previewControl',
   iosSimulator: 'iosSimulator',
@@ -34,10 +39,15 @@ export const MACHINE_PROTOCOL_CAPABILITIES = {
   piExtensions: 'piExtensions',
   acpCapabilityRefreshCache: 'acpCapabilityRefreshCache',
   providerRateLimitsRefresh: 'providerRateLimitsRefresh',
+  codeCollabAllChangesScope: 'codeCollabAllChangesScope',
   sessionHistory: 'sessionHistory',
+  sessionHistoryIncremental: 'sessionHistoryIncremental',
+  sessionHistoryWatch: 'sessionHistoryWatch',
+  sessionHistoryPatches: 'sessionHistoryPatches',
   sessionInputAcceptance: 'sessionInputAcceptance',
   sessionInputDispatch: 'sessionInputDispatch',
   sessionCollaborationControl: 'sessionCollaborationControl',
+  bugReportClientLog: 'bugReportClientLog',
 } as const;
 
 export const OPERATION_INBOX_PROTOCOL_VERSION = 2;
@@ -62,9 +72,16 @@ export const IOS_SIMULATOR_PROTOCOL_VERSION = 1;
 export const IOS_SIMULATOR_CONTROLS_PROTOCOL_VERSION = 1;
 export const PI_EXTENSIONS_PROTOCOL_VERSION = 1;
 export const ACP_CAPABILITY_REFRESH_CACHE_PROTOCOL_VERSION = 1;
-export const SESSION_HISTORY_PROTOCOL_VERSION = 2;
+export const CODE_COLLAB_ALL_CHANGES_SCOPE_PROTOCOL_VERSION = 1;
+/** Native publication and watch are the history authority; no Loro cursor log. */
+export const SESSION_HISTORY_PROTOCOL_VERSION = 3;
+export const SESSION_HISTORY_INCREMENTAL_PROTOCOL_VERSION = 1;
+export const SESSION_HISTORY_WATCH_PROTOCOL_VERSION = 1;
+export const SESSION_HISTORY_PATCHES_PROTOCOL_VERSION = 1;
 export const SESSION_INPUT_ACCEPTANCE_PROTOCOL_VERSION = 1;
 export const SESSION_INPUT_DISPATCH_PROTOCOL_VERSION = 1;
+/** `machine/bug-report` accepts an optional `clientLog` and merges it into the upload. */
+export const BUG_REPORT_CLIENT_LOG_PROTOCOL_VERSION = 1;
 
 type MachineProtocolCapabilityCarrier = {
   protocolCapabilities?: MachineProtocolCapabilities;
@@ -113,11 +130,20 @@ export function machineSupportsSubagentCancellation(
  * required version must never travel apart, because a mismatch fails silently
  * in the "supported" direction and there is no version fallback to catch it.
  */
+export const MULTI_REPO_PROJECT_PROTOCOL_VERSION = 1;
+export const PROJECT_FILE_ROOTS_PROTOCOL_VERSION = 1;
+export const PROJECT_REPOSITORY_MEMBERS_PROTOCOL_VERSION = 1;
+
 export const CURRENT_MACHINE_PROTOCOL_CAPABILITIES: MachineProtocolCapabilities = {
+  [MACHINE_PROTOCOL_CAPABILITIES.projectRepositoryMembers]:
+    PROJECT_REPOSITORY_MEMBERS_PROTOCOL_VERSION,
+  [MACHINE_PROTOCOL_CAPABILITIES.multiRepoProject]: MULTI_REPO_PROJECT_PROTOCOL_VERSION,
+  [MACHINE_PROTOCOL_CAPABILITIES.projectFileRoots]: PROJECT_FILE_ROOTS_PROTOCOL_VERSION,
   [MACHINE_PROTOCOL_CAPABILITIES.operationInbox]: OPERATION_INBOX_PROTOCOL_VERSION,
   providerRateLimitsRefresh: 1,
   [MACHINE_PROTOCOL_CAPABILITIES.magpieImport]: 1,
   [MACHINE_PROTOCOL_CAPABILITIES.dshProviderIsolation]: 1,
+  [MACHINE_PROTOCOL_CAPABILITIES.terminalNotifications]: 1,
   [MACHINE_PROTOCOL_CAPABILITIES.sessionCollaborationControl]: 1,
   [MACHINE_PROTOCOL_CAPABILITIES.memoryProviders]: MEMORY_PROVIDERS_PROTOCOL_VERSION,
   [MACHINE_PROTOCOL_CAPABILITIES.mcpToolDiscovery]: MCP_TOOL_DISCOVERY_PROTOCOL_VERSION,
@@ -137,6 +163,7 @@ export const CURRENT_MACHINE_PROTOCOL_CAPABILITIES: MachineProtocolCapabilities 
   [MACHINE_PROTOCOL_CAPABILITIES.sessionInputAttachments]:
     SESSION_INPUT_ATTACHMENTS_PROTOCOL_VERSION,
   [MACHINE_PROTOCOL_CAPABILITIES.localFileResources]: LOCAL_FILE_RESOURCES_PROTOCOL_VERSION,
+  [MACHINE_PROTOCOL_CAPABILITIES.markdownFileLinks]: 1,
   [MACHINE_PROTOCOL_CAPABILITIES.acpProtocolAuthentication]: ACP_PROTOCOL_AUTHENTICATION_VERSION,
   [MACHINE_PROTOCOL_CAPABILITIES.previewControl]: PREVIEW_CONTROL_PROTOCOL_VERSION,
   [MACHINE_PROTOCOL_CAPABILITIES.iosSimulator]: IOS_SIMULATOR_PROTOCOL_VERSION,
@@ -144,10 +171,31 @@ export const CURRENT_MACHINE_PROTOCOL_CAPABILITIES: MachineProtocolCapabilities 
   [MACHINE_PROTOCOL_CAPABILITIES.iosSimulatorExterior]: 1,
   [MACHINE_PROTOCOL_CAPABILITIES.acpCapabilityRefreshCache]:
     ACP_CAPABILITY_REFRESH_CACHE_PROTOCOL_VERSION,
+  [MACHINE_PROTOCOL_CAPABILITIES.codeCollabAllChangesScope]:
+    CODE_COLLAB_ALL_CHANGES_SCOPE_PROTOCOL_VERSION,
   [MACHINE_PROTOCOL_CAPABILITIES.sessionHistory]: SESSION_HISTORY_PROTOCOL_VERSION,
+  [MACHINE_PROTOCOL_CAPABILITIES.sessionHistoryPatches]: SESSION_HISTORY_PATCHES_PROTOCOL_VERSION,
+  [MACHINE_PROTOCOL_CAPABILITIES.sessionHistoryIncremental]:
+    SESSION_HISTORY_INCREMENTAL_PROTOCOL_VERSION,
+  [MACHINE_PROTOCOL_CAPABILITIES.sessionHistoryWatch]: SESSION_HISTORY_WATCH_PROTOCOL_VERSION,
   [MACHINE_PROTOCOL_CAPABILITIES.sessionInputAcceptance]: SESSION_INPUT_ACCEPTANCE_PROTOCOL_VERSION,
   [MACHINE_PROTOCOL_CAPABILITIES.sessionInputDispatch]: SESSION_INPUT_DISPATCH_PROTOCOL_VERSION,
+  [MACHINE_PROTOCOL_CAPABILITIES.bugReportClientLog]: BUG_REPORT_CLIENT_LOG_PROTOCOL_VERSION,
 };
+
+/**
+ * Whether `machine/bug-report` may carry `clientLog`. Its request schema is
+ * strict, so an older daemon rejects the whole report when the field is present.
+ */
+export function machineSupportsBugReportClientLog(
+  machine: MachineProtocolCapabilityCarrier | null | undefined
+): boolean {
+  return machineSupportsProtocolCapability(
+    machine,
+    MACHINE_PROTOCOL_CAPABILITIES.bugReportClientLog,
+    BUG_REPORT_CLIENT_LOG_PROTOCOL_VERSION
+  );
+}
 
 export function machineSupportsSessionInputDispatch(
   machine: MachineProtocolCapabilityCarrier | null | undefined
@@ -156,6 +204,18 @@ export function machineSupportsSessionInputDispatch(
     machine,
     MACHINE_PROTOCOL_CAPABILITIES.sessionInputDispatch,
     SESSION_INPUT_DISPATCH_PROTOCOL_VERSION
+  );
+}
+
+export function machineSupportsSessionHistoryWatch(
+  machine: MachineProtocolCapabilityCarrier | null | undefined
+): boolean {
+  return (
+    machineSupportsProtocolCapability(
+      machine,
+      MACHINE_PROTOCOL_CAPABILITIES.sessionHistoryWatch,
+      SESSION_HISTORY_WATCH_PROTOCOL_VERSION
+    ) && machineSupportsSessionHistoryIncremental(machine)
   );
 }
 
@@ -381,5 +441,63 @@ export function machineSupportsIosSimulatorExterior(
     machine,
     MACHINE_PROTOCOL_CAPABILITIES.iosSimulatorExterior,
     1
+  );
+}
+
+export function machineSupportsMultiRepoProject(
+  machine: MachineProtocolCapabilityCarrier | null | undefined
+): boolean {
+  return machineSupportsProtocolCapability(
+    machine,
+    MACHINE_PROTOCOL_CAPABILITIES.multiRepoProject,
+    MULTI_REPO_PROJECT_PROTOCOL_VERSION
+  );
+}
+
+/** Non-Git Project group members and root-aware file RPCs require this capability. */
+export function machineSupportsProjectFileRoots(
+  machine: MachineProtocolCapabilityCarrier | null | undefined
+): boolean {
+  return machineSupportsProtocolCapability(
+    machine,
+    MACHINE_PROTOCOL_CAPABILITIES.projectFileRoots,
+    PROJECT_FILE_ROOTS_PROTOCOL_VERSION
+  );
+}
+
+/**
+ * Project group repository Members (`preferLocal`): the daemon uses its own
+ * copy of the repository when it has one. Older daemons would clone instead.
+ */
+export function machineSupportsProjectRepositoryMembers(
+  machine: MachineProtocolCapabilityCarrier | null | undefined
+): boolean {
+  return machineSupportsProtocolCapability(
+    machine,
+    MACHINE_PROTOCOL_CAPABILITIES.projectRepositoryMembers,
+    PROJECT_REPOSITORY_MEMBERS_PROTOCOL_VERSION
+  );
+}
+
+export function machineSupportsSessionHistoryIncremental(
+  machine: MachineProtocolCapabilityCarrier | null | undefined
+): boolean {
+  return machineSupportsProtocolCapability(
+    machine,
+    MACHINE_PROTOCOL_CAPABILITIES.sessionHistoryIncremental,
+    SESSION_HISTORY_INCREMENTAL_PROTOCOL_VERSION
+  );
+}
+
+export function machineSupportsSessionHistoryPatches(
+  machine: MachineProtocolCapabilityCarrier | null | undefined
+): boolean {
+  return (
+    machineSupportsSessionHistoryIncremental(machine) &&
+    machineSupportsProtocolCapability(
+      machine,
+      MACHINE_PROTOCOL_CAPABILITIES.sessionHistoryPatches,
+      SESSION_HISTORY_PATCHES_PROTOCOL_VERSION
+    )
   );
 }

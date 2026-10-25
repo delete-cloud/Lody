@@ -491,6 +491,14 @@ export class AuthService {
   // out by themselves.
   private lastResolvedSessionResponse: unknown = null
 
+  /** Main-process identity only; never starts an authentication request. */
+  getCachedSessionIdentity(): { userId: string | null; generation: number } {
+    return {
+      userId: readSessionFromResponse(this.lastResolvedSessionResponse).userId,
+      generation: this.authGeneration
+    }
+  }
+
   private rememberSessionToken(token: string | null | undefined): void {
     if (typeof token === 'string' && token.length > 0) {
       this.lastKnownSessionToken = token
@@ -680,14 +688,29 @@ export class AuthService {
         }
         return resolved
       }
+      // The supplied bearer may be stale while the durable cookie is still
+      // valid. A failed cookie check must retain its own result: returning the
+      // first 401 would turn a 5xx/network outage into confirmed sign-out.
+      // Conversely, rejection of the cookie cannot settle a transient failure
+      // of the supplied bearer. Both credentials must be definitively rejected.
+      const unresolvedResponse = isDefinitiveUnauthenticatedResponse(response)
+        ? fallbackResponse
+        : response
+      if (
+        generation === this.authGeneration &&
+        isDefinitiveUnauthenticatedResponse(unresolvedResponse)
+      ) {
+        this.lastResolvedSessionResponse = null
+      }
+      return unresolvedResponse
     } catch (error) {
       console.warn('[Auth] Failed to resolve session through cookie bearer fallback', error)
+      const cached = this.lastResolvedSessionResponse
+      if (generation === this.authGeneration && cached !== null) {
+        return cached
+      }
+      throw error
     }
-
-    if (generation === this.authGeneration && isDefinitiveUnauthenticatedResponse(response)) {
-      this.lastResolvedSessionResponse = null
-    }
-    return response
   }
 
   async listOrganizations(options?: unknown) {

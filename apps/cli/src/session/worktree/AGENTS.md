@@ -26,8 +26,8 @@ and file responsibilities: [../README.md](../README.md).
 
 ## Git credential broker
 
-- Local projects and their worktrees use native Git/GitHub auth, even with GitHub
-  remotes. Skip managed credential preparation and never enroll them on refresh.
+- Local projects/worktrees and locally resolved Members use native Git/GitHub
+  auth. Never enroll them on refresh; pin `repositoryCheckout` through archive/restore.
 
 - Host clone/fetch must receive the prepared session's managed Git PATH/GIT_EXEC_PATH/config in
   `brokerAuth.transportEnv`, not just a helper: HTTP headers authenticate before
@@ -59,7 +59,7 @@ and file responsibilities: [../README.md](../README.md).
 ## Worktrees, branches, and setup
 
 - First-task branch naming is agent guidance for ordinary new independent GitHub/local
-  worktree Sessions, including prepared-worktree adoption. The daemon verifies the actual branch
+  worktree Sessions. The daemon verifies the actual branch
   after setup against this Session's allocation (numeric collisions included); unknown or
   descriptive refs receive no rename instruction. Exclude direct folders, child Tabs,
   prior/resumed ACP Sessions, later turns, and Fork; never restore a host prompt-to-ref
@@ -79,8 +79,8 @@ and file responsibilities: [../README.md](../README.md).
   refresh them via `syncWorkspaceGitState`: the one in `finalizeTurn` (Stop raced finalization)
   and `finalizeCancelledTurn` (Stop during the prompt — the common one). That helper owns
   the GitHub-capability gate itself because those callers carry no `ProjectRef`; do not
-  re-test it per call site. The flags are NOT written for a session with no GitHub
-  repository — nothing can act on them there.
+  re-test it per call site. Single-project flags need a GitHub
+  repository; Project groups publish the OR across members.
 - Resume a Session on a local project with the workspace's current branch as-is, worktree mode
   included: a persisted `acpSessionId` proves prior execution, so the stored `project.branch` is
   historical state, not a checkout request. A legacy direct local Session may re-enter
@@ -94,15 +94,12 @@ and file responsibilities: [../README.md](../README.md).
 - Worktree setup scripts are per worktree-directory lifetime: session runtime restore after
   idle GC must skip setup when the session's worktree directory already exists, but setup still
   runs when a missing worktree directory is materialized again.
-- INVARIANT: speculative-worktree marker mutations are read-check-act on one file and are
-  serialized per session (`withSessionMarkerLock` in `speculative-worktree.ts`) — a superseded
-  preparation's dispose racing its replacement's materialization must never delete the
-  replacement's directory.
-- A prepared worktree may be adopted only when the durable claim did not return `mismatch` AND
-  its directory still exists on disk; otherwise discard the prepared runtime (its ACP process
-  cwd points at a dead inode) and let the cold path rebuild via `createWorktree`. A `mismatch`
-  claim deletes the mismatched directory, so adoption after it hands the session a path that is
-  not on disk.
+- Nothing writes speculative-worktree markers any more; `legacy-speculative-worktrees.ts`
+  handles those older daemons left. Creation claims its marker before probing the directory
+  and reruns setup before dropping it. NEVER destroy a worktree a Session adopted
+  (`durable-pending-setup`, or a `restoreBranchName`) over a target mismatch: removal deletes
+  the branch resume restores. Only unadopted mismatches rebuild. The sweep removes orphans of
+  non-durable, inactive Sessions under the shared per-session lock, re-checking liveness.
 - `worktree-config-resolver.ts` follows the durable launch-config rule in
   [../AGENTS.md](../AGENTS.md): do not write per-session `sessionLaunchConfig`.
 - Archive and delete never delete a Session branch; only the worktree directory goes
@@ -110,3 +107,5 @@ and file responsibilities: [../README.md](../README.md).
   reconciled from Session state by `worktree-gc.ts` (no command, no acknowledgement);
   it acts only on `archived` or `deleted` owners, never on `unknown`, and only once
   workspace metadata is complete. Contract: specs/session-worktree-lifecycle.md.
+
+- Project roots use registrations. Repair links; archive unlinks without following targets.

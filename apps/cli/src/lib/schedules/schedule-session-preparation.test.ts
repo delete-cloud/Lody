@@ -1,3 +1,5 @@
+import { projectTurnAttention } from '@lody/shared/notifications';
+import { turnNotificationAudience } from '../notifications/turn-notification-audience';
 import { describe, expect, it } from 'vitest';
 import {
   ScheduleAgentSchema,
@@ -47,6 +49,7 @@ const manager = {
   repo: {
     getDocMeta: async () => undefined,
     getWorkspaceMeta: async () => undefined,
+    openFlockDoc: async () => ({ flock: { scan: () => [] } }),
   },
   syncMetaOrThrow: async () => {},
 } as unknown as LoroDocumentManager;
@@ -81,6 +84,7 @@ describe('Session preparation for a scheduled run', () => {
       expect(prepared.meta).not.toHaveProperty(field);
     expect(prepared.meta.machineId).toBe('machine');
     expect(prepared.meta.agentConfigId).toBe('agent');
+    expect(prepared.userTurn.inputConfig?.mcpServerIds).toEqual([]);
   });
 
   it('carries the identifiers the engine froze, so a retry reuses one Session', async () => {
@@ -90,6 +94,24 @@ describe('Session preparation for a scheduled run', () => {
     expect(prepared.userTurn.id).toBe('turn-1');
     // Host-owned automation always uses the inert prepared protocol.
     expect(prepared.userTurn.status).toBe('prepared');
+  });
+
+  it('treats a prepared scheduled turn as an ordinary user notification source', async () => {
+    const prepared = await prepare();
+    expect(prepared.userTurn.role).toBe('user');
+    const audience = turnNotificationAudience(prepared.userTurn.author);
+    expect(audience).toEqual({ kind: 'user' });
+    for (const outcome of [{ kind: 'succeeded' }, { kind: 'failed', code: 'synthetic' }] as const) {
+      const item = projectTurnAttention({
+        scope: { workspaceId: 'workspace' as WorkspaceId, recipientId: prepared.meta.userId },
+        sessionId: prepared.sessionId,
+        turnId: prepared.userTurn.id,
+        audience,
+        outcome,
+      });
+      expect(item?.source.turnId).toBe(prepared.userTurn.id);
+      expect(item?.outcome).toBe(outcome.kind);
+    }
   });
 
   it('keeps an explicit title as final, so no generated title replaces it', async () => {

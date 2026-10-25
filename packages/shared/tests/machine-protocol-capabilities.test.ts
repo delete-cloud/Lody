@@ -14,11 +14,85 @@ import {
   negotiatedAcpCapabilitiesRefreshForce,
   resolveNewSessionHistoryBackend,
   machineSupportsSessionInputDispatch,
+  machineSupportsSessionHistoryIncremental,
+  machineSupportsSessionHistoryWatch,
+  machineSupportsSessionHistoryPatches,
 } from '../src/machine-protocol-capabilities';
 import {
   MachineAcpCapabilitiesRefreshRequestSchema,
   safeParseLocalSessionControlRequest,
 } from '../src/message-schemas';
+
+it('negotiates content patches independently and keeps old history requests valid', () => {
+  for (const machine of [
+    undefined,
+    { protocolCapabilities: { sessionHistoryIncremental: 1 } },
+    { protocolCapabilities: { sessionHistoryPatches: 1 } },
+  ])
+    expect(machineSupportsSessionHistoryPatches(machine)).toBe(false);
+  expect(
+    machineSupportsSessionHistoryPatches({
+      protocolCapabilities: CURRENT_MACHINE_PROTOCOL_CAPABILITIES,
+    })
+  ).toBe(true);
+  const request = {
+    type: 'session/history-read',
+    machineId: 'synthetic-machine',
+    workspaceId: 'synthetic-workspace',
+    sessionId: 'synthetic-session',
+    query: { kind: 'readChanges', checkpoint: 'synthetic-checkpoint' },
+  };
+  for (const query of [
+    request.query,
+    { ...request.query, withPatches: true },
+    { ...request.query, kind: 'watchChanges', waitMs: 15_000, withPatches: true },
+  ])
+    expect(safeParseLocalSessionControlRequest(JSON.stringify({ ...request, query })).success).toBe(
+      true
+    );
+  expect(
+    safeParseLocalSessionControlRequest(
+      JSON.stringify({
+        ...request,
+        query: { ...request.query, withPatches: false },
+      })
+    ).success
+  ).toBe(false);
+});
+
+it('requires independent checkpoint observation and validates its bounded wait', () => {
+  expect(machineSupportsSessionHistoryWatch(undefined)).toBe(false);
+  expect(
+    machineSupportsSessionHistoryWatch({ protocolCapabilities: { sessionHistoryIncremental: 1 } })
+  ).toBe(false);
+  expect(
+    machineSupportsSessionHistoryWatch({ protocolCapabilities: { sessionHistoryWatch: 1 } })
+  ).toBe(false);
+  expect(
+    machineSupportsSessionHistoryWatch({
+      protocolCapabilities: CURRENT_MACHINE_PROTOCOL_CAPABILITIES,
+    })
+  ).toBe(true);
+  const request = {
+    type: 'session/history-read',
+    machineId: 'synthetic-machine',
+    workspaceId: 'synthetic-workspace',
+    sessionId: 'synthetic-session',
+    query: {
+      kind: 'watchChanges',
+      checkpoint: 'synthetic-checkpoint',
+      waitMs: 15_000,
+      includeBodiesFrom: 0,
+    },
+  };
+  expect(safeParseLocalSessionControlRequest(JSON.stringify(request)).success).toBe(true);
+  for (const waitMs of [-1, 15_001, 1.5])
+    expect(
+      safeParseLocalSessionControlRequest(
+        JSON.stringify({ ...request, query: { ...request.query, waitMs } })
+      ).success
+    ).toBe(false);
+});
 
 it('requires independently negotiated owner input dispatch, including mixed daemon versions', () => {
   expect(machineSupportsSessionInputDispatch(undefined)).toBe(false);
@@ -196,6 +270,23 @@ it('negotiates private simulator controls independently of preview support', () 
   );
   expect(
     machineSupportsIosSimulatorControls({
+      protocolCapabilities: CURRENT_MACHINE_PROTOCOL_CAPABILITIES,
+    })
+  ).toBe(true);
+});
+
+it('negotiates incremental history recovery independently of legacy paging', () => {
+  expect(machineSupportsSessionHistoryIncremental(undefined)).toBe(false);
+  expect(
+    machineSupportsSessionHistoryIncremental({ protocolCapabilities: { sessionHistory: 2 } })
+  ).toBe(false);
+  expect(
+    machineSupportsSessionHistoryIncremental({
+      protocolCapabilities: { sessionHistoryIncremental: 0 },
+    })
+  ).toBe(false);
+  expect(
+    machineSupportsSessionHistoryIncremental({
       protocolCapabilities: CURRENT_MACHINE_PROTOCOL_CAPABILITIES,
     })
   ).toBe(true);

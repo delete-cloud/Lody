@@ -72,22 +72,24 @@ export const deriveLocationsFromRawInput = (rawInput: unknown): ToolCallLocation
   return Array.from(unique).map((path) => ({ path }));
 };
 
+/** An image block, or a blob resource identified as an image by MIME type or data URI. */
+const isToolImagePayload = (value: unknown): boolean => {
+  if (!value || typeof value !== 'object') return false;
+  const { type, resource } = value as { type?: unknown; resource?: unknown };
+  if (type === 'image') return true;
+  if (type !== 'resource' || !resource || typeof resource !== 'object') return false;
+  if (!('blob' in resource)) return false;
+  const { mimeType, uri } = resource as { mimeType?: unknown; uri?: unknown };
+  return (
+    (typeof mimeType === 'string' && mimeType.trim().toLowerCase().startsWith('image/')) ||
+    (typeof uri === 'string' && uri.trim().toLowerCase().startsWith('data:image/'))
+  );
+};
+
 /** Tool images are execution output, not durable conversation attachments. */
 export const stripToolCallPayloadsForHistory = (content: ToolCallContent): ToolCallContent =>
   content
-    .filter((block) => {
-      if (block.type !== 'content') return true;
-      if (block.content.type === 'image') return false;
-      if (block.content.type !== 'resource') return true;
-      const resource = block.content.resource;
-      if (!('blob' in resource)) return true;
-      return !(
-        (typeof resource.mimeType === 'string' &&
-          resource.mimeType.trim().toLowerCase().startsWith('image/')) ||
-        (typeof resource.uri === 'string' &&
-          resource.uri.trim().toLowerCase().startsWith('data:image/'))
-      );
-    })
+    .filter((block) => block.type !== 'content' || !isToolImagePayload(block.content))
     .map((block) => {
       if (block.type !== 'content') return block;
       const value = block.content;

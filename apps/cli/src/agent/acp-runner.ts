@@ -32,7 +32,6 @@ import {
   type ImageGenerationEndEvent,
   type AcpStartupStageEvent,
   type AcpStartupTimeoutOptions,
-  type AcpSessionStartTarget,
 } from './agent-client';
 import { getLoginShellEnvLegacy } from './login-shell-env';
 import {
@@ -82,6 +81,7 @@ import { withAcpSessionStartSlot } from './acp-session-start-gate';
 
 export type CreateAcpClientOptions = {
   resolveWorktreeProject?: AgentClientOptions['resolveWorktreeProject'];
+  resolveAdditionalDirectories?: AgentClientOptions['resolveAdditionalDirectories'];
   stream: Stream;
   workdir: string;
   logger: Logger;
@@ -125,7 +125,6 @@ export type CreateAcpClientOptions = {
   sessionId?: SessionId;
   startupTimeouts?: AcpStartupTimeoutOptions;
   startupAbort?: Promise<never>;
-  resolveSessionStart?: () => Promise<AcpSessionStartTarget>;
 };
 
 export const createAcpClient = async (options: CreateAcpClientOptions) => {
@@ -141,6 +140,7 @@ export const createAcpClient = async (options: CreateAcpClientOptions) => {
     modelId: options.modelId,
     configOptionValues: options.configOptionValues,
     resolveWorktreeProject: options.resolveWorktreeProject,
+    resolveAdditionalDirectories: options.resolveAdditionalDirectories,
     launcher: options.launcher,
     terminalEnabled: options.terminalEnabled,
     onStartupStage: options.onStartupStage,
@@ -165,7 +165,6 @@ export const createAcpClient = async (options: CreateAcpClientOptions) => {
     options.resumeSessionId,
     options.startupTimeouts,
     options.startupAbort,
-    options.resolveSessionStart,
     options.forkSessionId,
     options.forkSessionTurnId
   );

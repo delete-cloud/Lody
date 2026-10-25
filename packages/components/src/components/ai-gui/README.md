@@ -3,9 +3,15 @@
 Conversation rendering for a Session: the message stream, assistant turn folding,
 the outline rail, and the markdown/terminal/file content surfaces.
 
-Builtin DeepSeek Harness keeps thought prose in expandable activity groups, including
-a default-open Thought disclosure for groups without tools; explicit collapse is retained. Provider visibility is part of the
-virtual-row cache identity; other providers retain their existing filtering.
+Builtin DeepSeek Harness separates thought disclosures from tool groups. Thoughts
+start open, tools closed, and explicit toggles remain respected. DSH thought prose
+uses the same Markdown typography and reading color as ordinary answers; tool
+labels and details retain their compact process styling. While streaming,
+intermediate prose stays visible in order. Once a final answer is complete, the shared finished-work disclosure collapses earlier prose and tools;
+expanding it restores their order and independent disclosure states. Interrupted
+turns without an answer remain visible. Duration follows the shared header/footer
+policy. Both layout and virtual-row caches include provider visibility. Other providers retain their grouping and filtering. This is
+presentation only: stored thought/text types and provider delivery remain unchanged.
 
 Binding rules live in [AGENTS.md](AGENTS.md); this file is the directory index and
 the reasoning behind those rules.
@@ -26,7 +32,12 @@ the reasoning behind those rules.
   work) and a hover preview; `conversation-outline-arrival-intent.ts` decides when
   a pointer heading for a tick counts as arrival.
 - `markdown-renderer.tsx` renders finished text with react-markdown and a
-  streaming turn with `@lobehub/streamdown`. Its dependency patch reveals text
+  streaming turn with `@lobehub/streamdown`. Finished static text uses
+  `lib/markdown-parse-cache.ts` to reuse only the raw syntax tree across remounts.
+  Each parser configuration retains at most 64 entries, 1,048,576 source characters
+  and 8,192 AST nodes; an input above 131,072 characters is not retained. Each
+  consumer gets a fresh tree, so transformations, sanitization, URL policy and
+  context-dependent components still run. Streaming prefixes bypass the cache. Its dependency patch reveals text
   already present at mount so switching back to a live Session does not replay
   the stream fade ([note](../../../../../.agents/notes/implemented/bug-fix/2026-09-26-streamdown-remount-animation.md)).
   A nonempty session search renders the complete current Markdown without the
@@ -49,8 +60,11 @@ the reasoning behind those rules.
   incomplete copy events before the extension can write clipboard data; see the
   [integration note](../../../../../.agents/notes/implemented/feature/2026-10-16-math-selection-copy.md).
   `markdown-code-block.tsx` owns fenced
-  blocks, wrap, and Markdown-fence preview (`markdown-code-highlight.ts` the Shiki
-  tokens); `markdown-diff-block.tsx` is the inline diff; `markdown-mermaid-block.tsx`
+  blocks, wrap, and Markdown-fence preview (`markdown-code-highlight.ts` the Highlights
+  tokens). Unsupported optional languages use an isolated Shiki fallback;
+  its native grammar registry owns loaded-language state, while Lody shares
+  fallback initialization and clears failed initialization for retry.
+  `markdown-diff-block.tsx` is the inline diff; `markdown-mermaid-block.tsx`
   renders a closed Mermaid fence. Diagrams are split three ways: `use-mermaid-diagram-canvas.tsx`
   owns activation and the gestures that follow it, `mermaid-inline-canvas.ts` the
   pure zoom/pan geometry, and `mermaid-diagram-viewer.tsx` the full-screen
@@ -66,6 +80,13 @@ the reasoning behind those rules.
   shared `session-link-export`, preserving code examples and stored history.
   Only a known source workspace supplies a missing ID; anonymous readers do not
   borrow the viewer's workspace.
+- `plan-surface.ts` resolves plan approval text from nonempty `rawInput.plan` first,
+  then the first nonempty content text block. Claude result updates can replace
+  content with a rejection message while retaining the original plan input.
+  This also restores historical rejected cards without rewriting session data.
+  Content-only adapters retain their fallback; a separate `proposed_plan` row
+  still suppresses the card's duplicate. See the
+  [rejected-plan fix](../../../../../.agents/notes/implemented/bug-fix/2026-10-22-claude-rejected-plan-display.md).
 - `message-content-guards.ts` gates which shared `MessageContent` variants render.
 - `assistant-turn-timing.ts` builds the turn popover's timing rows (Started,
   Ended, Duration, and Last update for a running turn) and the live status
@@ -304,6 +325,14 @@ scroll and a sideways swipe dragged the session away. So inside a
 `[data-vaul-drawer]` the dialog mounts in the drawer, `data-vaul-no-drag`,
 with a no-drag layer over its backdrop (`InMobileDrawer` story).
 
+The Loro conversation view carries display-only task metadata and a bounded latest
+step, not every child transcript. The task's non-enumerable `history` capability
+reads one exact owned run only after its detail mounts. Activity shows loading or
+retry until that read completes; a preview must never masquerade as the full run.
+Changing the selected task or closing the dialog discards late results and releases
+the full body. Static shares and other readers without this capability keep their
+already complete task data. Export/copy/replay use authoritative full readers.
+
 ## Creation progress
 
 `created-session-operation-card.tsx` owns each navigable child card and its title
@@ -358,3 +387,9 @@ Render `operation_completion_batch` as one result group with total count and del
 uncertainty. Its bounded member preview reuses existing completion/creation cards and
 `progressMessageId` deduplication. Rendering is passive: it never resumes a session or
 reads every omitted result. The `CompletedWorkBatch` story covers the uncertain state.
+
+Hide success receipts with no remaining concrete cards, including creation results
+already represented by progress. Hide their entire batch row when every member is
+present and hidden. Preserve concrete session cards, failure/cancellation details,
+unknown delivery and headers for omitted preview members. This is presentation-only;
+history and model delivery retain the original results.

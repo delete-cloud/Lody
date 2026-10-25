@@ -23,6 +23,7 @@
     "format:check": "oxfmt --check 'src/**/*.ts'",
     "typecheck": "tsgo --noEmit -p tsconfig.typecheck.json",
     "test": "vitest run",
+    "test:roost-recovery:perf": "LODY_ROOST_RECOVERY_PERF=1 vitest run tests/roost-session-backend-contract.test.ts -t 'Roost cache recovery'",
     "bench:acp-history": "vitest bench tests/acp-history.bench.ts",
     "bench:turn-diff-store": "pnpm --filter @lody/turn-diff-store bench",
     "test:e2e": "LODY_E2E=1 vitest run",
@@ -39,7 +40,7 @@
   "author": "Leon Zhao",
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=22.14.0 <23 || >=23.6.0"
+    "node": ">=22.23.4 <23 || >=24.22.1 <25 || >=26.12.1 <27"
   },
   "devDependencies": {
     "@agentclientprotocol/sdk": "catalog:",
@@ -49,13 +50,14 @@
     "@effect/vitest": "catalog:",
     "@lody/cli-supervisor": "workspace:*",
     "@lody/cloud-api": "workspace:*",
+    "@lody/e2ee-core": "workspace:*",
     "@lody/code-review-helper": "workspace:*",
     "@lody/loro-streams-rpc": "workspace:*",
     "@lody/platform": "workspace:*",
     "@lody/shared": "workspace:*",
     "@lody/turn-diff-store": "workspace:*",
     "@loro-dev/flock-wasm": "catalog:",
-    "@loro-dev/roost": "0.1.3",
+    "@loro-dev/roost": "catalog:",
     "@loro-dev/streams-crdt": "catalog:",
     "@loro-dev/streams-client": "catalog:",
     "@modelcontextprotocol/client": "2.0.0",
@@ -128,11 +130,11 @@
   ],
   "dependencies": {
     "@effect/platform-node-shared": "catalog:",
-    "@loro-dev/roost-node": "0.1.2",
+    "@loro-dev/roost-node": "0.3.0",
     "@lydell/node-pty": "1.2.0-beta.14",
     "@napi-rs/keyring": "2.1.0",
     "better-sqlite3": "catalog:",
-    "loro-crdt": "1.16.3",
+    "loro-crdt": "1.17.0",
     "tinypool": "^1.0.0",
     "typescript": "^5.9.3"
   }

@@ -269,7 +269,11 @@ export type SessionActions = {
   markSessionUnread: (sessionId: SessionId) => Promise<void>;
   /** Delete exactly the supplied Sessions without discovering related Sessions. */
   deleteSessions: (sessionIds: SessionId[]) => Promise<void>;
-  archiveSession: (sessionId: SessionId) => Promise<void>;
+  /** Archives contained Tabs; opened Sessions only with `includeOpenedSessions`. */
+  archiveSession: (
+    sessionId: SessionId,
+    options?: { includeOpenedSessions?: boolean }
+  ) => Promise<void>;
   setTreeCollaborationStopped: (sessionId: SessionId, stopped: boolean) => Promise<void>;
   setSessionTabClosed: (sessionId: SessionId, closed: boolean) => Promise<void>;
   restoreSession: (sessionId: SessionId) => Promise<void>;
@@ -804,20 +808,22 @@ export function useSessionActions(): SessionActions {
   );
 
   const archiveSession = useCallback(
-    async (sessionId: SessionId) => {
-      log('[session-archive] start', { sessionId });
+    async (sessionId: SessionId, options?: { includeOpenedSessions?: boolean }) => {
+      const includeOpenedSessions = options?.includeOpenedSessions === true;
+      log('[session-archive] start', { sessionId, includeOpenedSessions });
       if (!runtime) {
         throw new Error('Runtime not ready');
       }
-      // A conversation whose creation is still held exists only in memory:
-      // archiving it cancels that send (and its pending children) and ends here.
       const unwritten = runtime.pendingSends?.hasPendingCreation(sessionId) ?? false;
       await runtime.pendingSends?.cancelSessions([sessionId]);
       if (unwritten && !(await runtime.repo.getDocMeta(getSessionRoomId(sessionId)))?.meta?.id) {
         log('[session-archive] canceled unwritten conversation', { sessionId });
         return;
       }
-      const archiveTargets = await runtime.readSessionOperationTargets(sessionId, 'archive');
+      const archiveTargets = await runtime.readSessionOperationTargets(
+        sessionId,
+        includeOpenedSessions ? 'archive-tree' : 'archive'
+      );
       if (store.get(activeWorkspaceRuntimeAtom) !== runtime) {
         throw new Error('Workspace changed before archiving');
       }

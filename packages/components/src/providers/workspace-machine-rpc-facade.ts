@@ -1,8 +1,14 @@
 import {
+  FilePreviewV3ResponseSchema,
+  MAIN_SESSION_FILE_ROOT_ID,
   MemoryProviderResponseSchema,
+  ProjectProbeLocalMemberResultSchema,
+  machineSupportsBugReportClientLog,
   machineSupportsMemoryProviders,
+  type BugReportClientLog,
   type MemoryProviderRequest,
   type MemoryProviderResponse,
+  type ProjectProbeLocalMemberResult,
 } from '@lody/shared';
 import { createRpcSecretRecipient } from '@lody/loro-streams-rpc';
 import type { PreviewControlOperation } from '@lody/shared';
@@ -64,10 +70,6 @@ import {
   type SessionCancelResponse,
   type SessionDispatchTurnResponse,
   type SessionId,
-  type SessionPreparationCancelSpec,
-  type SessionPreparationSpec,
-  type SessionPrepareCancelResponse,
-  type SessionPrepareResponse,
   type SessionPreviewCreateResponse,
   type SessionPreviewEndpointAcquireResponse,
   type SessionPreviewEndpointReleaseResponse,
@@ -270,6 +272,17 @@ export function createWorkspaceMachineRpcFacade(deps: WorkspaceMachineRpcFacadeD
    * so a transport failure surfaces as a typed `FilePreviewV3Error` instead of a
    * Code Collab error the preview UI would have to translate.
    */
+  const supportsMarkdownLinks = async (machineId: MachineId) =>
+    machineSupportsProtocolCapability(
+      { protocolCapabilities: await deps.getMachineProtocolCapabilities(machineId) },
+      MACHINE_PROTOCOL_CAPABILITIES.markdownFileLinks
+    );
+  const unsupportedMarkdownLinks = () =>
+    filePreviewV3Error('unsupported_protocol', {
+      message: 'The agent machine does not support Markdown link resolution.',
+      retryable: false,
+    });
+
   const requestFilePreview = async (
     machineId: MachineId,
     request: Omit<FilePreviewV3Request, 'v'>,
@@ -279,13 +292,36 @@ export function createWorkspaceMachineRpcFacade(deps: WorkspaceMachineRpcFacadeD
       v: FILE_PREVIEW_PROTOCOL_VERSION,
       sessionId: request.sessionId,
       path: request.path,
+      ...(request.rootId === undefined ? {} : { rootId: request.rootId }),
+      ...(request.resolveMarkdownLink ? { resolveMarkdownLink: true as const } : {}),
       ...(request.knownDigest === undefined ? {} : { knownDigest: request.knownDigest }),
       ...(request.maxBytes === undefined ? {} : { maxBytes: request.maxBytes }),
     };
+    // A member root's path is relative to a directory only the machine knows;
+    // the Electron fast path resolves against the main workspace root and would
+    // read a different file. Such requests always go to the machine.
+    const memberRoot = request.rootId !== undefined && request.rootId !== MAIN_SESSION_FILE_ROOT_ID;
     try {
       const result = await (async () => {
         const isElectron = typeof window !== 'undefined' && window.__LODY_ELECTRON__;
-        if (isElectron) {
+        // A member root on this machine: ask the local daemon, which resolves the
+        // root from its registry and authorizes the real path. No remote channel
+        // is needed, so this also works in local-only mode.
+        if (memberRoot && (await canUseLocalMachineRpc(machineId))) {
+          const local = await sendLocalMachineRpcRequest({
+            machineId,
+            workspaceId,
+            method: 'file/preview',
+            params,
+            ...(options?.ownerSessionId === undefined
+              ? {}
+              : { ownerSessionId: options.ownerSessionId }),
+            timeoutMs: options?.timeoutMs ?? 30_000,
+          });
+          const parsed = FilePreviewV3ResponseSchema.safeParse(local);
+          return parsed.success ? parsed.data : null;
+        }
+        if (isElectron && !memberRoot) {
           const ipc = getIpcServices();
           if (!ipc) throw new Error('Local file preview is not available.');
           // Main checks persistent machine identity before touching the path. This
@@ -294,6 +330,7 @@ export function createWorkspaceMachineRpcFacade(deps: WorkspaceMachineRpcFacadeD
             machineId,
             path: request.path,
             workspaceRoot: options?.workspaceRoot ?? null,
+            ...(request.resolveMarkdownLink ? { resolveMarkdownLink: true as const } : {}),
           });
           if (local !== null) return local;
           const plane = await resolveMachineTargetPlane(machineId);
@@ -303,6 +340,8 @@ export function createWorkspaceMachineRpcFacade(deps: WorkspaceMachineRpcFacadeD
               path: request.path,
             });
           }
+          if (request.resolveMarkdownLink && !(await supportsMarkdownLinks(machineId)))
+            return unsupportedMarkdownLinks();
           const client = await getMachineRpcClient(machineId);
           return await client.requestFilePreview({
             ...params,
@@ -310,6 +349,8 @@ export function createWorkspaceMachineRpcFacade(deps: WorkspaceMachineRpcFacadeD
             timeoutMs: options?.timeoutMs ?? 30_000,
           });
         }
+        if (request.resolveMarkdownLink && !(await supportsMarkdownLinks(machineId)))
+          return unsupportedMarkdownLinks();
         const client = await getMachineRpcClient(machineId);
         return await client.requestFilePreview({
           ...params,
@@ -718,94 +759,6 @@ export function createWorkspaceMachineRpcFacade(deps: WorkspaceMachineRpcFacadeD
         sessionId: args.sessionId,
         userTurnId: args.userTurnId,
         accepted: false,
-        disposition: 'error',
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  };
-
-  const requestSessionPrepare = async (
-    machineId: MachineId,
-    spec: SessionPreparationSpec,
-    options?: { timeoutMs?: number }
-  ): Promise<SessionPrepareResponse | null> => {
-    try {
-      if (await canUseLocalMachineRpc(machineId)) {
-        const response = await getLocalMachineRpcSender()?.({
-          machineId,
-          workspaceId,
-          method: 'session/prepare',
-          params: spec,
-          timeoutMs: options?.timeoutMs ?? 5_000,
-        });
-        if (response && !response.ok) {
-          return {
-            type: 'session/prepare_response',
-            preparationId: spec.preparationId,
-            sessionId: spec.sessionId,
-            accepted: false,
-            disposition: 'error',
-            error: response.error,
-          };
-        }
-        if (response?.ok) return response.result as SessionPrepareResponse;
-      }
-      return await (
-        await getMachineRpcClient(machineId)
-      ).requestSessionPrepare({
-        ...spec,
-        timeoutMs: options?.timeoutMs ?? 5_000,
-      });
-    } catch (error) {
-      return {
-        type: 'session/prepare_response',
-        preparationId: spec.preparationId,
-        sessionId: spec.sessionId,
-        accepted: false,
-        disposition: 'error',
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  };
-
-  const requestSessionPrepareCancel = async (
-    machineId: MachineId,
-    args: SessionPreparationCancelSpec,
-    options?: { timeoutMs?: number }
-  ): Promise<SessionPrepareCancelResponse | null> => {
-    try {
-      if (await canUseLocalMachineRpc(machineId)) {
-        const response = await getLocalMachineRpcSender()?.({
-          machineId,
-          workspaceId,
-          method: 'session/prepare-cancel',
-          params: args,
-          timeoutMs: options?.timeoutMs ?? 5_000,
-        });
-        if (response && !response.ok) {
-          return {
-            type: 'session/prepare-cancel_response',
-            preparationId: args.preparationId,
-            sessionId: args.sessionId,
-            cancelled: false,
-            disposition: 'error',
-            error: response.error,
-          };
-        }
-        if (response?.ok) return response.result as SessionPrepareCancelResponse;
-      }
-      return await (
-        await getMachineRpcClient(machineId)
-      ).requestSessionPrepareCancel({
-        ...args,
-        timeoutMs: options?.timeoutMs ?? 5_000,
-      });
-    } catch (error) {
-      return {
-        type: 'session/prepare-cancel_response',
-        preparationId: args.preparationId,
-        sessionId: args.sessionId,
-        cancelled: false,
         disposition: 'error',
         error: error instanceof Error ? error.message : String(error),
       };
@@ -1386,6 +1339,42 @@ export function createWorkspaceMachineRpcFacade(deps: WorkspaceMachineRpcFacadeD
     }
   };
 
+  /**
+   * Read-only `.gitmodules` probe of a registered local project, used by the
+   * Project group editor. The local plane answers through Local Machine RPC; a
+   * remote machine through Streams. `null` is "no answer", never "no submodules".
+   */
+  const requestProjectProbeLocalMember = async (
+    machineId: MachineId,
+    localProjectId: LocalProjectId,
+    requestedByUserId: string,
+    options?: { timeoutMs?: number }
+  ): Promise<ProjectProbeLocalMemberResult | null> => {
+    try {
+      if (await canUseLocalMachineRpc(machineId)) {
+        const result = await sendLocalMachineRpcRequest({
+          machineId,
+          workspaceId,
+          method: 'project/probe-local-member',
+          params: { localProjectId },
+          timeoutMs: options?.timeoutMs ?? 30_000,
+        });
+        const parsed = ProjectProbeLocalMemberResultSchema.safeParse(result);
+        return parsed.success ? parsed.data : null;
+      }
+      return await (
+        await getMachineRpcClient(machineId)
+      ).requestProjectProbeLocalMember({
+        localProjectId,
+        requestedByUserId,
+        timeoutMs: options?.timeoutMs ?? 30_000,
+      });
+    } catch (error) {
+      console.warn('Project member probe failed', error);
+      return null;
+    }
+  };
+
   const requestLocalProjectControl = async (
     request: LocalProjectControlRequest,
     options?: { timeoutMs?: number }
@@ -1514,14 +1503,28 @@ export function createWorkspaceMachineRpcFacade(deps: WorkspaceMachineRpcFacadeD
 
   const requestMachineBugReport = async (
     machineId: MachineId,
-    args: { description: string; reporterUserId: string; requestToken: string },
+    args: {
+      description: string;
+      reporterUserId: string;
+      requestToken: string;
+      clientLog?: BugReportClientLog;
+    },
     options?: { timeoutMs?: number }
   ): Promise<MachineBugReportResponse | null> => {
     try {
+      const { clientLog, ...report } = args;
+      // The request schema is strict: an older daemon rejects the whole report
+      // when the field is present, so the client log goes only where it is understood.
+      const sendClientLog =
+        clientLog !== undefined &&
+        machineSupportsBugReportClientLog({
+          protocolCapabilities: await deps.getMachineProtocolCapabilities(machineId),
+        });
       return await (
         await getMachineRpcClient(machineId)
       ).requestMachineBugReport({
-        ...args,
+        ...report,
+        ...(sendClientLog ? { clientLog } : {}),
         timeoutMs: options?.timeoutMs ?? 120_000,
       });
     } catch (error) {
@@ -1565,8 +1568,6 @@ export function createWorkspaceMachineRpcFacade(deps: WorkspaceMachineRpcFacadeD
     requestSessionFork,
     requestSessionEditAndResend,
     requestSessionDispatchTurn,
-    requestSessionPrepare,
-    requestSessionPrepareCancel,
     requestSessionHistoryRead,
     requestSessionHistoryWrite,
     requestFilePreview,
@@ -1588,6 +1589,7 @@ export function createWorkspaceMachineRpcFacade(deps: WorkspaceMachineRpcFacadeD
     requestSessionPreviewStatus,
     requestIosSimulatorControl,
     requestLocalProjectGitState,
+    requestProjectProbeLocalMember,
     requestLocalProjectControl,
     requestMachineBugReport,
     requestMemoryProvider,

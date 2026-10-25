@@ -4,13 +4,11 @@
 
 ## Mirrors over synced docs tolerate unknown root keys
 
-Synced Mirrors use `ignoreUnknownProperties: true`; unknown newer roots must not
-block client writes. Regression:
-`packages/shared/tests/session-doc-forward-compat.test.ts`.
+Synced Mirrors use `ignoreUnknownProperties: true`; unknown roots must not block writes.
+Test: `packages/shared/tests/session-doc-forward-compat.test.ts`.
 
-SessionDocument's private Mirror is control-only. HistoryWriter writes; SessionData
-reads. `session-agent-writes.ts` reuses shared planners over that writer, never
-UI port methods or a second writer.
+SessionDocument Mirror is control-only. HistoryWriter writes; SessionData reads.
+`session-agent-writes.ts` uses shared planners, never UI ports or a second writer.
 Replacement rules: [shared](../../../../../packages/shared/AGENTS.md#session-history).
 
 ## Opening a doc pulls its stream
@@ -43,8 +41,7 @@ Rules:
   teardown write status/meta for docs that must stay hidden (e.g. unfinished
   fork targets).
 
-The dispatch watcher's contract, "session metadata is the activation index", is
-documented in `../../session/AGENTS.md` and applies to any module enumerating rooms.
+Room enumeration follows the metadata activation index: `../../session/AGENTS.md`.
 
 `getOrCreateSessionDoc(..., { skipAutoRead: true })` affects only newly initialized
 wrappers. Use it for observation in an isolated command manager, never to change
@@ -88,10 +85,11 @@ cannot retire a Turn. Its Legacy entry owns execution/analytics. Intent:
 
 `workspace-presence.ts` owns Scopes; `presence-replica.ts` is synchronous.
 Only Legacy entries execute. No kernel Promise/timers,
-extra runtime or POST/SSE queue. Failed release retains work/Cause/owner
-and fences replacement; close joins completion. Revoke preserves local
-production. CLI owns registry/token Scopes; durable/presence share one provider.
-`platform/presence.ts` consumes the published SDK native entry.
+extra runtime or POST/SSE queue. Failed release retains work/Cause/owner and
+fences its generations; the registry retires it, never blocking the workspace.
+Close joins completion. Revoke preserves local
+production. CLI owns registry/token Scopes; workspace token users share one kernel.
+`platform/presence.ts` uses the published SDK native entry.
 
 ## Device resources use `machine-monitor.ts`
 
@@ -99,6 +97,11 @@ Local renderer observer/snapshot state crosses protocol-v6 `machine-monitor` fra
 and MUST sample without a cloud transport. Cloud observers/snapshots attach only after
 the authorized remote bridge attaches, and detach on offline/revocation. Sampling is
 observer-lease driven; never start OS probes permanently or persist snapshots.
+
+## Catalog readers
+
+Share Promise Repo; close readers first. Timeouts end waiters.
+Retry baseline errors in-place. Role writes confirm remote sync.
 
 ## Machine Flock writes for this machine are local-first
 

@@ -1,7 +1,22 @@
+import { encodeSessionFilePath, resolveSessionPullRequests } from '@lody/shared';
+import type { SessionFileRoot } from '@lody/shared';
+import { resolveProjectFileRoots } from '@/session/worktree/project-member-access';
+import { worktreeGitLegacy } from '@/session/worktree/git-execution-legacy';
+import { resolveSessionFilePath } from '@lody/shared';
+import { projectGroupDirectory } from '@/session/worktree/project-worktrees';
+import { archiveProjectGroup } from '@/session/worktree/project-worktree-archive';
+import {
+  resolveNotificationPresentation,
+  notificationReplyPreview,
+  type NotificationPresentation,
+} from '@lody/shared/notifications';
 import type { SessionActivePresencePhase } from './loro/session-active-presence';
+import { projectTurnAttention, type TerminalOutcome } from '@lody/shared/notifications';
+import { turnNotificationAudience } from './notifications/turn-notification-audience';
 import { fileLocksLegacy } from '@/utils/file-lock';
 import { Effect } from 'effect';
 import { awaitSessionHistoryOwner } from '@/session/session-history-owner';
+import { ConcurrentQueue } from './concurrent-queue';
 import {
   getSessionHistoryRpcRejection,
   putSessionHistoryRpcRejection,
@@ -30,6 +45,7 @@ import { describeRoostHistoryFailure } from '@/session/roost-history-diagnostics
 import {
   createLoroStreamsJsonStreamClient,
   LoroStreamsMachineRpcServer,
+  LoroStreamsRpcHandlerError,
   LORO_STREAMS_RPC_RETENTION_SECONDS,
   LORO_STREAMS_RPC_VERSION,
   type LocalProjectGitStateRpcResponse,
@@ -72,8 +88,6 @@ import {
   getMachineRoomId,
   getSessionIdFromRoomId,
   getSessionRoomId,
-  SessionHistoryChangeSchema,
-  type SessionHistoryChange,
   type IssuePRMention,
   type SessionImageGroupContent,
   type SessionInputBlock,
@@ -164,11 +178,9 @@ import {
   buildLiveActivityConversationItems,
   countLiveActivityConversationCandidates,
   countLiveActivityConversationStatuses,
-  findLiveActivityPermissionAlertCandidate,
   buildLodyConversationsLiveActivityId,
   LODY_CONVERSATIONS_LIVE_ACTIVITY_SCHEMA_VERSION,
   type LiveActivityConversationItem,
-  type LiveActivityPermissionAlert,
   type LiveActivityStatusCounts,
   getCodeCollabFileIndexFlockDocId,
   shouldBypassSessionQuota,
@@ -196,7 +208,7 @@ import {
   publishCodeCollabFileIndexFlock,
   publishCodeCollabFileIndexSignalFlock,
 } from './code-collab/code-collab-flock-publish';
-import type { ModelInfo } from '@lody/shared';
+import type { ModelInfo, SessionActiveInvocationContextResult } from '@lody/shared';
 import type {
   CloudNotificationsPort,
   CloudPort,
@@ -261,7 +273,7 @@ import {
 import type { AcpAgentEditEvidence, AcpStandardDiffBlockEvidence } from '@/lib/acp/history';
 import { mergeAcpRuntimeConfigUpdates } from '@/lib/acp/runtime-config';
 import { generateTitleIsolated, sanitizeTitle } from '@/agent/title-generator';
-import type { AgentSessionWarning } from '@/agent/agent-client';
+import type { AgentSessionWarning, NativeAgentWork } from '@/agent/agent-client';
 import { SessionActivePresenceControllerLegacy } from './loro/session-active-presence-legacy';
 import {
   resolveImageGenerationPresencePhase,
@@ -305,12 +317,12 @@ import { LodyOperationCoordinator } from '@/orchestration/operation-coordinator'
 import {
   createLocalSessionCommandEnvironment,
   getSessionCommandEnvironment,
+  runWithDaemonWorkspace,
   runWithSessionCommandEnvironment,
 } from './session-command-environment';
 import { getLodyOperationStorePath, LodyOperationStore } from '@/orchestration/operation-store';
 import {
   createSessionResult,
-  resolveTurnDispatchConfig,
   sendSessionChatResult,
   type CreateOptions,
   type ResolvedTurnDispatchConfig,
@@ -367,6 +379,7 @@ import {
   isSessionInLocalProjectRemovalScope,
   shouldApplyMachineDeleteLocalProjectCommand,
   upsertMachineLocalProject,
+  readLocalProjectRootResolveSyncTimeoutMs,
 } from '@/lib/local-project-meta';
 import {
   isACPAgentRichContentNotification,
@@ -564,7 +577,6 @@ type LiveActivitySummary = {
   statusCounts: LiveActivityStatusCounts;
   items: LiveActivityConversationItem[];
   updatedAt: number;
-  permissionAlert?: LiveActivityPermissionAlert;
 };
 
 function formatLiveActivityUpdatedAt(value: number, nowMs: number): string {
@@ -695,6 +707,9 @@ export class MessageHandler {
   private pendingProcessLifecycleAction: MachineProcessLifecycleAction | null = null;
   private readonly store = new SessionTransientStore();
   private readonly historyOwnerAbort = new AbortController();
+  private readonly historyWatchAbort = new AbortController();
+  private readonly historyWatchReads = new ConcurrentQueue<string>(8);
+  private historyWatchWaiters = 0;
   private sessionActivePresence!: SessionActivePresenceControllerLegacy;
   private readonly titleGenerationInFlight = new Map<SessionId, Promise<string | null>>();
   // Note: titleGenerationInFlight, archiveInFlight are self-cleaning
@@ -949,6 +964,13 @@ export class MessageHandler {
       let author = existing.state === 'ready' ? readMessageAuthor(existing.turn.author) : undefined;
       if (!author && userTurnId) {
         const input = await backend.history.readTurn(userTurnId);
+        if (input.state === 'ready' && input.turn.role === 'user') {
+          this.executionService.setTurnNotificationAudience(
+            sessionId,
+            userTurnId,
+            turnNotificationAudience(input.turn.author)
+          );
+        }
         const meta = await sessionDoc.getMetaState();
         if (meta)
           author = await resolveSessionMessageAuthor(
@@ -979,7 +1001,7 @@ export class MessageHandler {
 
   /**
    * Run a Lody-cloud side effect attached to a visible turn (usage flush,
-   * completion notification, Live Activity sync). Two-layer discipline —
+   * turn outcome notification, Live Activity sync). Two-layer discipline —
    * cloud work must never hold the turn's presence scope
    * (specs/local-first-two-plane.md):
    *
@@ -1319,6 +1341,11 @@ export class MessageHandler {
       notification,
       logger: this.logger,
       resolveSessionWorkspaceRoot: (sessionId) => this.resolveSessionWorkspaceRoot(sessionId),
+      resolveSessionFileRoots: async (sessionId) => {
+        const resolved = await this.resolveCodeCollabV2Workspace(sessionId);
+        if (!resolved.ok) throw new Error('Session file roots are unavailable');
+        return resolved.fileRoots ?? [{ id: 'main', absolutePath: resolved.workspaceRoot }];
+      },
       validateSessionImageUploadPath: async (filePath) =>
         await this.validateSessionImageUploadPath(filePath),
       uploadSessionImageFile: async (uploadArgs) => await this.uploadSessionImageFile(uploadArgs),
@@ -2380,6 +2407,24 @@ export class MessageHandler {
     return promptBlocks;
   }
 
+  private async probeProjectLocalMember(localProjectId: LocalProjectId) {
+    try {
+      const rootPath = await resolveWorkspaceLocalProjectRootPath(
+        this.workspaceDocument.repo,
+        this.workspaceId,
+        this.machineId,
+        localProjectId
+      );
+      if (!rootPath) throw new Error('Project group member is unavailable');
+      return {
+        type: 'project/probe-local-member' as const,
+        ...(await worktreeGitLegacy.probeLocalProjectMember(rootPath)),
+      };
+    } catch {
+      throw new Error('Unable to probe project group member');
+    }
+  }
+
   private async getLocalProjectGitStateForRpc(args: {
     localProjectId: LocalProjectId;
     requestedByUserId: string;
@@ -2419,7 +2464,7 @@ export class MessageHandler {
         requestSync: () =>
           this.workspaceDocument.syncMachineFlockDoc(this.machineId, {
             reason: 'local-project-git-state-resolve',
-            timeoutMs: readTimeoutEnv('LODY_LOCAL_PROJECT_RESOLVE_SYNC_TIMEOUT_MS', 1_500),
+            timeoutMs: readLocalProjectRootResolveSyncTimeoutMs(),
           }),
       }
     );
@@ -2489,47 +2534,33 @@ export class MessageHandler {
     });
   }
 
-  private async prepareSessionWithAccessCheck(
-    spec: SessionPreparationSpec
-  ): Promise<SessionPrepareResponse> {
-    const { sessionId } = spec;
-    const access = await this.verifyMachineAccess({
-      sessionId,
-      requesterUserId: spec.requestedByUserId,
-      ...(spec.project?.kind === 'local' ? { localProjectId: spec.project.localProjectId } : {}),
-    });
-    if (access.outcome !== 'allowed') {
-      return {
-        type: 'session/prepare_response',
-        preparationId: spec.preparationId,
-        sessionId,
-        accepted: false,
-        disposition: access.outcome === 'denied' ? 'not-owned' : 'error',
-        error: access.outcome === 'denied' ? access.reason : access.error,
-      };
-    }
-    return this.sessionManager.requestSessionPreparation(spec);
+  /**
+   * Draft session preparation is retired. Desktops that predate its removal
+   * still ask for it, so both requests answer at once without doing any work.
+   * Prepare reports an accepted duplicate: an older desktop then holds that one
+   * lease until the draft idles or is sent. A rejection would make it ask again,
+   * and cancel, after every pause in typing.
+   */
+  private declineSessionPreparation(spec: SessionPreparationSpec): SessionPrepareResponse {
+    return {
+      type: 'session/prepare_response',
+      preparationId: spec.preparationId,
+      sessionId: spec.sessionId,
+      accepted: true,
+      disposition: 'duplicate',
+    };
   }
 
-  private async cancelSessionPreparationWithAccessCheck(
+  private declineSessionPreparationCancel(
     args: SessionPreparationCancelSpec
-  ): Promise<SessionPrepareCancelResponse> {
-    const { sessionId } = args;
-    const access = await this.verifyMachineAccess({
-      sessionId,
-      requesterUserId: args.requestedByUserId,
-    });
-    if (access.outcome !== 'allowed') {
-      return {
-        type: 'session/prepare-cancel_response',
-        preparationId: args.preparationId,
-        sessionId,
-        cancelled: false,
-        disposition: access.outcome === 'denied' ? 'not-owned' : 'error',
-        error: access.outcome === 'denied' ? access.reason : access.error,
-      };
-    }
-    return this.sessionManager.cancelSessionPreparation(args);
+  ): SessionPrepareCancelResponse {
+    return {
+      type: 'session/prepare-cancel_response',
+      preparationId: args.preparationId,
+      sessionId: args.sessionId,
+      cancelled: false,
+      disposition: 'not-found',
+    };
   }
 
   // Single access choke point for prompt-handoff steer: both RPC arrival paths
@@ -2670,6 +2701,7 @@ export class MessageHandler {
       const dispatchConfig =
         frozenTargetDispatchConfig ??
         ({
+          mcpServerIds: [],
           frozenInheritedInputConfig: frozenInputConfig,
           inheritSessionDefaults: false,
           ...(hasAgentRunConfigSelection(runConfig) ? { runConfig } : {}),
@@ -2698,6 +2730,11 @@ export class MessageHandler {
       if (typeof command.agentRoleRevision === 'number') {
         options.agentRoleRevision = command.agentRoleRevision;
       }
+      // Operations accepted before the split stored a composed `prompt` and no
+      // prefix; replaying them unchanged keeps their execution text.
+      if (typeof command.agentRolePromptPrefix === 'string') {
+        options.agentRolePromptPrefix = command.agentRolePromptPrefix;
+      }
       if (typeof command.useCurrentSessionAsParent === 'boolean') {
         options.useCurrentSessionAsParent = command.useCurrentSessionAsParent;
       }
@@ -2712,14 +2749,10 @@ export class MessageHandler {
         }
         if (typeof context.branch === 'string') options.branch = context.branch;
       }
-      await createSessionResult(
-        auth,
-        workspace,
-        this.workspaceDocument,
-        prompt,
-        options,
-        dispatchConfig
-      );
+      await createSessionResult(auth, workspace, this.workspaceDocument, prompt, options, {
+        ...dispatchConfig,
+        mcpServerIds: dispatchConfig.mcpServerIds ?? [],
+      });
       return;
     }
 
@@ -2729,7 +2762,7 @@ export class MessageHandler {
       this.workspaceDocument,
       item.target.sessionId,
       prompt,
-      resolveTurnDispatchConfig({}),
+      operation.frozenContinuationConfig.targetDispatchConfigs?.[index] ?? { mcpServerIds: [] },
       undefined,
       delegatedRequester ? undefined : operation.requesterUserId,
       {
@@ -2803,16 +2836,19 @@ export class MessageHandler {
         const pathCount = Object.keys(state.fileIndex).length;
         const result = await publishCodeCollabFileIndexFlock({
           repo: this.workspaceDocument.repo,
+          signal: state.signal,
           flockDocId: getCodeCollabFileIndexFlockDocId(this.workspaceId, state.ownerSessionId),
           fileIndex: state.fileIndex,
           updatedAtMs: state.updatedAtMs,
           reconcileRemote: state.reconcileRemote,
         });
+        state.signal?.throwIfAborted();
         if (state.persistAllChangesDiffStats && state.allChangesDiffStats) {
           try {
             await this.persistCodeCollabAllChangesDiffStats(
               state.ownerSessionId,
-              state.allChangesDiffStats
+              state.allChangesDiffStats,
+              state.signal
             );
           } catch (error) {
             this.logger.debug(
@@ -2835,6 +2871,7 @@ export class MessageHandler {
         const publishStartedAtMs = Date.now();
         const result = await publishCodeCollabFileIndexSignalFlock({
           repo: this.workspaceDocument.repo,
+          signal: state.signal,
           flockDocId: getCodeCollabFileIndexSignalFlockDocId(
             this.workspaceId,
             state.ownerSessionId
@@ -2853,13 +2890,14 @@ export class MessageHandler {
     this.filePreviewService = new FilePreviewService({
       onDiagnostic: (event) => this.logger.debug(`[file-preview] ${JSON.stringify(event)}`),
       resolveLocalWorkspace: this.resolveLocalFilePreviewWorkspace,
-      resolveWorkspace: async (sessionId) => {
-        const resolved = await this.resolveCodeCollabV2Workspace(sessionId);
+      resolveWorkspace: async (sessionId, rootId) => {
+        const resolved = await this.resolveCodeCollabV2Workspace(sessionId, { rootId });
         return resolved.ok
           ? {
               ok: true,
               ownerSessionId: resolved.ownerSessionId,
               workspaceRoot: resolved.workspaceRoot,
+              fileRoots: resolved.fileRoots,
             }
           : { ok: false, code: resolved.code, message: resolved.message };
       },
@@ -2942,8 +2980,48 @@ export class MessageHandler {
           await this.turnPostProcessingService.detectAndAssociatePR(ctx),
         syncWorkspaceGitState: async (sessionId, session) =>
           await this.turnPostProcessingService.syncWorkspaceGitState(sessionId, session),
-        notifySessionCompleted: async (sessionId, userId, occurrenceId) =>
-          await this.notifySessionCompleted(sessionId, userId, occurrenceId),
+        onTurnOutcome: async (fact) => {
+          if (this.deletedSessionIds.has(fact.sessionId)) return;
+          const attention = projectTurnAttention(fact);
+          if (!attention) return;
+          const { scope, source, outcome } = attention;
+          const presentation = await this.buildNotificationPresentation(
+            source.sessionId,
+            source.originTurnIds ?? [source.turnId],
+            fact.assistantTurnId
+          );
+          // Independent channels: a local projection failure cannot block mobile,
+          // and cloud latency/failure cannot prevent desktop publication.
+          const attempts = await Promise.allSettled([
+            (async () => {
+              const sessionDoc = await this.workspaceDocument.getOrCreateSessionDoc(
+                source.sessionId
+              );
+              if (this.deletedSessionIds.has(source.sessionId)) return;
+              await sessionDoc.publishTerminalNotification({
+                id: crypto.randomUUID(),
+                recipientId: scope.recipientId,
+                turnId: source.turnId,
+                outcome,
+                presentation,
+                createdAt: getServerNow(),
+              });
+            })(),
+            this.notifyTurnOutcome(
+              source.sessionId,
+              scope.recipientId,
+              source.turnId,
+              outcome,
+              presentation
+            ),
+          ]);
+          for (const attempt of attempts) {
+            if (attempt.status === 'rejected')
+              this.logger.debug(
+                `[${source.sessionId}] Notification attempt failed: ${formatErrorMessage(attempt.reason)}`
+              );
+          }
+        },
       },
       recordChatFailure: async (sessionDoc, reason, message, code) =>
         await this.recordChatFailure(sessionDoc, reason, message, code),
@@ -3014,6 +3092,16 @@ export class MessageHandler {
       isRuntimeActive: (sessionId) =>
         this.archiveInFlight.has(sessionId) || this.sessionManager.hasSession(sessionId),
       runCleanupScript: (input) => this.runArchivedWorktreeCleanupScript(input),
+      archiveProjectGroup: (input) =>
+        archiveProjectGroup({
+          ...input,
+          machineId: this.machineId,
+          workspaceDocument: this.workspaceDocument,
+          logger: this.logger,
+          resolveLocalRoot: (id) => this.sessionManager.resolveLocalProjectRootPath(id),
+          allowManagedClone: this.cloudPort.githubTokens !== null,
+          cleanup: (cleanupInput) => this.runArchivedWorktreeCleanupScript(cleanupInput),
+        }),
       // Restore reattaches by `branchName`; a branch renamed in a terminal is
       // only known to git, so the name archiving reports is written back.
       recordArchivedBranch: async (sessionId, branchName) => {
@@ -3240,7 +3328,7 @@ export class MessageHandler {
             },
             { onAcpBinaryProgress }
           ),
-        submitBugReport: async ({ description, reporterUserId, requestToken }) => {
+        submitBugReport: async ({ description, reporterUserId, requestToken, clientLog }) => {
           if (!this.cloudPort.bugReports) {
             return {
               type: 'machine/bug-report_response' as const,
@@ -3256,6 +3344,7 @@ export class MessageHandler {
             reporterUserId,
             requestToken,
             machineUserId: this.userId,
+            ...(clientLog ? { clientLog } : {}),
           });
         },
         cancelSession: async ({ sessionId, turnId, subagentTaskId, cancelId, pauseInbox }) => {
@@ -3326,12 +3415,12 @@ export class MessageHandler {
             disposition,
           };
         },
-        prepareSession: async (spec) => await this.prepareSessionWithAccessCheck(spec),
-        cancelSessionPreparation: async (args) =>
-          await this.cancelSessionPreparationWithAccessCheck(args),
+        prepareSession: async (spec) => this.declineSessionPreparation(spec),
+        cancelSessionPreparation: async (args) => this.declineSessionPreparationCancel(args),
         resolveSessionHistoryOwnerSessionId: this.resolveSessionHistoryOwnerSessionId,
-        readSessionHistory: async ({ sessionId, query }) =>
-          await this.readSessionHistoryForRpc(sessionId, query),
+        readSessionHistory: async ({ sessionId, query, signal }) =>
+          await this.readSessionHistoryForRpc(sessionId, query, signal),
+        waitForSessionHistoryChanges: async (args) => await this.waitForSessionHistoryChanges(args),
         writeSessionHistory: async ({ sessionId, operation, payload }) =>
           await this.writeSessionHistoryForRpc(sessionId, operation, payload),
         resolveCodeCollabOwnerSessionId: this.resolveCodeCollabV2OwnerSessionId,
@@ -3348,8 +3437,10 @@ export class MessageHandler {
           await this.codeCollabV2Service.openTurnDiff(request),
         initCodeCollabDirectory: async (request) =>
           await this.codeCollabV2Service.initDirectory(request),
-        getCodeCollabLspDefinition: async () => await this.codeCollabV2Service.lspDefinition(),
-        getCodeCollabLspReferences: async () => await this.codeCollabV2Service.lspReferences(),
+        getCodeCollabLspDefinition: async (request) =>
+          await this.codeCollabV2Service.lspDefinition(request),
+        getCodeCollabLspReferences: async (request) =>
+          await this.codeCollabV2Service.lspReferences(request),
         controlIosSimulator: async ({ proof, responseKey, ...request }) =>
           this.iosSimulatorService.control(request, true, () =>
             this.previewService.authorizeRemoteControl(
@@ -3401,6 +3492,16 @@ export class MessageHandler {
             workspaceId: this.workspaceId,
           });
         },
+        probeLocalProjectMember: async ({ localProjectId, requestedByUserId }) => {
+          const access = await this.cloudPort.access.verifyMachineAccess({
+            workspaceId: this.workspaceId,
+            machineId: this.machineId,
+            requesterUserId: requestedByUserId,
+            localProjectId,
+          });
+          if (!access.allowed) throw new Error('Project group member access denied');
+          return this.probeProjectLocalMember(localProjectId);
+        },
         getLocalProjectGitState: async ({ localProjectId, requestedByUserId }) =>
           await this.getLocalProjectGitStateForRpc({
             localProjectId,
@@ -3434,8 +3535,6 @@ export class MessageHandler {
       userResolver: this.sessionUserResolver,
       workspaceDocument: this.workspaceDocument,
       executionService: this.executionService,
-      getPreparedSessionLaunchConfig: (input) =>
-        this.sessionManager.getPreparedSessionLaunchConfig(input),
       accessPolicy: makeSessionAccessPolicy(this.localWorkspaceCatalog),
       canUseMachine: async (args) => await this.verifyMachineAccess(args),
       // P5/D11 snapshot bookkeeping for the watcher's background owner
@@ -3528,7 +3627,7 @@ export class MessageHandler {
           }
         : {}),
       materializeTarget: async (operation, item, index) =>
-        await this.withSessionCommandEnvironment(() =>
+        await this.withDaemonCommandScope(() =>
           this.materializeOperationTarget(operation, item, index)
         ),
     });
@@ -3574,7 +3673,7 @@ export class MessageHandler {
         rpcVersion: supportsStreamsRpc ? LORO_STREAMS_RPC_VERSION : undefined,
         supportsLocalProjectHistoryRpc: supportsStreamsRpc,
         protocolCapabilities: getHostMachineProtocolCapabilities(),
-        timeZone: getDeviceTimeZone(),
+        timeZone: getDeviceTimeZone(process.env.TZ),
         supportRegistryAgentTypes: this.supportRegistryAgentTypes,
         sessions: [],
       });
@@ -4405,10 +4504,6 @@ export class MessageHandler {
   }
 
   private enqueueACPUpdate(sessionId: SessionId, update: AcpSessionNotification): void {
-    // Note: ACP notifications are internal agent events, NOT user activity.
-    // We intentionally do NOT call touchSession() here to avoid keeping sessions
-    // artificially alive. Only user-initiated actions (chat, image upload) reset
-    // the idle timer.
     if (this.deletedSessionIds.has(sessionId)) {
       this.logger.debug(
         `[${sessionId}] Dropping ACP update after permanent deletion reached its commit boundary`
@@ -4427,6 +4522,14 @@ export class MessageHandler {
       return;
     }
     if (target.source === 'finalized_turn') {
+      // Output inside a turn never touches the session: the turn keeps it from
+      // GC. Output after the turn means the model was woken by a finished
+      // background task, a ScheduleWakeup or a cron, so the idle timer restarts
+      // from it. Only agents that report `sessionActivity` get this; the others
+      // keep the old rule that only user actions and turn ends count.
+      if (this.sessionManager.getSession(sessionId)?.agentClient?.reportsSessionActivity()) {
+        this.touchSession(sessionId);
+      }
       this.captureACPUpdateInvariant(
         'late_acp_update_routed_to_finalized_turn',
         sessionId,
@@ -4923,6 +5026,11 @@ export class MessageHandler {
           notification,
           logger: this.logger,
           resolveSessionWorkspaceRoot: (sessionId) => this.resolveSessionWorkspaceRoot(sessionId),
+          resolveSessionFileRoots: async (sessionId) => {
+            const resolved = await this.resolveCodeCollabV2Workspace(sessionId);
+            if (!resolved.ok) throw new Error('Session file roots are unavailable');
+            return resolved.fileRoots ?? [{ id: 'main', absolutePath: resolved.workspaceRoot }];
+          },
           validateSessionImageUploadPath: async (filePath) =>
             await this.validateSessionImageUploadPath(filePath),
           uploadSessionImageFile: async (uploadArgs) =>
@@ -5185,6 +5293,7 @@ export class MessageHandler {
     for (const diff of diffs) {
       const event = await pendingEventFromStandardDiffEvidence({
         workspaceRoot: resolved.workspaceRoot,
+        fileRoots: resolved.fileRoots,
         diff,
       });
       if (event) {
@@ -5246,14 +5355,15 @@ export class MessageHandler {
     workspaceRoot: string,
     ownerSessionId: SessionId,
     acpEvents: readonly CodeCollabV2PendingDiffStoreEvent[],
-    editEvidence: readonly AcpAgentEditEvidence[]
+    editEvidence: readonly AcpAgentEditEvidence[],
+    fileRoots?: readonly SessionFileRoot[]
   ): Promise<CodeCollabV2PendingDiffStoreEvent[]> {
     if (editEvidence.length === 0) {
       return [];
     }
     const coveredRelativePaths = new Set<string>();
     for (const event of acpEvents) {
-      const resolved = resolveCodeCollabV2EvidencePath(workspaceRoot, event.path);
+      const resolved = resolveCodeCollabV2EvidencePath(workspaceRoot, event.path, fileRoots);
       if (resolved) {
         coveredRelativePaths.add(resolved.relativePath);
       }
@@ -5266,7 +5376,7 @@ export class MessageHandler {
     }
     const gapEvents: CodeCollabV2PendingDiffStoreEvent[] = [];
     for (const edit of latestEditByPath.values()) {
-      const resolved = resolveCodeCollabV2EvidencePath(workspaceRoot, edit.path);
+      const resolved = resolveCodeCollabV2EvidencePath(workspaceRoot, edit.path, fileRoots);
       if (!resolved || coveredRelativePaths.has(resolved.relativePath)) {
         continue;
       }
@@ -5284,6 +5394,7 @@ export class MessageHandler {
       let event = hasDirectOldEvidence
         ? await pendingEventFromAgentEditEvidence({
             workspaceRoot,
+            fileRoots,
             edit: normalizedEdit,
             latestText,
           })
@@ -5296,6 +5407,7 @@ export class MessageHandler {
         });
         event = await pendingEventFromAgentEditEvidence({
           workspaceRoot,
+          fileRoots,
           edit: normalizedEdit,
           latestText,
         });
@@ -5346,7 +5458,8 @@ export class MessageHandler {
         resolved.workspaceRoot,
         resolved.ownerSessionId,
         acpEvents,
-        editEvidence
+        editEvidence,
+        resolved.fileRoots
       );
       const mergedEvents = this.mergeCodeCollabTurnDiffEvents([...acpEvents, ...gapEvents]);
       if (mergedEvents.length === 0) {
@@ -5359,6 +5472,7 @@ export class MessageHandler {
       const capturedAtMs = turnStorageMetadata?.capturedAtMs ?? recordedAtMs;
       const fileDiff = await this.codeCollabV2DiffStore.recordTurnDiffs({
         workspaceRoot: resolved.workspaceRoot,
+        fileRoots: resolved.fileRoots,
         ownerSessionId: resolved.ownerSessionId,
         turnId,
         events: mergedEvents,
@@ -5891,7 +6005,7 @@ export class MessageHandler {
         rpcVersion: supportsStreamsRpc ? LORO_STREAMS_RPC_VERSION : machineMeta?.rpcVersion,
         supportsLocalProjectHistoryRpc: supportsStreamsRpc,
         protocolCapabilities: getHostMachineProtocolCapabilities(),
-        timeZone: getDeviceTimeZone(),
+        timeZone: getDeviceTimeZone(process.env.TZ),
         supportRegistryAgentTypes: this.supportRegistryAgentTypes,
         sessions: machineMeta?.sessions ?? [],
       });
@@ -6031,6 +6145,34 @@ export class MessageHandler {
 
     const project = meta.project;
     const ownerSessionId = (meta.parentSessionId ?? sessionId) as SessionId;
+    const groupMeta =
+      ownerSessionId === sessionId
+        ? meta
+        : await this.resolveCodeCollabOwnerSessionMeta(ownerSessionId);
+    if (groupMeta?.projectRun) {
+      if (
+        groupMeta.isArchived ||
+        groupMeta.machineId !== this.machineId ||
+        meta.machineId !== this.machineId
+      )
+        return {
+          ok: false,
+          error: 'permission_denied',
+          message: 'Project group ownership is invalid.',
+        };
+      const workspaceRoot = path.join(
+        projectGroupDirectory(groupMeta.projectRun),
+        'worktrees',
+        ownerSessionId
+      );
+      if (!fs.existsSync(workspaceRoot))
+        return {
+          ok: false,
+          error: 'workspace_unavailable',
+          message: 'Project group workspace is unavailable.',
+        };
+      return { ok: true, workspaceRoot, ownerSessionId, source: 'project-group' };
+    }
     if (project?.kind === 'local') {
       const originalRootPath = await resolveWorkspaceLocalProjectRootPath(
         this.workspaceDocument.repo,
@@ -6278,10 +6420,33 @@ export class MessageHandler {
             message: 'Code Collab write access is denied for this user.',
           };
         }
+        const fileRoots = await resolveProjectFileRoots(
+          resolved.workspaceRoot,
+          ownerMeta?.projectRun,
+          this.machineId,
+          (id) => this.sessionManager.resolveLocalProjectRootPath(id),
+          (id) => this.logger.debug(`Project group file root unavailable: ${id}`)
+        );
+        const rootId = options?.rootId ?? 'main';
+        const selected = fileRoots.find((root) => root.id === rootId);
+        if (!selected)
+          return {
+            ok: false,
+            code:
+              rootId.startsWith('member:') &&
+              ownerMeta?.projectRun?.members[
+                rootId.slice(7) as keyof typeof ownerMeta.projectRun.members
+              ]
+                ? 'workspace_root_unavailable'
+                : 'permission_denied',
+            message: 'Session file root is unavailable.',
+          };
         return {
           ok: true,
           ownerSessionId,
-          workspaceRoot: resolved.workspaceRoot,
+          workspaceRoot: selected.absolutePath,
+          fileRoots,
+          projectRun: rootId === 'main' ? ownerMeta?.projectRun : undefined,
           allChangesBaseBranch: this.resolveGitHubProjectBranch(ownerMeta),
         };
       }
@@ -6314,7 +6479,8 @@ export class MessageHandler {
   };
 
   private readonly resolveLocalFilePreviewWorkspace: FilePreviewLocalWorkspaceResolver = async (
-    sessionId
+    sessionId,
+    rootId
   ) => {
     // Local IPC grants filesystem reads, but must retain the session/machine and
     // child-owner checks without requiring a live agent or an existing directory.
@@ -6349,8 +6515,14 @@ export class MessageHandler {
         message: 'Local file preview session ownership is invalid.',
       };
     }
-    const resolved = await this.resolveCodeCollabV2Workspace(sessionId);
-    if (resolved.ok) return { ok: true, ownerSessionId, workspaceRoot: resolved.workspaceRoot };
+    const resolved = await this.resolveCodeCollabV2Workspace(sessionId, { rootId });
+    if (resolved.ok)
+      return {
+        ok: true,
+        ownerSessionId,
+        workspaceRoot: resolved.workspaceRoot,
+        fileRoots: resolved.fileRoots,
+      };
     if (resolved.code === 'workspace_root_unavailable') {
       return { ok: true, ownerSessionId, workspaceRoot: null };
     }
@@ -6383,13 +6555,16 @@ export class MessageHandler {
 
   private async persistCodeCollabAllChangesDiffStats(
     ownerSessionId: SessionId,
-    diffStats: NonNullable<SessionMeta['diffStats']>
+    diffStats: NonNullable<SessionMeta['diffStats']>,
+    signal?: AbortSignal
   ): Promise<void> {
     const ownerRoomId = getSessionRoomId(ownerSessionId);
     const metaRecord = await this.workspaceDocument.repo.getDocMeta(ownerRoomId);
     if (!metaRecord?.meta || isLoroRepoDocDeleted(metaRecord)) {
       return;
     }
+    signal?.throwIfAborted();
+    if ((metaRecord.meta as SessionMeta).projectRun) return;
     const ownerMeta = readDiffStatsMetadata(metaRecord.meta);
     const target = resolveDiffStatsTarget({ ownerRoomId, ownerMeta });
     const patch = resolveCodeCollabAllChangesDiffStatsPatch({ target, ownerMeta, diffStats });
@@ -6411,8 +6586,29 @@ export class MessageHandler {
     return requester === ownerUserId || requester === this.userId;
   }
 
-  private withSessionCommandEnvironment<T>(run: () => T): T {
-    if (this.cloudPort.kind !== 'local') return run();
+  private readActiveInvocation(sessionId: SessionId): SessionActiveInvocationContextResult {
+    const invocation = this.executionService.getActiveInvocationContext(sessionId);
+    return invocation
+      ? { type: 'session/active-invocation-context', sessionId, active: true, ...invocation }
+      : { type: 'session/active-invocation-context', sessionId, active: false };
+  }
+
+  /**
+   * Commands the daemon executes always borrow its workspace replica. Cloud keeps
+   * its authenticated command behavior; only the local platform adds the local host.
+   */
+  private withDaemonCommandScope<T>(run: () => T): T {
+    if (this.cloudPort.kind !== 'local')
+      return runWithDaemonWorkspace(
+        {
+          workspaceId: this.workspaceId,
+          userId: this.userId,
+          machineId: this.machineId,
+          manager: this.workspaceDocument,
+          readInvocation: (sessionId) => this.readActiveInvocation(sessionId),
+        },
+        run
+      );
     return runWithSessionCommandEnvironment(
       createLocalSessionCommandEnvironment({
         manager: this.workspaceDocument,
@@ -6421,17 +6617,7 @@ export class MessageHandler {
         machineName: this.machineName,
         userId: this.userId,
         host: {
-          readInvocation: (sessionId) => {
-            const invocation = this.executionService.getActiveInvocationContext(sessionId);
-            return invocation
-              ? {
-                  type: 'session/active-invocation-context',
-                  sessionId,
-                  active: true,
-                  ...invocation,
-                }
-              : { type: 'session/active-invocation-context', sessionId, active: false };
-          },
+          readInvocation: (sessionId) => this.readActiveInvocation(sessionId),
           readLiveStatus: async (sessionId) => {
             const live = resolveSessionLiveStatus({
               presence: this.sessionActivePresence.getStatus(sessionId),
@@ -6509,11 +6695,18 @@ export class MessageHandler {
     };
 
     switch (request.method) {
+      case 'project/probe-local-member': {
+        if (
+          request.machineId !== this.machineId ||
+          request.workspaceId !== this.workspaceId ||
+          request.ownerSessionId
+        )
+          throw new Error('Project group probe scope mismatch');
+        return this.probeProjectLocalMember(request.params.localProjectId as LocalProjectId);
+      }
       case 'mcp/list-tools':
         return await listMcpTools(request.params.server);
       case 'session/call-tool': {
-        if (this.cloudPort.kind !== 'local')
-          throw new Error('Daemon Session tools require a local workspace');
         const { sessionId, name, arguments: args } = request.params;
         if (
           request.workspaceId !== this.workspaceId ||
@@ -6526,7 +6719,7 @@ export class MessageHandler {
         if (!sourceWorkdir && args && typeof args === 'object' && 'attachments' in args)
           throw new Error('Requester Session workspace is unavailable');
 
-        return this.withSessionCommandEnvironment(() =>
+        return this.withDaemonCommandScope(() =>
           executeDaemonSessionTool(
             {
               machineId: this.machineId,
@@ -6566,10 +6759,10 @@ export class MessageHandler {
         return await this.codeCollabV2Service.initDirectory(request.params);
       case 'code-collab/lsp-definition':
         await assertOwner(request.params.sessionId as SessionId);
-        return await this.codeCollabV2Service.lspDefinition();
+        return await this.codeCollabV2Service.lspDefinition(request.params);
       case 'code-collab/lsp-references':
         await assertOwner(request.params.sessionId as SessionId);
-        return await this.codeCollabV2Service.lspReferences();
+        return await this.codeCollabV2Service.lspReferences(request.params);
       case 'file/preview':
         await assertOwner(request.params.sessionId as SessionId);
         return await this.filePreviewService.previewFile(request.params);
@@ -6650,9 +6843,9 @@ export class MessageHandler {
         };
       }
       case 'session/prepare':
-        return await this.prepareSessionWithAccessCheck(request.params);
+        return this.declineSessionPreparation(request.params);
       case 'session/prepare-cancel':
-        return await this.cancelSessionPreparationWithAccessCheck(request.params);
+        return this.declineSessionPreparationCancel(request.params);
       case 'ios-simulator/agent-control': {
         const sessionId = request.params.sessionId as SessionId;
         const invocation = this.executionService.getActiveInvocationContext(sessionId);
@@ -6884,12 +7077,61 @@ export class MessageHandler {
     );
   };
 
+  private async waitForSessionHistoryChanges(args: {
+    sessionId: SessionId;
+    checkpoint: string;
+    waitMs: number;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    if (this.historyWatchWaiters >= 128)
+      throw new LoroStreamsRpcHandlerError(
+        'rpc_request_capacity_exceeded',
+        'History observation capacity exceeded.'
+      );
+    this.historyWatchWaiters++;
+    try {
+      const signal = AbortSignal.any([
+        this.historyOwnerAbort.signal,
+        this.historyWatchAbort.signal,
+        ...(args.signal ? [args.signal] : []),
+      ]);
+      await this.resolveSessionHistoryOwnerSessionId(args.sessionId, { signal });
+      this.touchSession(args.sessionId);
+      const doc = await this.workspaceDocument.getOrCreateSessionDoc(args.sessionId);
+      const backend = await this.getSessionBackend(doc);
+      if (backend.kind !== 'roost' || !backend.history.waitForChanges)
+        throw new Error('History observation unavailable');
+      await backend.flushLocalWrites();
+      await backend.history.waitForChanges(args.checkpoint, args.waitMs, signal);
+    } finally {
+      this.historyWatchWaiters--;
+    }
+  }
+
   private async readSessionHistoryForRpc(
     sessionId: SessionId,
-    query: SessionHistoryReadQuery
+    query: SessionHistoryReadQuery,
+    signal?: AbortSignal
   ): Promise<SessionHistoryReadResponse> {
     try {
-      await this.resolveSessionHistoryOwnerSessionId(sessionId);
+      if (query.kind === 'watchChanges') {
+        await this.waitForSessionHistoryChanges({
+          sessionId,
+          checkpoint: query.checkpoint,
+          waitMs: query.waitMs,
+          signal,
+        });
+        const read = {
+          kind: 'readChanges' as const,
+          checkpoint: query.checkpoint,
+          includeBodiesFrom: query.includeBodiesFrom,
+          ...(query.withPatches ? { withPatches: true as const } : {}),
+        };
+        return await this.historyWatchReads.enqueue(sessionId, () =>
+          this.readSessionHistoryForRpc(sessionId, read, signal)
+        );
+      }
+      await this.resolveSessionHistoryOwnerSessionId(sessionId, { signal });
       this.touchSession(sessionId);
       const sessionDoc = await this.workspaceDocument.getOrCreateSessionDoc(sessionId);
       const backend = await this.getSessionBackend(sessionDoc);
@@ -6901,10 +7143,55 @@ export class MessageHandler {
         // The read and its revision must straddle no unpublished history write.
         // These are local durability barriers, never remote synchronization.
         await backend.flushLocalWrites();
-        const before = await sessionDoc.getRoostHistoryCursor();
+        if (!history.getPublication) throw new Error('Native history publication is unavailable');
+        const before = await history.getPublication();
         let result: unknown;
         let pageTurns: SessionHistoryReadResponse['pageTurns'];
         switch (query.kind) {
+          case 'readChanges': {
+            if (!history.readChanges)
+              throw new Error('History incremental recovery is unavailable');
+            const changes = await history.readChanges(
+              query.checkpoint,
+              query.withPatches ? { withPatches: true } : undefined
+            );
+            result = changes;
+            if (changes.state === 'ready' && query.includeBodiesFrom !== undefined) {
+              const count = await history.count();
+              const retainedFrom =
+                query.includeBodiesFrom >= count && count > 0
+                  ? Math.max(0, count - 40)
+                  : Math.min(query.includeBodiesFrom, count);
+              const from =
+                changes.from === undefined
+                  ? undefined
+                  : Math.max(retainedFrom, Math.min(changes.from, count));
+              // Normal streaming edits/appends fit in one coherent reply. A large
+              // structural rewrite retains the bounded checkpoint-read path.
+              if (changes.ids.length + (from === undefined ? 0 : count - from) <= 500) {
+                const changed: SessionHistoryInput[] = [];
+                const patched = new Set(changes.patches?.turns.map((turn) => turn.turnId));
+                for (const id of changes.ids) {
+                  if (patched.has(id)) continue;
+                  const read = await history.readTurn(id);
+                  if (read.state === 'ready') changed.push(read.turn as SessionHistoryInput);
+                }
+                const suffix =
+                  from === undefined
+                    ? []
+                    : (await history.readRange(from, count)).map((read) => {
+                        if (read.state !== 'ready')
+                          throw new Error('History suffix body is unavailable');
+                        return read.turn as SessionHistoryInput;
+                      });
+                result = {
+                  ...changes,
+                  bodies: { changed, ...(from === undefined ? {} : { from }), suffix },
+                };
+              }
+            }
+            break;
+          }
           case 'count':
             result = await history.count();
             break;
@@ -6934,7 +7221,10 @@ export class MessageHandler {
             }
             {
               const page = await history.readLatestDirectoryPage(query.limit);
-              result = page;
+              result =
+                query.withCheckpoint && history.getCheckpoint
+                  ? { ...page, checkpoint: await history.getCheckpoint() }
+                  : page;
               pageTurns = (
                 await history.readRange(page.startPosition, page.startPosition + page.rows.length)
               ).map((read) => {
@@ -6951,7 +7241,10 @@ export class MessageHandler {
             }
             {
               const page = await history.readOlderDirectoryPage(query.cursor, query.limit);
-              result = page;
+              result =
+                query.withCheckpoint && history.getCheckpoint
+                  ? { ...page, checkpoint: await history.getCheckpoint() }
+                  : page;
               pageTurns = (
                 await history.readRange(page.startPosition, page.startPosition + page.rows.length)
               ).map((read) => {
@@ -6968,20 +7261,26 @@ export class MessageHandler {
             break;
         }
         await backend.flushLocalWrites();
-        const after = await sessionDoc.getRoostHistoryCursor();
-        if (before?.historyRevision !== after?.historyRevision) continue;
-        if (after?.historyRevision === undefined || after.historyCount === undefined) {
-          throw new Error('Roost history has no durable revision');
-        }
-        let historyChange: SessionHistoryReadResponse['historyChange'];
-        if (after.historyChangeJson) {
-          try {
-            historyChange = SessionHistoryChangeSchema.nullable().parse(
-              JSON.parse(after.historyChangeJson)
-            );
-          } catch {
-            historyChange = { kind: 'structure', from: 0, to: after.historyCount };
-          }
+        const after = await history.getPublication();
+        if (
+          before.checkpoint !== after.checkpoint ||
+          before.historyRevision !== after.historyRevision
+        )
+          continue;
+        const protectedRead =
+          query.kind === 'readChanges' ||
+          ((query.kind === 'readLatestPage' || query.kind === 'readOlderPage') &&
+            query.withCheckpoint) ||
+          ((query.kind === 'readTurn' || query.kind === 'readRange') && query.atCheckpoint);
+        if (protectedRead) {
+          if (!history.getCheckpoint) throw new Error('History checkpoints are unavailable');
+          const current = await history.getCheckpoint();
+          const expected =
+            query.kind === 'readTurn' || query.kind === 'readRange'
+              ? query.atCheckpoint
+              : (result as { checkpoint?: string }).checkpoint;
+          if (current !== expected)
+            throw Object.assign(new Error('History checkpoint was superseded'), { code: 'stale' });
         }
         return {
           type: 'session/history-read_response',
@@ -6990,12 +7289,29 @@ export class MessageHandler {
           result,
           historyRevision: after.historyRevision,
           historyCount: after.historyCount,
-          historyChange,
+          historyChange: after.historyChange,
           ...(pageTurns ? { pageTurns } : {}),
         };
       }
-      throw new Error('History changed during the read; retry the observation');
+      throw Object.assign(new Error('History changed during the read; retry the observation'), {
+        code: 'stale',
+      });
     } catch (error) {
+      const protectedRead =
+        query.kind === 'readChanges' ||
+        ((query.kind === 'readLatestPage' || query.kind === 'readOlderPage') &&
+          query.withCheckpoint) ||
+        ((query.kind === 'readTurn' || query.kind === 'readRange') && query.atCheckpoint);
+      if (protectedRead && error instanceof Error && 'code' in error && error.code === 'stale') {
+        this.logger.trace(`[${sessionId}] History observation superseded operation=${query.kind}`);
+        return {
+          type: 'session/history-read_response',
+          sessionId,
+          success: false,
+          retryReason: 'superseded',
+          error: 'The history observation was superseded; retry it.',
+        };
+      }
       const detail =
         describeRoostHistoryFailure(error, {
           stage: 'read',
@@ -7107,36 +7423,19 @@ export class MessageHandler {
           break;
         }
       }
-      const historyCursor = await sessionDoc.getRoostHistoryCursor();
-      let historyChange: SessionHistoryChange | null = null;
-      if (historyCursor?.historyChangeJson) {
-        try {
-          historyChange = SessionHistoryChangeSchema.nullable().parse(
-            JSON.parse(historyCursor.historyChangeJson)
-          );
-        } catch {
-          historyChange = {
-            kind: 'structure',
-            from: 0,
-            to: historyCursor.historyCount ?? 0,
-          };
-        }
-      }
+      await backend.flushLocalWrites();
+      if (!backend.history.getPublication)
+        throw new Error('Native history publication is unavailable');
+      const historyCursor = await backend.history.getPublication();
       return {
         type: 'session/history-write_response',
         sessionId,
         operation,
         success: true,
         ...(result === undefined ? {} : { result }),
-        ...(historyCursor?.historyRevision === undefined
-          ? {}
-          : {
-              historyRevision: historyCursor.historyRevision,
-              ...(historyCursor.historyCount === undefined
-                ? {}
-                : { historyCount: historyCursor.historyCount }),
-              ...(historyChange === undefined ? {} : { historyChange }),
-            }),
+        historyRevision: historyCursor.historyRevision,
+        historyCount: historyCursor.historyCount,
+        historyChange: historyCursor.historyChange,
       };
     } catch (error) {
       const detail =
@@ -7485,7 +7784,10 @@ export class MessageHandler {
    * symlink final component), reject non-files/empty/oversize, compute sha256
    * and text-previewability by streaming (bounded memory).
    */
-  private validateSessionFileUploadPath(filePath: string, options?: { containWithin?: string }) {
+  private validateSessionFileUploadPath(
+    filePath: string,
+    options?: { containWithin?: string; fileRoots?: readonly SessionFileRoot[] }
+  ) {
     return this.attachmentTransfer().validateSessionFileUploadPath(filePath, options);
   }
 
@@ -7618,13 +7920,15 @@ export class MessageHandler {
       return;
     }
 
+    const rootResolution = await this.resolveCodeCollabV2Workspace(sessionId);
+    const fileRoots = rootResolution.ok
+      ? (rootResolution.fileRoots ?? [{ id: 'main', absolutePath: workspaceRoot }])
+      : [];
     // Validate every path up front (existence/readable/size + sha256/textPreview).
     let validatedFiles: ValidatedUploadFile[];
     try {
       validatedFiles = await Promise.all(
-        message.paths.map((filePath) =>
-          this.validateSessionFileUploadPath(filePath, { containWithin: workspaceRoot })
-        )
+        message.paths.map((filePath) => this.validateSessionFileUploadPath(filePath, { fileRoots }))
       );
     } catch (error) {
       respond({
@@ -7638,7 +7942,7 @@ export class MessageHandler {
 
     const uploadedFiles: UploadedSessionFile[] = [];
     const failures: string[] = [];
-    const canonicalWorkspaceRoot = await fs.promises.realpath(workspaceRoot);
+
     for (const file of validatedFiles) {
       try {
         const uploaded = await this.uploadValidatedSessionFile({
@@ -7649,9 +7953,9 @@ export class MessageHandler {
         // Validation above canonicalized the path and proved containment. Keep
         // only the workspace-relative provenance in history so a local Lody
         // client can reopen the live artifact without publishing a host path.
-        const sourcePath = normalizeSessionFileSourcePath(
-          path.relative(canonicalWorkspaceRoot, file.absolutePath)
-        );
+        const source = resolveSessionFilePath(fileRoots, file.absolutePath);
+        if (!source) throw new Error('File is outside the session workspace');
+        const sourcePath = encodeSessionFilePath(source);
         uploadedFiles.push({ ...uploaded, sourcePath });
       } catch (error) {
         failures.push(`${file.fileName}: ${formatErrorMessage(error)}`);
@@ -8746,38 +9050,26 @@ export class MessageHandler {
     }
 
     if (notificationService) {
-      if (requestKind === 'permission') {
-        void (async () => {
-          const historySynced = await doc.waitUntilSynced();
-          if (resolved) return;
-          if (!historySynced) {
-            this.logger.debug(
-              `[${sessionId}] Permission request history was not confirmed before Live Activity sync; sending notification fallback`
-            );
-            await notificationService.notifyPermissionRequested(notificationInput);
-            return;
-          }
-
-          const liveActivityResult = await this.syncLiveActivitySummary(permissionUserId, {
-            permissionAlert: true,
+      // Ordinary push owns the alert. Live Activity remains a silent projection;
+      // provider acceptance is not proof that the user saw a permission request.
+      void this.runTurnCloudSideEffect(sessionId, 'permission notification', async () => {
+        const invocation = this.executionService.getActiveInvocationContext(sessionId);
+        const presentation =
+          invocation && invocation.requesterUserId === permissionUserId
+            ? await this.buildNotificationPresentation(
+                sessionId,
+                invocation.notificationOriginTurnIds.length
+                  ? invocation.notificationOriginTurnIds
+                  : [invocation.sourceTurnId]
+              )
+            : undefined;
+        if (!resolved)
+          await notificationService.notifyPermissionRequested({
+            ...notificationInput,
+            presentation,
           });
-          if (resolved) return;
-          if (liveActivityResult.sent && !liveActivityResult.ended) {
-            return;
-          }
-
-          await notificationService.notifyPermissionRequested(notificationInput);
-        })().catch((error: unknown) => {
-          this.logger.debug(
-            `[${sessionId}] Failed to send permission notification fallback: ${formatErrorMessage(
-              error
-            )}`
-          );
-        });
-      } else {
-        void notificationService.notifyPermissionRequested(notificationInput);
-        void this.syncLiveActivitySummary(permissionUserId);
-      }
+      });
+      void this.syncLiveActivitySummary(permissionUserId);
     }
 
     // Track when permission was requested for duration calculation
@@ -9494,7 +9786,7 @@ export class MessageHandler {
         lastOpenedAtMs: nowMs,
       },
       nowMs,
-      { sync: this.workspaceDocument, reason: 'local-project-add' }
+      { sync: this.workspaceDocument, reason: 'local-project-add', refreshGitHubRemote: true }
     );
   }
 
@@ -9831,6 +10123,13 @@ export class MessageHandler {
   }
 
   /**
+   * Release parked observers before the processor drains; shared writes keep their owner.
+   */
+  cancelPendingHistoryWatches(): void {
+    this.historyWatchAbort.abort();
+  }
+
+  /**
    * Flush pending ACP updates and tear down session resources.
    */
   async cleanup(): Promise<void> {
@@ -9838,6 +10137,7 @@ export class MessageHandler {
     void inboxShutdown.catch((cause) =>
       this.logger.error('Inbox shutdown retains resources', cause)
     );
+    this.cancelPendingHistoryWatches();
     this.historyOwnerAbort.abort();
     await this.iosSimulatorService.closeAll();
     this.logger.debug('Cleaning up message handler resources');
@@ -9887,24 +10187,79 @@ export class MessageHandler {
     await this.sessionManager.cleanUp();
   }
 
-  private async notifySessionCompleted(
+  private async buildNotificationPresentation(
+    sessionId: SessionId,
+    originTurnIds: readonly string[],
+    assistantTurnId?: string
+  ): Promise<NotificationPresentation | undefined> {
+    // Read exact originating inputs and the completed assistant entry, never all history.
+    // Mixed/large batches fall back to the conversation name.
+    try {
+      const sessionDoc = await this.workspaceDocument.getOrCreateSessionDoc(sessionId);
+      const meta = await sessionDoc.getMetaState();
+      if (!meta) return undefined;
+      const backend = await this.getSessionBackend(sessionDoc);
+      const inputs: { id: string; scheduleRun?: unknown }[] = [];
+      if (originTurnIds.length <= 32) {
+        for (const id of originTurnIds) {
+          const read = await backend.history.readTurn(id);
+          inputs.push(read.state === 'ready' ? read.turn : { id });
+        }
+      }
+      let projectName: string | undefined;
+      if (meta.project?.kind === 'local') {
+        try {
+          projectName = (
+            await resolveWorkspaceLocalProject(
+              this.workspaceDocument.repo,
+              this.workspaceId,
+              meta.machineId,
+              meta.project.localProjectId
+            )
+          )?.name;
+        } catch {
+          /* The repository name remains a useful fallback. */
+        }
+      }
+      const presentation = resolveNotificationPresentation(meta, inputs, projectName);
+      if (assistantTurnId) {
+        try {
+          const reply = await backend.history.readTurn(assistantTurnId);
+          if (reply.state === 'ready') {
+            presentation.replyPreview = notificationReplyPreview(reply.turn);
+          }
+        } catch {
+          // An unavailable reply must not discard the existing display context.
+        }
+      }
+      return presentation;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async notifyTurnOutcome(
     sessionId: SessionId,
     userId: string,
-    occurrenceId: string
+    occurrenceId: string,
+    outcome: TerminalOutcome,
+    presentation?: NotificationPresentation
   ): Promise<void> {
     if (!this.notificationService) {
       return;
     }
     const notificationService = this.notificationService;
-    await this.runTurnCloudSideEffect(sessionId, 'completion notification', async () => {
+    await this.runTurnCloudSideEffect(sessionId, 'turn outcome notification', async () => {
       const sessionDoc = await this.workspaceDocument.getOrCreateSessionDoc(sessionId);
       const meta = await sessionDoc.getMetaState();
       const workspaceSlug = this.workspaceSlug?.trim() || this.workspaceId;
       await notificationService.notifySessionCompleted({
         sessionId,
         occurrenceId,
+        outcome,
+        presentation,
         sessionTitle: meta?.title,
-        pullRequests: meta?.pullRequests,
+        pullRequests: resolveSessionPullRequests(meta),
         workspaceId: this.workspaceId,
         workspaceSlug,
         userId,
@@ -9913,10 +10268,7 @@ export class MessageHandler {
     });
   }
 
-  private async buildLiveActivitySummary(
-    userId: string,
-    options: { permissionAlert?: boolean } = {}
-  ): Promise<LiveActivitySummary> {
+  private async buildLiveActivitySummary(userId: string): Promise<LiveActivitySummary> {
     const sessionMetas = (
       await Promise.all(
         [...this.workspaceDocument.sessions.values()].map(async (sessionDoc) => {
@@ -9941,14 +10293,6 @@ export class MessageHandler {
       },
       formatUpdatedAt: (updatedAt) => formatLiveActivityUpdatedAt(updatedAt, nowMs),
     });
-    const permissionAlertCandidate = options.permissionAlert
-      ? findLiveActivityPermissionAlertCandidate({
-          sessions: sessionMetas,
-          currentUserId: userId,
-          defaultTitle: 'New Task',
-        })
-      : null;
-
     const summary: LiveActivitySummary = {
       activityId: buildLodyConversationsLiveActivityId({
         workspaceId: this.workspaceId,
@@ -9966,25 +10310,16 @@ export class MessageHandler {
       items,
       updatedAt: nowMs,
     };
-    if (permissionAlertCandidate) {
-      summary.permissionAlert = {
-        title: 'Permission Required',
-        body: permissionAlertCandidate.sessionTitle,
-      };
-    }
     return summary;
   }
 
-  private async syncLiveActivitySummary(
-    userId: string,
-    options: { permissionAlert?: boolean } = {}
-  ): Promise<LiveActivitySummarySyncResult> {
+  private async syncLiveActivitySummary(userId: string): Promise<LiveActivitySummarySyncResult> {
     if (!this.notificationService) {
       return { sent: false, reason: 'notifications_disabled' };
     }
 
     try {
-      const summary = await this.buildLiveActivitySummary(userId, options);
+      const summary = await this.buildLiveActivitySummary(userId);
       return await this.notificationService.syncLiveActivitySummary({
         workspaceId: this.workspaceId,
         userId,
@@ -10085,6 +10420,14 @@ export class MessageHandler {
    */
   isArchiveInFlight(sessionId: SessionId): boolean {
     return this.archiveInFlight.has(sessionId);
+  }
+
+  /**
+   * Work the native agent does outside Lody's turns (a background shell, or a
+   * model turn it started itself). GC must not stop such a session as idle.
+   */
+  getNativeWork(sessionId: SessionId): NativeAgentWork {
+    return this.sessionManager.getSession(sessionId)?.agentClient?.getNativeWork() ?? null;
   }
 
   /**

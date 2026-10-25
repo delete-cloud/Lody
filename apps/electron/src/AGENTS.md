@@ -75,8 +75,8 @@ native-dependency, and OSS-composition rules stay in `apps/electron/AGENTS.md`.
   `-webkit-app-region: drag`. Interactive descendants use `app-region-no-drag`.
   Dialog and alert-dialog overlays mount the strip themselves. Hide those
   regions in native fullscreen. Windows caption buttons stay an OS overlay
-  (`MAIN_WINDOW_TITLE_BAR_OVERLAY_HEIGHT`); right-edge headers pad `pr-[144px]`
-  so toolbar controls do not sit under them.
+  (`MAIN_WINDOW_TITLE_BAR_OVERLAY_HEIGHT`), measured by `--window-caption-*`:
+  right-edge headers pad by its width, full-window overlays start below it.
 - The onboarding window must be native Light before its first renderer paint; normal product windows start from the committed theme ([main/AGENTS.md](main/AGENTS.md#startup-theme)).
   An automatic login launch may suppress the initial product window, but onboarding and deep-link launches must remain visible during normal product use. Unpackaged E2E windows are the exception: they stay hidden unless `LODY_E2E_SHOW_WINDOW=1` and always disable background throttling.
 - `sessionControl.send` streams intermediate responses on `sessionControl.response`
@@ -92,6 +92,9 @@ native-dependency, and OSS-composition rules stay in `apps/electron/AGENTS.md`.
   other right-click and yields to it on images.
 
 ## Local file resources
+
+- Markdown link discovery uses the shared resolver after disk-machine validation.
+  It returns identities without resources; the selected path is reauthorized on read.
 
 - Electron previews local files directly after matching the target to its on-disk
   machine identity; never require daemon liveness or protocol metadata. Relative

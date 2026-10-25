@@ -1,7 +1,7 @@
 # apps/cli/src/session
 
 Session lifecycle on the daemon side: watching for user turns, running them through an ACP
-agent, and the sagas around them (fork, edit-and-resend, preparation, worktrees). Binding
+agent, and the sagas around them (fork, edit-and-resend, worktrees). Binding
 rules live in [AGENTS.md](AGENTS.md) and [worktree/AGENTS.md](worktree/AGENTS.md); this file
 is the responsibility index and background.
 
@@ -15,6 +15,16 @@ CLI/MCP orchestration contract is specs/session-orchestration.md.
 | Execution        | [Execution service](session-execution-service.ts) | Owns turns, steer results, cancellation, and raw-request drain.                      |
 | Process lifetime | [Session](session.ts)                             | Owns ACP resources, confirmed termination, and bounded Codex refresh-start recovery. |
 
+## Terminal notification facts
+
+Execution publishes typed terminal facts using the frozen invocation requester and
+input turn identity. Input author provenance determines result audience; Session
+containment does not. `onTurnOutcome` is attempted once, even on failure; its consumer
+publishes the latest desktop projection and submits mobile independently. Installing
+this consumer disables the legacy execution completion sender. Older embedders retain
+that callback. No notification journal, retry or replay. See [notification ownership rules](../lib/notifications/AGENTS.md).
+A notification failure cannot replay Agent execution.
+
 ## Files
 
 - `session-dispatch-watcher.ts` — the current dispatch entry: watches
@@ -27,16 +37,26 @@ CLI/MCP orchestration contract is specs/session-orchestration.md.
 - `session-dispatch-logic.ts` — pure decision functions for the watcher (testable).
 - `roost-node-session.ts` — owns Roost history reads/writes and its bounded active-branch
   page cache; `roost-session-backend.ts` joins it to the existing Loro control plane.
+- `roost-content-patches.ts` preserves an existing text node through a verified
+  tail-item split; `roost-message-state.ts` preserves an unchanged large patch
+  when its array position changes. Both stage and compare the exact final JSON
+  before using cheaper existing ContentOps, otherwise retaining the ordinary diff.
 - `roost-writer-identity.ts` — persists the replica's signing identity in private
   application data, independent of login credentials and the system credential store.
 - `roost-history-generation.ts` — stages structural replacements privately and
   atomically activates them, fencing writes through superseded handles.
+- `roost-history-changes.ts` — durable semantic receipts over verified native event intervals;
+  owner-scoped checkpoints recover missed logical edits without rereading unchanged bodies.
+- `roost-history-change-codec.ts` — lossless v2 storage for those receipts, retaining complete
+  identities, cursor intervals and structural/reset evidence.
 - `roost-history-diagnostics.ts` — correlates local Worker causes and runtime details
   with the safe error reference returned by history RPC.
 - `session-history-owner.ts` — native Effect readiness barrier for history RPC; waits
   for this session's owner/backend metadata and releases its observer on every exit.
-- `roost-rpc-session.ts` — one-shot Cloud CLI history services backed by owner RPC;
-  `lib/command-runtime.ts` supplies the same composition for sessions, export and MCP.
+- `roost-rpc-session.ts` — Cloud CLI history services backed by owner RPC;
+  `lib/command-runtime.ts` supplies the same composition for standalone commands and,
+  through `routeRemoteOwnedSessionHistory`, for Sessions the cloud daemon touches on
+  other machines.
 - `turn-history-gate.ts` — ordering barrier for RPC fast-path turns. Created in
   message-handler's `beginConversationTurn`, stored/disposed via `SessionTransientStore` turn
   state; it creates the assistant entry when it opens.
@@ -54,7 +74,8 @@ CLI/MCP orchestration contract is specs/session-orchestration.md.
   session and process lifecycle, workdirs, worktrees, sandboxed spawning, ACP terminals.
   Managed GitHub credential preparation excludes local projects and their worktrees;
   each managed runtime owns a scoped credential lease, retained across adoption.
-- `session-preparation-service.ts` — process-local speculative ACP lease/state owner.
+- `session-start-stage.ts` — start step names and the user-visible failure text
+  ([start failures](#start-failures)).
 - `session-fork-service.ts` / `session-fork-operation-store.ts` — the fork saga and its
   machine-local marker store.
 - `session-edit-and-resend-service.ts` — same-session replacement of the last normal User turn.
@@ -194,6 +215,13 @@ inside that same ACP process. Creation/restoration retain their cancellation fen
 initialization completes; those fences must not override a later `keep` during configuration.
 Binding a ready session alone does not authorize termination.
 
+An ordinary user turn can retry a stale ACP prompt once before observing output; Inbox
+submissions never retry. Exact-instance retirement detaches lifecycle listeners before
+termination, preserving the assistant entry and output owner through resume. Until retirement
+succeeds, the disconnected-execution release path retains the old Session for cleanup,
+including missing-session errors and Stop. Success clears the old prompt's cancellation drain,
+so Stop reaches the reusable replacement.
+
 History promotion and activation can fail independently. `promotion-failed` preserves proof
 of non-delivery. `recoveryOwned` tells the renderer not to publish a conflicting activation;
 it retries that proven failure once through the daemon and surfaces persistent failure.
@@ -292,18 +320,13 @@ checkout. Managed credential helpers also cover checkout filters and LFS; non-ow
 host children scrub inherited GitHub tokens. `session-credentials.ts` bridges the
 broker's Effect-scoped acquisition into the existing Promise Session lifecycle.
 Each acquisition has its own token and pinned file; neither enrollment nor release
-uses a Session ID lookup. `SessionConfig` carries no credential policy. Preparation
-owns the lease until adoption transfers it to the same Session; failures before
-Session creation release it too. Validation on create, continue, recovery and steer
-checks that runtime's lease and trusted owner. Owner changes revoke it and retire
-the old runtime, since children retain their old environments. Operations are not replayed.
+uses a Session ID lookup. `SessionConfig` carries no credential policy. Session
+creation owns the lease and a failed creation releases it. Validation on create,
+continue, recovery and steer checks that runtime's lease and trusted owner. Owner
+changes revoke it and retire the old runtime, since children retain their old
+environments. Operations are not replayed.
 
-`preparation-control.ts` owns the Effect TTL fiber separately from runtime resources.
-Claim closes this control scope without closing the adopted runtime's credentials.
-The synchronous admission/claim facade remains; raw ACP/worktree creation is still
-owned by the existing Promise lifecycle, not treated as automatically interruptible
-by Effect. Retirement stays visible until cleanup succeeds; a failed cleanup blocks
-same-session replacement rather than pretending resources were released. See [the contract](../../../../specs/github-identity-fallback.md) and
+See [the contract](../../../../specs/github-identity-fallback.md) and
 [worktree rules](worktree/AGENTS.md) for ownership, write non-replay and isolation.
 
 ### Commit identity
@@ -323,20 +346,58 @@ Lody/GitHub identity and can never inherit the machine owner's Git config; if no
 identity exists, the neutral LodyAI identity is used. The cloud composition root owns hosted
 user resolution because the daemon does not own an end-user browser session; the local access
 port resolves only its synthetic owner and never performs network I/O. PR and push identity
-itself comes from the conversation-owner GitHub credential, not from git config. Identity changes update the host Session environment without restarting ACP or its sandbox,
-including adopted preparations. Existing ACP children retain their launch environment; live
+itself comes from the conversation-owner GitHub credential, not from git config. Identity
+changes update the host Session environment without restarting ACP or its sandbox.
+Existing ACP children retain their launch environment; live
 identity propagation into adapter-owned Git commands remains unresolved.
 
-### Speculative preparation
+### Start failures
 
-Peek and claim are synchronous published-resource snapshots. A prepared resource may reuse its
-open target-machine Flock to synchronously resolve launch config, but dispatch and claim
-rescan the current row. Durable creation claims the marker only when repo, source, and base
-branch target identity match, runs setup, then permits the first prompt. A missed claim returns
-any retiring cleanup barrier even after its lease has disappeared. Cold creation, discard,
-replacement preparation and shutdown join that barrier, including resources returned after
-cancellation. This can delay cold startup until cleanup finishes; otherwise a retired
-preparation could delete the newly reused directory. Unrelated Sessions remain independent.
+`SessionManager.createSession` reports each start step through `onStartStage` as it
+begins: credentials, working directory, worktree, worktree setup script (reported only when a
+script actually starts), agent sandbox, Git identity, agent runtime, then agent start. The execution service keeps the last step on the turn and clears it once a Session
+is bound. A failure is recorded as `<step> failed: <message>`, using
+`session-start-stage.ts`, so the user sees where start-up stopped. Authentication failures
+keep their own message. The error itself is never wrapped: the restore and create paths
+classify it by identity to choose sign-in, the history-replay fallback or a generic failure.
+When a start fails, cleanup terminates the partial Session and releases its credentials.
+Each cleanup failure is logged, and the original error is rethrown. These are rules:
+never wrap the start error, and never let cleanup replace it. Failure text uses
+`formatReportedError`, which names the type and cause of an error whose message is empty,
+which a `Data.TaggedError` without a message getter produces. Only Error and string causes
+are described. Classifiers keep using `formatErrorMessage`, whose output does not change.
+See the
+[decision](../../../../.agents/notes/implemented/bug-fix/2026-10-16-session-start-failure-attribution.md).
+
+`startWithTransientRetry` in the execution service starts again after a temporary OS
+failure (`EAGAIN`, `EMFILE`, `ENFILE` or `ENOMEM` anywhere in the cause chain), up to three
+attempts with 1- and 3-second delays from `SESSION_START_RETRY_DELAYS_MS`, each jittered
+over its upper half. Before each delay it publishes `Retrying after a temporary system error`
+as presence detail, and after the delay it checks for Stop. Each attempt is a fresh
+`createSession`. A failed attempt whose cleanup could not terminate its agent or release its
+credentials is marked (`recordIncompleteStartCleanup`) and never retried. The whole
+service shares `SESSION_START_RETRY_BUDGET` (6 retries per minute), because a temporary OS
+failure usually hits every Session at once. `sessionStartRetryMode` decides how to repeat.
+A new Session repeats unchanged if it failed before its worktree setup script. If it got past
+the script, it repeats as a resume, which skips the script. It never repeats if it failed
+while the script was running. A restore always repeats unchanged, because its existing
+worktree already skips setup. Authentication, resume and every other error fail on the first
+attempt. See the
+[retry decision](../../../../.agents/notes/implemented/feature/2026-10-16-session-start-transient-retry.md).
+
+### No draft preparation
+
+Every Session starts its ACP process and worktree when its first turn is dispatched.
+Draft preparation, which started both while the user typed, was removed: its runtime was
+almost never adopted, and discarding it cost more than a cold start
+([decision](../../../../.agents/notes/implemented/simplification/2026-10-16-remove-draft-session-preparation.md)).
+`session/prepare` and `session/prepare-cancel` still parse, because older desktops send
+them. The daemon answers both at once without work; prepare reports an accepted duplicate
+so an older desktop holds one lease per draft instead of re-asking after every pause.
+`worktree/legacy-speculative-worktrees.ts` handles worktrees an older daemon prepared:
+creation claims the Session's marker and reruns setup on its worktree. Only a worktree no
+Session adopted is rebuilt for a target mismatch: an adopted one keeps its branch, which
+resume restores by name. A sweep removes orphans whose Session never became durable.
 
 Memory identity references travel with turn configuration. `Session.createAgent` maps
 them through `../lib/memory-providers.ts` at spawn; the execution service restarts a
@@ -351,6 +412,152 @@ The shared renderer uses the existing local IPC or remote history RPC bridge;
 Web/iOS clients need no Node addon. The owning machine must be available for RPC
 reads; browser-local IndexedDB replicas and offline sync are separate work.
 Runtime packaging and verification: [native runtime note](../../../../.agents/notes/proposed/architecture/2026-10-09-roost-native-runtime.md).
+
+The owner retains decoded bodies for its installed physical message snapshots.
+Content refresh converts changed rows and reuses unchanged snapshots; identity
+index construction needs no body conversion. Patch planning may reuse decoded
+content only for the exact installed physical row. Native authoritative reads,
+generation/cursor checks and checkpoint publication still govern updates and
+recovery. Private semantic mutation plans share untouched values and carry text
+append intent into Native. Owned path copies still pass through the same logical
+projection; public reads return detached values. Incremental text analysis retains
+bounded suffix context, and complex tags keep the established full parser.
+Confirmed SDK directory transitions advance local tail membership without reloading
+unchanged rows. Foreign work and uncertain results retain authoritative recovery.
+See the [incremental projection investigation](../../../../.agents/notes/proposed/architecture/2026-10-22-roost-owner-incremental-projection.md).
+
+Guarded batch writes compare the bound generation pointer/epoch in the same
+transaction as content and receipts. Exact locally certified content checkpoints
+can install staged overlays, including a proven absent overlay, and carry their
+settled cursor into the next chunk. Publication still polls for later events and
+reloads foreign work. A retained goal value is reusable only for the same host
+and freshly observed cursor. See the
+[append CPU investigation](../../../../.agents/notes/proposed/architecture/2026-10-23-roost-append-cpu-structure.md).
+
+Roost progress retains cursor, revision, count and change hints. Operation identities
+are verified by Native receipts; the control notification does not repeat an
+unused operation ID. Publication order, per-action persistence and the existing
+control schema/readers are retained. See the
+[control storage investigation](../../../../.agents/notes/proposed/architecture/2026-10-23-roost-control-storage.md).
+
+Dispatch reads pending identities, requested turns and completion evidence from
+body-free indexes, then hydrates only the selected input. The complete marker
+must match the authoritative Native event cursor and history count; selection
+and body hydration share that observation. Loro captures its shallow directory
+and selected body synchronously. Missing or invalid Native indexes are repaired
+once from bounded coherent pages; valid persisted indexes do not scan old bodies
+on reopen. Explicit replay/export retain full history reads. See the
+[dispatch projection note](../../../../.agents/notes/proposed/architecture/2026-10-22-roost-dispatch-scalar-projection.md).
+
+Positional range reads use the same certified projection's position-to-business-ID
+mapping and hydrate only the selected rows' ordered physical segments. The version-2
+checkpoint certifies the mapping; its puts and rebuild completion share the existing
+index transaction. Before caching bodies, the reader rechecks the index marker,
+event cursor and resolved history generation, including index-only activation.
+An absent or damaged projection retains existing page traversal and diagnostics;
+a range read never initiates a full index rebuild or fills a partial replica.
+The body cache remains bounded. See the
+[position paging experiment](../../../../.agents/notes/proposed/architecture/2026-10-24-roost-position-paging.md).
+
+Latest-turn queries share `readLatestTurn` from session-data. It scans the latest
+40-row page first and reads older pages only when no readable match is present.
+The `accept_input_and_dispatch` activation guard uses this path too: a newly
+accepted tail input must not wait for unrelated old history bodies before its
+receipt. The [input acceptance lookup note](../../../../.agents/notes/proposed/bug-fix/2026-10-19-roost-input-acceptance-paging.md)
+records the cold-reopen native regression and its separate rollout from browser recovery.
+The manual [first-input benchmark](../../benchmarks/roost-first-input.mts) reopens
+identical synthetic snapshots, records acceptance timings and page reads, and
+keeps native SQLite durability distinct from the in-memory Loro reference.
+
+### Incremental replica recovery
+
+`sessionHistoryIncremental` v1 is negotiated separately from existing history paging.
+Checkpoint-bearing pages opt in with `withCheckpoint`; legacy page replies remain unchanged.
+`readChanges` verifies the previous checkpoint and returns complete changed identities plus
+any affected structural suffix, or an explicit reset. The native owner attaches semantic
+metadata to the final event of a content transaction. Complex SDK operations annotate
+their final event only after verifying the whole interval, or record a reset. Receipts
+contain no history body, signing material or executable command, and emit no outgoing event.
+A crash or foreign mutation that leaves an uncovered interval requires reset. A checkpoint
+cannot claim acceptance or execution, and must not be copied between unrelated owner views.
+
+Renderer v3 payloads retain full nonces, compact UUID lists, exact JSON for other IDs and
+optional structural positions. Native stores the full scope once per stream and owns
+the interval cursors. Reads scan bounded event pages and require complete interval coverage;
+an unannotated event is never skipped as evidence. Agent v2 identities/digests keep their
+direct index and compare absence inside the content transaction, including receipt-only
+operations with no event advance. Checkpoint tokens and RPC replies are unchanged.
+Session history protocol v3 uses a current Native published head and owner checkpoint
+observation. The head binds scope, cursor, revision, count and the latest logical change;
+eligible body edits commit it with content, compact receipts and derived indexes. RPC
+reads compare scoped checkpoints before and after reading, including across generations.
+Prepared generations have a durable head before activation and continue the prior revision
+under a head CAS. The owner requires `commit-metadata-v1`, `derived-indexes-v1`,
+`receipt-checks-v1` and `commit-observation-v1`; use matching coordinated Native/SDK/CLI
+and renderer builds. This boundary does not change the Native container or wire frames.
+The retired Loro history cursor is neither written nor read for publication. Existing
+experimental control-cursor sessions are refused without migration or deletion.
+
+For eligible published-body edits, the SDK plans its own binding/publication progress
+under settled cursor, identity/member and waiting-dependency comparisons. Native installs
+these conditional indexes, application receipts and a staged known goal projection in the
+content transaction only after proving the entire nonempty event interval is local and
+ends at the planned cursor. Only a confirmed `derivedIndexesApplied` result for the same
+host/cursor/value can suppress the later goal index write. Ordinary metadata is not that
+proof. Pending remote events, unknown goals, seals, other commands and lost replies retain
+full catch-up and recovery. No private SDK index formats are copied into Lody.
+See the [atomic metadata decision](../../../../.agents/notes/implemented/architecture/2026-10-21-roost-atomic-commit-metadata.md).
+
+Normal repairs request affected bodies with the change interval in one reply, bounded at
+500 changed/suffix bodies. Larger repairs use checkpoint-protected ranges. The renderer
+atomically commits bodies, positions, revision and checkpoint. Coherent replies may advance
+behind newer control hints and immediately catch up again, so streaming does not need to
+stop for a stable observation. Body-only edits retain cached directory cursor validity.
+A successful delta repair finishes even for a partial tail cache, without rereading
+the unchanged latest page.
+
+`sessionHistoryPatches` v1 additionally negotiates `withPatches` on changes/watches.
+For a verified interval of at most 256 native edits to unsealed primary messages
+without successor segments or state/permission overlays, replies carry content operations instead of accumulated
+bodies. Operations use Unicode scalar offsets and name their exact base checkpoint.
+Structural edits, seals, state/permission records, projection-only defaults and
+unavailable evidence retain complete-body reads. The renderer prepares detached
+replacements; an unusable patch recovers its body at the target checkpoint before
+the existing atomic cache transaction. Old requests and database formats are unchanged.
+See [content patch decision](../../../../.agents/notes/implemented/bug-fix/2026-10-20-roost-history-rpc-patches.md).
+
+Unprotected body writes invalidate patch eligibility while retaining a recovery cursor for
+complete changed bodies. That repair commits before relative patches resume; a partial page
+cannot certify an untouched prefix at a different checkpoint. The previous durable projection
+survives failed repair. Supersession retries immediately; storage and transport failures
+retain recovery backoff. Local control reads have a separate bounded pool from writes;
+remote RPC reserves write/control pools and rejects excess ordinary work without blocking
+send intake. Detailed decision and verification:
+[Roost incremental recovery](../../../../.agents/notes/implemented/bug-fix/2026-10-16-roost-incremental-history.md).
+
+Initial population and missing or rejected coverage read only the latest coherent window.
+An explicit reset atomically replaces the active cache in the other slot even when its
+Native publication revision is equal or consecutive, provided the captured head has not changed.
+Last-change hints cannot repair unknown coverage. Older pages load on demand, using a
+checkpoint-protected absolute range where supported; ordinary refresh never sweeps the
+whole history. Genuine reset invalidates old pages until fetched again, including for
+offline use; ordinary complete-change repair preserves the retained prefix.
+See [bounded cache recovery](../../../../.agents/notes/implemented/bug-fix/2026-10-21-roost-cache-recovery-network-cost.md).
+
+Cold readers observe backend metadata before composition; provisional absence remains
+pending until explicit identity or the session's selected metadata source restores.
+An empty history list is not legacy evidence. Owner capabilities remain live.
+Restoration is a finite identity barrier; a still-missing owner or a known Roost
+cursor waits for metadata changes rather than selecting legacy history.
+Independently negotiated `sessionHistoryWatch` v1 observes the committed checkpoint
+through local `watchChanges` or encrypted remote `session/history-watch`. Publication
+wakes the wait immediately; a 15-second deadline bounds idle waits without occupying
+the native Worker or writer queue. Actual body reads acquire bounded read capacity after
+waking, and idle replies transfer no history bodies. Active readers therefore recover
+through Native publications, independently of the session control document. Each bridge owns one refresh; release and
+hidden/offline remote views stop new observations. Local IPC remains usable offline.
+[Peer-reader readiness and observation](../../../../.agents/notes/implemented/bug-fix/2026-10-16-roost-peer-reader-readiness.md)
+records the lifecycle, protocol limits and verification.
 
 ### Immutable input acceptance
 
@@ -456,12 +663,42 @@ hydration. Reverse pages carry their own total count and absolute positions. Cur
 rejection after a branch rewrite is recoverable by refreshing the loaded window;
 it never authorizes switching back to Loro or reading a superseded published suffix.
 
-ACP batch appliers can mutate item arrays. The Roost adapter applies them to a
-detached working copy, preserving the before-image used to decide what to persist.
+ACP batch appliers can mutate item arrays. The Roost adapter plans them on private
+copy-on-write drafts, preserving the before-image used to decide what to persist.
 Content changes refresh only affected primary bodies. Sealed-turn corrections
-use mutable SDK state records anchored to their primary; permission responses
+use `lody-message-state` version 1 records: field, Unicode-text and array operations
+relative to the exact immutable primary Turn ID. The owner reconstructs logical
+entries for existing RPC readers. Whole-entry state records remain readable in a
+supported container and convert on their next mutation; sealed primary bytes stay
+unchanged. Reopening delta states requires this adapter or newer. SDK fallback
+batches use owner-local recovery: the compact pending
+receipt and private journal commit together, then effects, publication, seal and
+journal retirement commit together. Moving unfinished work requires the whole
+owner database and its paired host identity; Turn exports carry committed history.
+The [message-copy repair](../../../../.agents/notes/implemented/bug-fix/2026-10-20-roost-message-storage-copies.md)
+records the format, release dependency and measured storage reduction. Permission responses
 remain independent SDK records projected onto the matching tool. Responding does
 not seal the assistant or interrupt its output.
+Existing eligible unsealed primary/state records use guarded native field/text edits,
+with compact publication digests in `lody_agent_operation_receipts_v2`, committed in
+the same `writeBatch`. Canonical UUID agent identities use 49 key bytes and 33 value
+bytes, retaining the full operation and content digests; other identities use a
+disjoint canonical JSON key tag. This experimental format has no v1 reader or
+migration: a bounded presence check rejects generations containing v1 receipts
+before recovery or writes. Start a new session; existing data is not deleted.
+This owner-local journal has no command/body/baseline snapshots; lookup retains
+SDK receipts from structural writes and generation ancestors. Creation, stitched or
+sealed targets, permissions, immutable human input and branch contracts retain their
+SDK path. A failed native write never falls through to a second write path.
+The [receipt encoding change](../../../../.agents/notes/implemented/bug-fix/2026-10-21-roost-agent-receipt-encoding.md)
+records the format break and whole-session validation.
+Native inserted items/fields use the same JSON encoding as SDK content: absent object
+fields are omitted and absent array values become `null`. Normalize only changed
+subtrees; unchanged message bodies are not serialized for each delta. The semantic
+change receipt starts at the command's initial cursor, even when its bounded ACP
+batches advance the native write guard between chunks.
+The [write-amplification repair](../../../../.agents/notes/implemented/bug-fix/2026-10-16-roost-storage-write-amplification.md)
+records storage budgets and the unchanged existing-data/outbox retention limits.
 Ordinary Edit & Resend reuses the sealed prefix through the SDK's branch activation
 inside the same stream/view. The Lody session id and owner saga do not change.
 An application-owned signed epoch commits in that native transaction and fences
@@ -481,14 +718,19 @@ use eight concurrent lanes; a lane issues at most one native request at a time.
 Per-item ACP receipts commit with their output and remain discoverable through
 prior generations, so a lost reply or overlapping retry cannot replay a prefix.
 Count and position reads refresh after a lost activation reply. The local write
-barrier republishes the committed projection before RPC binds its control revision;
+barrier republishes the committed projection before RPC binds its Native publication checkpoint;
 it never retries an indeterminate history action.
-External cursor refreshes share the local write queue so an earlier branch read
+External Native commit refreshes share the local write queue so an earlier branch read
 cannot overwrite a later mutation's projection; disposal rejects pending reads.
 Cloud one-shot managers inject owner RPC services and never open a caller-local
-Roost database. Open-ended directory reads clip to the owner count and use at most
+Roost database. The cloud daemon routes per Session: another machine's Sessions use
+owner RPC, its own (or not-yet-known owners) use the installed local owner, and the
+routing leaves its execution documents' auto-read policy unchanged. Open-ended directory reads clip to the owner count and use at most
 500 rows per RPC, restarting when the durable revision moves. Fork and Edit & Resend
 retain their owner sagas; process-local snapshot/rollback handles do not cross RPC.
+The [Roost validation workflow](../../../../.agents/docs/roost-validation.md) owns
+repeatable dependency preparation, suite selection, fixed performance workloads
+and failure diagnosis across Lody and Roost.
 The production SQLite regressions live in
 [`roost-session-backend-contract.test.ts`](../../tests/roost-session-backend-contract.test.ts).
 The synthetic [history benchmark](../../benchmarks/roost-history.mts) exercises
@@ -519,6 +761,25 @@ WorktreeGit and Clock under the caller's existing repo lease. `runWorktreeLegacy
 executes this and observation programs through the same FileLocks runtime; a failed
 metadata scratch release retains its path and bounded retry capability. Bare
 clone/fetch, full mutations and long-lived GC still require their own native owners.
+
+The semantic reducer and history-action planner record authored paths while
+sharing untouched private values. Persistence compiles only the affected validated
+top-level fields; actual text rewrites still use compact scalar-indexed splices.
+The owner stages all supported content operations on private SDK/application
+snapshots, including an existing state overlay. It may install them only when the
+atomic commit certifies the complete event interval and the window is unchanged;
+state reuse also requires the derived-index group to have applied. A simultaneous
+seal reads its authoritative header/hash. Unknown operations, uncertain replies and
+external changes retain authoritative refresh. Checkpoint publication still verifies ownership. Sealed window rows may reuse
+private decoded content only within the same SDK handle, with the complete
+physical identity, sequence, seal hash and parents unchanged. SDK-owned branch
+selection and current state/permission overlays still run. New windows share
+one decode between projection and installation. Sealing an installed primary
+refreshes that row's authoritative sequence/hash; publication still reloads the
+branch if its event interval includes foreign or unaccounted work.
+Resumed state composes verified text appends and rebuilds only affected fields'
+baseline-relative deltas for other changes. Projection uses private path copies
+instead of deep-copying the primary; public reads remain detached.
 
 ## Conversation-tree stop
 
@@ -555,3 +816,55 @@ The Session sandbox persists incomplete identity before spawn and continuously a
 ACP/terminal process roots. Execution retains every attached Session owner until release,
 including replacements within one turn. Restart probes require explicit completeness and
 absence of every root/group; an initial snapshot alone is insufficient.
+A child error with no PID proves that spawn created no process: it still rejects
+the command, but does not make resource identity permanently incomplete. This
+exception matches the actual child error; journal, setup and cleanup failures
+remain uncertain, as do other acquisitions already marked uncertain.
+
+Native commit observation has one acknowledged callback in flight per pooled client;
+stream identities and changed index keys coalesce with bounded memory. The owner watches
+body events plus generation/epoch keys, so its own index-only publication/repair writes do
+not trigger a reload loop. A fresh bootstrap hint closes the private-load/admission gap.
+Observers wait outside the serial Native request lane and never retain a SQLite transaction.
+Unsubscribe does not stop writers. These wakes cover the shared Store owner, not independent
+processes opening the same file. The command RPC reader and renderer resume from their
+persisted scoped checkpoints through the existing `watchChanges` transport.
+
+### Project worktree preparation
+
+`WorktreeManagerConfig.projectMember` places a root Member under the frozen Project
+root while retaining the source repository's storage and lock. Placement-aware managers
+are not cached by repo ID alone. `worktree/project-submodules.ts` provides native Git
+validation, gitlink checkout and persistent backup/restore primitives.
+`project-worktrees.ts` materializes the frozen group in parent-first order and publishes
+each successful member branch before continuing. `WorkspaceGitService` shares one queue
+per document manager and owner Session for materialization receipts and observations;
+`projectRun` is one atomic metadata value, never a nested merge. Client writes stop at
+the creation snapshot. `project-worktree-archive.ts` backs up children before parents, persists submodule refs,
+then deinitializes submodules and removes root worktrees. Unresolvable members retain
+the directory for GC retry. See the
+[single-writer decision](../../../../.agents/notes/proposed/architecture/2026-10-16-multi-repo-projects.md#runtime-storage-finding-and-worktree-primitives).
+
+Non-Git Project group members are registry-backed extra roots. Member probing treats Git
+exit 128 with either parent-directory or mount-boundary discovery exhaustion as non-Git;
+other failures remain errors. `project-member-access.ts`
+resolves authority, reconciles links and prevents archive traversal into original directories.
+ACP startup negotiates access after initialize; per-root file state shares the session owner
+and physical-file save queues. See the multi-root integration section of the Project group Note.
+
+Repository Members (`github` with `preferLocal`) resolve against the executing
+machine's local-project catalog and re-observe each candidate's remote. The owner
+persists `repositoryCheckout` before creating branches, pinning credentials and
+archive/restore storage. Local copies use native auth, including in mixed managed
+groups; PR polling keeps native and managed targets in separate batches. Missing
+copies fail with `project_repository_not_on_machine` when managed cloning is absent.
+
+Project preparation reports the existing `git-clone` presence stage during repository
+resolution, member checkout, submodule initialization and setup. These are actual
+milestones, not periodic keepalives. Up to four independent checkouts run together;
+selected submodules wait for their parent, and siblings sharing parent Git config
+are serialized. Branch receipts publish serially, and failures drain started work
+before releasing the Project owner. Selected members initialize non-recursively
+with their own credentials; remaining submodules initialize afterward with four Git
+fetch jobs per command. Local selected copies lend objects via `--reference` and
+`--dissociate`, so source GC cannot invalidate a checkout. Setup retains the prior serial traversal order, including parents before children.

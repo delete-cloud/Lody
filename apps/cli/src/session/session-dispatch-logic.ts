@@ -25,6 +25,7 @@ import {
   type SessionInputBlock,
   type SessionMeta,
 } from '@lody/shared';
+import type { SessionDispatchEntry } from './session-dispatch-history';
 
 // ── Snapshot types ──────────────────────────────────────────────────────────
 
@@ -40,6 +41,8 @@ export type SessionDispatchSnapshot = {
   hasReusableSession: boolean;
   /** True while edit-and-resend is replacing the durable history tail. */
   hasRewriteBarrier: boolean;
+  /** Present while the previous turn's release is unconfirmed; it still blocks successors. */
+  releaseBlocked?: { reason: string };
 };
 
 /** Metadata and process-local signals that decide whether to open a Session Doc room. */
@@ -50,10 +53,10 @@ export type SessionWatchSnapshot = {
   hasAccessRetry: boolean;
 };
 
-export function findLastHistoryEntry(
-  history: SessionHistoryInput[],
+export function findLastHistoryEntry<T extends SessionDispatchEntry>(
+  history: readonly T[],
   turnId: string
-): SessionHistoryInput | undefined {
+): T | undefined {
   for (let index = history.length - 1; index >= 0; index--) {
     const entry = history[index];
     if (entry?.id === turnId) return entry;
@@ -69,7 +72,7 @@ export function findLastHistoryEntry(
  * arrived yet. Once it is here and terminal, waiting cannot change the answer.
  */
 export function isActivationAwaitingHistory(
-  history: SessionHistoryInput[],
+  history: readonly SessionDispatchEntry[],
   pendingUserTurnId: string
 ): boolean {
   const entry = findLastHistoryEntry(history, pendingUserTurnId);
@@ -85,7 +88,13 @@ export function isActivationAwaitingHistory(
 export type DispatchAction =
   | {
       type: 'noop';
-      reason: 'not-owned' | 'archived' | 'rewrite-barrier' | 'pending-create' | 'active-session';
+      reason:
+        | 'not-owned'
+        | 'archived'
+        | 'rewrite-barrier'
+        | 'pending-create'
+        | 'release-blocked'
+        | 'active-session';
     }
   | { type: 'reset-stale-status'; statusType: string }
   | { type: 'no-dispatchable-turn' }
@@ -152,7 +161,7 @@ function getImportedAcpSourceAcpSessionId(meta: SessionMeta): string | undefined
   return externalHistory?.sourceAcpSessionId;
 }
 
-function isImportedAcpReplayUserTurn(entry: SessionHistoryInput, meta: SessionMeta): boolean {
+function isImportedAcpReplayUserTurn(entry: SessionDispatchEntry, meta: SessionMeta): boolean {
   const provider = meta.externalHistory
     ? getLocalProjectHistoryProviderKey(meta.externalHistory.provider)
     : null;
@@ -202,6 +211,9 @@ export function resolveSessionDispatchAction(
   }
   if (hasBlockingPendingCreate) {
     return { type: 'noop', reason: 'pending-create' };
+  }
+  if (snapshot.releaseBlocked) {
+    return { type: 'noop', reason: 'release-blocked' };
   }
   if (hasActiveTurn) {
     return { type: 'noop', reason: 'active-session' };
@@ -302,10 +314,10 @@ export function resolveSessionCancelAction(
  *
  * Returns the first matching entry (chronological scan), or null.
  */
-export function findNextDispatchableUserTurn(
-  history: SessionHistoryInput[],
+export function findNextDispatchableUserTurn<T extends SessionDispatchEntry>(
+  history: readonly T[],
   meta: SessionMeta
-): SessionHistoryInput | null {
+): T | null {
   // Concurrent queue promotion and steering can insert the same turn twice.
   // Match readTurn/updateEntry: only the last stored copy owns that identity.
   const lastPositions = new Map(history.map((entry, index) => [entry.id, index]));

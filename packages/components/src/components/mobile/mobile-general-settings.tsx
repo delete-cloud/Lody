@@ -9,8 +9,6 @@ import { Spinner } from '@lody/ui/spinner';
 import { Switch } from '@lody/ui/switch';
 import { toast } from '@/lib/toast';
 import {
-  autoArchiveOnPrClosedAtom,
-  autoArchiveOnPrMergedAtom,
   electronSessionCompletionNotificationsEnabledAtom,
   iosLiveActivitiesEnabledAtom,
   mobileKeyboardActionAtom,
@@ -41,7 +39,6 @@ import { isMobileKeyboardAction } from '@/lib/mobile-keyboard-action';
 import { usePostHog } from '@posthog/react';
 import { capturePostHogEvent } from '@/lib/posthog-analytics';
 import { QueuedMessageBehaviorControl } from '@/components/settings/queued-message-behavior-control';
-import { useAppCapability } from '@/lib/app-platform';
 import { getIpcServices } from '@/lib/electron-ipc-client';
 import { useElectronAutoLaunch } from '@/hooks/use-electron-auto-launch';
 
@@ -70,7 +67,6 @@ function getDesktopNotificationHintKey(platform: ElectronPlatform): string {
 
 export function MobileGeneralSettings() {
   const { t } = useTranslation();
-  const githubIntegrationAvailable = useAppCapability('githubIntegration');
   const postHog = usePostHog();
   const user = useAtomValue(userAtom);
   const [electronCompletionNotificationsEnabled, setElectronCompletionNotificationsEnabled] =
@@ -83,8 +79,6 @@ export function MobileGeneralSettings() {
     sessionSidebarCodeChangesOnlyAtom
   );
   const [queuedMessageBehavior, setQueuedMessageBehavior] = useAtom(queuedMessageBehaviorAtom);
-  const [autoArchiveOnPrMerged, setAutoArchiveOnPrMerged] = useAtom(autoArchiveOnPrMergedAtom);
-  const [autoArchiveOnPrClosed, setAutoArchiveOnPrClosed] = useAtom(autoArchiveOnPrClosedAtom);
   const [preventSleepEnabled, setPreventSleepEnabled] = useState(true);
   const clearCache = useClearCache();
   const isMobile = useIsMobile();
@@ -606,8 +600,8 @@ export function MobileGeneralSettings() {
           >
             {isProcessing ? (
               <span className="flex h-5 w-9 items-center justify-center">
-                  <Spinner size="small" label={t('common.loading', 'Loading...')} />
-                </span>
+                <Spinner size="small" label={t('common.loading', 'Loading...')} />
+              </span>
             ) : (
               <Switch
                 id="notification-toggle"
@@ -660,26 +654,6 @@ export function MobileGeneralSettings() {
           </MobileSettingsSection>
         ) : null}
       </MobileInlinePickerCoordinator>
-
-      {githubIntegrationAvailable ? (
-        <MobileSettingsSection
-          title={t('settings.autoArchive.title', 'Auto-archive sessions')}
-          description={t('settings.autoArchive.description')}
-        >
-          <MobileSettingsRowGroup>
-            <MobileSettingsRow
-              label={t('settings.autoArchive.onPrMerged', 'When the PR is merged')}
-            >
-              <Switch checked={autoArchiveOnPrMerged} onCheckedChange={setAutoArchiveOnPrMerged} />
-            </MobileSettingsRow>
-            <MobileSettingsRow
-              label={t('settings.autoArchive.onPrClosed', 'When the PR is closed')}
-            >
-              <Switch checked={autoArchiveOnPrClosed} onCheckedChange={setAutoArchiveOnPrClosed} />
-            </MobileSettingsRow>
-          </MobileSettingsRowGroup>
-        </MobileSettingsSection>
-      ) : null}
 
       <MobileSettingsSection title={t('settings.general.sessions.title', 'Sessions')}>
         <MobileSettingsRowGroup>
