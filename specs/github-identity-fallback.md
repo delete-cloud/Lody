@@ -34,19 +34,18 @@ not an OS sandbox against processes sharing the same user account.
 
 ## Runtime ownership
 
-A logical Session may have successive speculative and live runtime instances.
-Each managed instance owns a distinct credential lease and pinned context file,
-including when Session ID and owner are unchanged. Successful adoption retains
-that lease; cancelled preparation, failed startup and runtime termination release
-only the exact acquired generation. An old release must never revoke a replacement.
+A logical Session may have successive runtime instances, for example after an owner
+change retires the old one. Each managed instance owns a distinct credential lease and
+pinned context file, including when Session ID and owner are unchanged. Failed startup
+and runtime termination release only the exact acquired generation. An old release must
+never revoke a replacement.
 Local runtimes have no managed lease and never infer authentication from a broker's
 historical Session registration. Missing or released managed authority is an error,
 not permission to fall back to machine credentials.
 
-Preparation control (expiry/cancellation) ends on claim; adopted runtime resources
-continue until the runtime ends. Same-session replacement waits for successful
-retirement, including late resource creation. Failed cleanup remains observable
-and blocks replacement; a timeout or interrupted waiter does not prove release.
+Same-session replacement waits for successful retirement, including late resource
+creation. Failed cleanup remains observable and blocks replacement; a timeout or
+interrupted waiter does not prove release.
 
 ## Providers and availability
 
@@ -54,8 +53,15 @@ A local HTTP broker only supplies personal and App tokens. Its cloud requests
 have a 15-second deadline; helper requests wait 20 seconds including response
 bodies, so a helper always outlasts the broker's own cloud request. Successful credentials may be cached for up to 60 seconds,
 partitioned by repository, owner, machine and source and bounded by token expiry.
-Failures are not cached. Configuration changes can invalidate the cache; remote
-revocation while disconnected is not guaranteed instantaneous.
+Concurrent requests for one partition share one cloud request. A failed answer is
+reused for that partition so repeated requests do not ask the cloud again for an
+unavailable source; the source still fails and selection advances exactly as before.
+The CLI receives no reauthorization or configuration signal, so reuse is short where
+it can change the selected identity: per-command candidates reuse a failure for at
+most 5 seconds, enough to merge one command's helper calls. Background PR polling
+reuses one for at most 30 seconds. An expired CLI login is never reused, and a
+rejected token's invalidation clears the partition. Remote revocation while
+disconnected is not guaranteed instantaneous.
 
 Broker failure cannot prevent an eligible machine candidate. Broker startup
 failure is reported while trusted local context remains usable. Concurrent startup
@@ -106,7 +112,7 @@ host configuration; legacy custom remotes must be migrated to standard URLs.
 ## Evidence
 
 Implementation: `github-credential-runtime.ts`, `github-git-transport.ts`,
-`gh-shim-script.ts`, token broker/manager and session preparation in the CLI.
+`gh-shim-script.ts`, token broker/manager and session creation in the CLI.
 Owning suites exercise ordering, provider failure, context ownership, gh write
 non-replay, host checkout credentials and native recursive Git cloning with a
 failing broker. Production GitHub and Windows end-to-end validation remain open.

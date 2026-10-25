@@ -29,6 +29,13 @@ import {
 } from '@lody/shared/session-data';
 import type { SessionDocument } from '@/lib/loro/doc';
 import type { SessionAgentWrites } from '@/lib/loro/session-agent-writes';
+import {
+  readDispatchHistory,
+  readDispatchSelection,
+  type SessionDispatchEntry,
+  type SessionDispatchSelection,
+  type SessionDispatchSelector,
+} from './session-dispatch-history';
 import type {
   QueuePromotionInput,
   QueuePromotionResult,
@@ -47,6 +54,13 @@ export type RoostSessionBackendServices = {
   readonly sessionData: RoostSessionData;
   readonly agentWrites: SessionAgentWrites;
   readonly setPlan: (entries: readonly SessionPlanEntry[]) => Promise<void>;
+  readonly readDispatchHistory?: (
+    includeTurnIds: readonly string[]
+  ) => Promise<SessionDispatchEntry[]>;
+  readonly readDispatchSelection?: (
+    includeTurnIds: readonly string[],
+    select: SessionDispatchSelector
+  ) => Promise<SessionDispatchSelection>;
   readonly initialize?: (options: { readonly skipAutoRead: boolean }) => Promise<void>;
   readonly flushLocalWrites?: () => Promise<void>;
   /**
@@ -131,6 +145,23 @@ export class RoostSessionBackend implements SessionBackend {
     })) as SessionHistoryInput[];
   }
 
+  readDispatchHistory(includeTurnIds: readonly string[]): Promise<SessionDispatchEntry[]> {
+    return (
+      this.services.readDispatchHistory?.(includeTurnIds) ??
+      readDispatchHistory(this.history, includeTurnIds)
+    );
+  }
+
+  readDispatchSelection(
+    includeTurnIds: readonly string[],
+    select: SessionDispatchSelector
+  ): Promise<SessionDispatchSelection> {
+    return (
+      this.services.readDispatchSelection?.(includeTurnIds, select) ??
+      readDispatchSelection(this.history, includeTurnIds, select)
+    );
+  }
+
   async captureForkSnapshot(): Promise<SessionBackendForkSnapshot> {
     const storageSnapshot = await this.services.sessionData.snapshots.capture();
     return {
@@ -164,21 +195,7 @@ export class RoostSessionBackend implements SessionBackend {
   }
 
   async readLatestTurn(role: SessionTurn['role']): Promise<SessionTurn | undefined> {
-    const paged = this.history.readLatestDirectoryPage;
-    const older = this.history.readOlderDirectoryPage;
-    if (!paged || !older) return readLatestHistoryTurn(this.history, role);
-
-    let page = await paged(40);
-    for (;;) {
-      for (let index = page.rows.length - 1; index >= 0; index -= 1) {
-        const row = page.rows[index];
-        if (!row?.turnId || row.scalars?.role !== role) continue;
-        const read = await this.history.readTurn(row.turnId);
-        if (read.state === 'ready' && read.turn.role === role) return read.turn;
-      }
-      if (!page.hasMoreOlder || !page.cursor) return undefined;
-      page = await older(page.cursor, 40);
-    }
+    return readLatestHistoryTurn(this.history, role);
   }
 
   readTurn(turnId: string): Promise<SessionTurnRead> {

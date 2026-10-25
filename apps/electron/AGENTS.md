@@ -65,8 +65,8 @@ Root rules apply. For `src/**`, read module, IPC and window contracts in
   `scripts/cli-native-deps.mjs`.
   Roost's client, Worker, and binding retain relative paths; stage only the target prebuild,
   from the main package or its exact-version optional platform package.
-- `@lydell/node-pty` and `better-sqlite3 >= 13.0.2` use N-API artifacts. Stage the
-  target platform/architecture artifact; do not rebuild by Electron ABI.
+- `@lydell/node-pty` and `better-sqlite3 >= 13.0.2` use N-API prebuilds. Stage the
+  target platform/arch; never run `install-app-deps` or rebuild these by Electron ABI.
 - Every embedded-CLI descendant launched through `process.execPath` must inherit
   `ELECTRON_RUN_AS_NODE` when it exists. On packaged macOS, omitting it launches a
   second GUI app instead of Node.
@@ -79,10 +79,9 @@ Root rules apply. For `src/**`, read module, IPC and window contracts in
   them into `app.asar.unpacked`, assert the DeepSeek adapter plus all four pinned
   presets, then probe CLI `--help`, node-pty loading, and a real in-memory SQLite
   database before signing.
-- Keep `better-sqlite3 >= 13.0.2`, the Node-API 10 engine range
-  (`>=22.14.0 <23 || >=23.6.0`), the first-import guard in
-  `sqlite-runtime-support.ts`, and its tests aligned. Older runtimes can segfault
-  while loading the binding. Linux armv7 is unsupported.
+- Keep `better-sqlite3 >= 13.0.2`, Node-API 10, and the CLI first-import guard aligned.
+  [Node security floors and Electron backport limits](../../.agents/notes/implemented/bug-fix/2026-10-22-node-security-runtime-floor.md)
+  are separate. Linux armv7 is unsupported.
 - When upgrading `@lydell/node-pty`, audit package layout and Windows ConPTY binding
   names. Apply the staged asar-path repair after downloading target artifacts; a pnpm
   patch cannot cover cross-architecture packages fetched during packaging.

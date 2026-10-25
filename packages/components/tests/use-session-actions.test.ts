@@ -109,6 +109,12 @@ vi.mock('../src/hooks/use-authenticated-convex', () => ({
 }));
 
 import { runtimeAtom, type WorkspaceRuntime } from '../src/atoms/runtime';
+import { lodyPresenceNowMsAtom, lodyPresenceStatesAtom } from '../src/atoms/presence';
+import {
+  SessionArchiveConfirmationDialog,
+  useArchiveSessionWithConfirmation,
+} from '../src/components/sessions/session-archive-confirmation';
+import { initI18n } from '../src/i18n';
 import { docMetaCacheReadyAtom, sessionMetaCacheAtom } from '../src/atoms/doc-meta';
 import {
   editSessionRunConfigDraftAtom,
@@ -166,6 +172,16 @@ function editRunConfigDraft(
     edit: { type: 'config', configId: 'fast', value: false },
   });
   return lease;
+}
+
+type ConfirmedArchive = (sessionId: SessionId, options?: { confirm?: boolean }) => Promise<boolean>;
+
+function ConfirmedArchiveProbe({ onReady }: { onReady: (archive: ConfirmedArchive) => void }) {
+  const archive = useArchiveSessionWithConfirmation(useSessionActions().archiveSession);
+  useEffect(() => {
+    onReady(archive);
+  }, [archive, onReady]);
+  return createElement(SessionArchiveConfirmationDialog);
 }
 
 function ActionsProbe({ onReady }: { onReady: (actions: SessionActions) => void }) {
@@ -458,18 +474,24 @@ function createContainmentSessions(prefix: string, isArchived: boolean) {
   };
 }
 
-function createSessionMetaRepo(sessions: readonly SessionMeta[]) {
+function createSessionMetaRepo(
+  sessions: readonly SessionMeta[],
+  onChange?: (sessions: Record<string, SessionMeta>) => void
+) {
   const docs = new Map<string, Record<string, unknown>>(
     sessions.map((session) => [getSessionRoomId(session.id), { ...session }])
   );
+  const publish = () => onChange?.(Object.fromEntries(docs) as Record<string, SessionMeta>);
   const repo = {
     listDoc: async () => [...docs].map(([docId, meta]) => ({ docId, meta: { ...meta } })),
     getDocMeta: vi.fn(async (roomId: string) => ({ meta: docs.get(roomId) ?? {} })),
     upsertDocMeta: vi.fn(async (roomId: string, patch: Record<string, unknown>) => {
       docs.set(roomId, { ...(docs.get(roomId) ?? {}), ...patch });
+      publish();
     }),
     deleteDoc: vi.fn(async (roomId: string) => {
       docs.delete(roomId);
+      publish();
     }),
     openFlockDoc: vi.fn(async () => ({
       flock: { scan: () => [], set: vi.fn(), delete: vi.fn(), commit: vi.fn() },
@@ -484,6 +506,7 @@ function createSessionMetaRepo(sessions: readonly SessionMeta[]) {
       docs.get(getSessionRoomId(sessionId)) as SessionMeta | undefined,
     setMeta: (roomId: string, meta: Record<string, unknown>) => {
       docs.set(roomId, { ...meta });
+      publish();
     },
   };
 }
@@ -517,6 +540,7 @@ describe('useSessionActions', () => {
     container?.remove();
     container = undefined;
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   const renderActions = async (
@@ -1827,13 +1851,19 @@ describe('useSessionActions', () => {
         sessionMetaCache: { [getSessionRoomId(tree.rootSession.id)]: tree.rootSession },
       });
       await actions.archiveSession(tree.rootSession.id);
-      for (const session of tree.sessions) {
+      for (const session of [tree.rootSession, tree.tabSession]) {
         expect((await repo.getDocMeta(getSessionRoomId(session.id)))?.meta).toMatchObject({
           isArchived: true,
           status: { type: 'idle' },
         });
       }
-      for (const session of [unrelated, hintOnly, conflicting]) {
+      for (const session of [
+        tree.openedSession,
+        tree.openedFromTabSession,
+        unrelated,
+        hintOnly,
+        conflicting,
+      ]) {
         expect((await repo.getDocMeta(getSessionRoomId(session.id)))?.meta.isArchived).toBe(false);
       }
       expect(isLoroRepoDocDeleted(await repo.getDocMeta(getSessionRoomId(deleted.id)))).toBe(true);
@@ -1847,7 +1877,7 @@ describe('useSessionActions', () => {
         isTabClosed: true,
       });
       for (const session of [tree.openedSession, tree.openedFromTabSession]) {
-        expect((await repo.getDocMeta(getSessionRoomId(session.id)))?.meta.isArchived).toBe(true);
+        expect((await repo.getDocMeta(getSessionRoomId(session.id)))?.meta.isArchived).toBe(false);
       }
       await actions.archiveSession(tree.rootSession.id);
       await actions.deleteArchivedSession(tree.rootSession.id);
@@ -1859,7 +1889,7 @@ describe('useSessionActions', () => {
       for (const session of [tree.openedSession, tree.openedFromTabSession]) {
         const entry = await repo.getDocMeta(getSessionRoomId(session.id));
         expect(isLoroRepoDocDeleted(entry)).toBe(false);
-        expect(entry?.meta.isArchived).toBe(true);
+        expect(entry?.meta.isArchived).toBe(false);
       }
       expect(runtime.writer.flockRowPut).not.toHaveBeenCalled();
     } finally {
@@ -1953,10 +1983,14 @@ describe('useSessionActions', () => {
     });
     finish.resolve();
     await result;
-    for (const session of tree.sessions) {
+    for (const session of [tree.rootSession, tree.tabSession]) {
       expect(original.getSession(session.id)?.isArchived).toBe(true);
-      expect(replacement.getSession(session.id)).toEqual(session);
     }
+    for (const session of [tree.openedSession, tree.openedFromTabSession]) {
+      expect(original.getSession(session.id)).toEqual(session);
+    }
+    for (const session of tree.sessions)
+      expect(replacement.getSession(session.id)).toEqual(session);
     expect(original.getSession(lateChild.id)).toEqual(lateChild);
   });
 
@@ -1981,11 +2015,13 @@ describe('useSessionActions', () => {
       throw new Error('terminal unavailable');
     });
     await actions.archiveSession(tree.rootSession.id);
-    for (const session of tree.sessions)
+    for (const session of [tree.rootSession, tree.tabSession])
       expect(metaRepo.getSession(session.id)?.isArchived).toBe(true);
+    for (const session of [tree.openedSession, tree.openedFromTabSession])
+      expect(metaRepo.getSession(session.id)).toEqual(session);
   });
 
-  it('archives tabs and recursively opened sessions, leaving unrelated sessions active', async () => {
+  it('archives tabs but leaves independently opened sessions and their descendants active', async () => {
     const { rootSession, tabSession, openedSession, openedFromTabSession, sessionMetaCache } =
       createContainmentSessions('archive', false);
     const grandchild = {
@@ -2003,31 +2039,203 @@ describe('useSessionActions', () => {
 
     await actions.archiveSession(rootSession.id);
 
-    for (const session of [
-      rootSession,
-      tabSession,
-      openedSession,
-      openedFromTabSession,
-      grandchild,
-    ]) {
+    for (const session of [rootSession, tabSession]) {
       expect(metaRepo.getSession(session.id)).toMatchObject({
         isArchived: true,
         status: { type: 'idle' },
       });
     }
-    expect(metaRepo.getSession(unrelated.id)).toMatchObject({ isArchived: false });
+    for (const session of [openedSession, openedFromTabSession, grandchild, unrelated]) {
+      expect(metaRepo.getSession(session.id)).toEqual(session);
+    }
 
     expect(sendIpcMock.mock.calls).toEqual([
       ['terminal.closeSession', { sessionId: rootSession.id }],
       ['terminal.closeSession', { sessionId: tabSession.id }],
-      ['terminal.closeSession', { sessionId: openedSession.id }],
-      ['terminal.closeSession', { sessionId: openedFromTabSession.id }],
-      ['terminal.closeSession', { sessionId: grandchild.id }],
     ]);
     expect(runtime.writer.flockRowPut).not.toHaveBeenCalled();
     for (const session of [rootSession, openedSession, openedFromTabSession]) {
       expect(metaRepo.getMeta(getMachineRoomId(session.machineId))).toBeUndefined();
     }
+  });
+
+  describe('archive confirmation for opened sub-conversations', () => {
+    const renderConfirmedArchive = async (runtime: WorkspaceRuntime, workingIds: SessionId[]) => {
+      await initI18n('en');
+      const jotaiStore = createStore();
+      jotaiStore.set(runtimeAtom, runtime);
+      jotaiStore.set(docMetaCacheReadyAtom, true);
+      jotaiStore.set(currentWorkspaceIdAtom, 'workspace-1' as WorkspaceId);
+      jotaiStore.set(currentWorkspaceSlugAtom, 'workspace-slug');
+      const nowMs = 1_000_000;
+      jotaiStore.set(lodyPresenceNowMsAtom, nowMs);
+      jotaiStore.set(
+        lodyPresenceStatesAtom,
+        Object.fromEntries(
+          workingIds.map((sessionId) => [
+            `presence-${sessionId}`,
+            {
+              kind: 'session',
+              sessionId,
+              machineId: 'machine' as MachineId,
+              instanceId: 'instance',
+              status: { type: 'running' },
+              updatedAt: nowMs,
+            },
+          ])
+        ) as never
+      );
+      let archive: ConfirmedArchive | null = null;
+      container = document.createElement('div');
+      document.body.appendChild(container);
+      root = createRoot(container);
+      await act(async () => {
+        root?.render(
+          createElement(
+            PlatformContext.Provider,
+            { value: testPlatform },
+            createElement(
+              Provider,
+              { store: jotaiStore },
+              createElement(ConfirmedArchiveProbe, {
+                onReady: (next) => {
+                  archive = next;
+                },
+              })
+            )
+          )
+        );
+      });
+      if (!archive) throw new Error('Confirmed archive was not initialized');
+      return archive as ConfirmedArchive;
+    };
+
+    const dialog = () => document.querySelector<HTMLElement>('[role="alertdialog"]');
+    // Wrapped: returning the pending promise would make the caller await the answer.
+    const startArchive = async (
+      archive: ConfirmedArchive,
+      sessionId: SessionId,
+      options?: { confirm?: boolean }
+    ) => {
+      let result!: Promise<boolean>;
+      await act(async () => {
+        result = archive(sessionId, options);
+      });
+      await vi.waitFor(() => expect(dialog()).not.toBeNull());
+      return { result };
+    };
+    const answer = async (label: string) => {
+      const button = Array.from(dialog()!.querySelectorAll('button')).find(
+        (candidate) => candidate.textContent?.trim() === label
+      );
+      expect(button).toBeInstanceOf(HTMLButtonElement);
+      await act(async () => button!.click());
+    };
+
+    const createTree = (prefix: string) => {
+      const tree = createContainmentSessions(prefix, false);
+      const openedTab = {
+        ...tree.tabSession,
+        id: `${prefix}-opened-tab` as SessionId,
+        parentSessionId: tree.openedSession.id,
+        openedBySessionId: tree.openedSession.id,
+      };
+      const archivedOpened = {
+        ...tree.openedSession,
+        id: `${prefix}-archived-opened` as SessionId,
+        isArchived: true,
+      };
+      const metaRepo = createSessionMetaRepo([...tree.sessions, openedTab, archivedOpened]);
+      return { ...tree, openedTab, archivedOpened, metaRepo };
+    };
+
+    it('counts active and working sub-conversations, then archives the whole tree', async () => {
+      const tree = createTree('confirm-all');
+      const runtime = createRuntime({ repo: tree.metaRepo.repo });
+      // Work in an opened Session's own Tab makes that sub-conversation working.
+      const archive = await renderConfirmedArchive(runtime, [tree.openedTab.id]);
+
+      const { result } = await startArchive(archive, tree.rootSession.id);
+      expect(dialog()?.textContent).toContain(
+        'This conversation opened 2 active sub-conversations.'
+      );
+      expect(dialog()?.textContent).toContain('1 is still working; archiving it stops that work.');
+      // Nothing is written while the user decides.
+      expect(tree.metaRepo.getSession(tree.rootSession.id)?.isArchived).toBe(false);
+
+      await answer('Archive all');
+      await expect(result).resolves.toBe(true);
+      for (const session of [
+        tree.rootSession,
+        tree.tabSession,
+        tree.openedSession,
+        tree.openedTab,
+        tree.openedFromTabSession,
+      ]) {
+        expect(tree.metaRepo.getSession(session.id)?.isArchived).toBe(true);
+      }
+      expect(dialog()).toBeNull();
+    });
+
+    it('archives only the conversation and its Tabs, or nothing on cancel', async () => {
+      const tree = createTree('confirm-only');
+      const runtime = createRuntime({ repo: tree.metaRepo.repo });
+      const archive = await renderConfirmedArchive(runtime, []);
+
+      const { result: cancelled } = await startArchive(archive, tree.rootSession.id);
+      expect(dialog()?.textContent).toContain('None of them is working right now.');
+      await answer('Cancel');
+      await expect(cancelled).resolves.toBe(false);
+      expect(tree.metaRepo.getSession(tree.rootSession.id)?.isArchived).toBe(false);
+
+      const { result: onlyThis } = await startArchive(archive, tree.rootSession.id);
+      await answer('Archive this only');
+      await expect(onlyThis).resolves.toBe(true);
+      for (const session of [tree.rootSession, tree.tabSession]) {
+        expect(tree.metaRepo.getSession(session.id)?.isArchived).toBe(true);
+      }
+      for (const session of [tree.openedSession, tree.openedTab, tree.openedFromTabSession]) {
+        expect(tree.metaRepo.getSession(session.id)?.isArchived).toBe(false);
+      }
+    });
+
+    it('archives directly when every opened sub-conversation is already archived', async () => {
+      const tree = createTree('confirm-none');
+      const runtime = createRuntime({ repo: tree.metaRepo.repo });
+      const archive = await renderConfirmedArchive(runtime, []);
+
+      await act(async () => {
+        await expect(archive(tree.archivedOpened.id)).resolves.toBe(true);
+      });
+      expect(dialog()).toBeNull();
+      expect(tree.metaRepo.getSession(tree.archivedOpened.id)?.isArchived).toBe(true);
+    });
+
+    it('asks one question when confirmation is always required', async () => {
+      const tree = createTree('confirm-always');
+      const runtime = createRuntime({ repo: tree.metaRepo.repo });
+      const archive = await renderConfirmedArchive(runtime, []);
+
+      // Without sub-conversations, the shared dialog asks the plain question.
+      const { result: plain } = await startArchive(archive, tree.archivedOpened.id, {
+        confirm: true,
+      });
+      expect(dialog()?.textContent).toContain('Archive chat?');
+      expect(dialog()?.textContent).not.toContain('sub-conversation');
+      await answer('Archive');
+      await expect(plain).resolves.toBe(true);
+      expect(tree.metaRepo.getSession(tree.archivedOpened.id)?.isArchived).toBe(true);
+
+      // With them, the sub-conversation choice is the only dialog.
+      const { result: treeArchive } = await startArchive(archive, tree.rootSession.id, {
+        confirm: true,
+      });
+      expect(document.querySelectorAll('[role="alertdialog"]')).toHaveLength(1);
+      expect(dialog()?.textContent).toContain('Archive sub-conversations too?');
+      await answer('Archive all');
+      await expect(treeArchive).resolves.toBe(true);
+      expect(tree.metaRepo.getSession(tree.openedSession.id)?.isArchived).toBe(true);
+    });
   });
 
   it.each([
@@ -2042,6 +2250,7 @@ describe('useSessionActions', () => {
         `held-${action}-${settle}`,
         action !== 'archiveSession'
       );
+      tree.openedSession.isArchived = false;
       const metaRepo = createSessionMetaRepo(tree.sessions);
       const runtime = createRuntime({ repo: metaRepo.repo });
       const actions = await renderActions(runtime);
@@ -2055,14 +2264,24 @@ describe('useSessionActions', () => {
         dispatch: true,
         attachments: [imageDraft('att-tab')],
       });
-      const [rootPreparation] = heldPreparations;
+      const openedSend = await actions.addSessionHistory(
+        tree.openedSession.id,
+        userInput('opened'),
+        {
+          dispatch: true,
+          attachments: [imageDraft('att-opened')],
+        }
+      );
+      const [rootPreparation, , openedPreparation] = heldPreparations;
 
       const running = actions[action](tree.rootSession.id);
       await whenAborted(rootPreparation.signal);
       rootPreparation[settle]();
       await expect(running).resolves.toBeUndefined();
 
-      expect(runtime.pendingSends?.getSnapshot()).toEqual([]);
+      expect(runtime.pendingSends?.getSnapshot().map((send) => send.id)).toEqual([openedSend.id]);
+      expect(openedPreparation.signal.aborted).toBe(false);
+      expect(metaRepo.getSession(tree.openedSession.id)).toEqual(tree.openedSession);
       const written = await readHistory(runtime, tree.rootSession.id);
       expect(written.map((turn) => turn.id)).not.toContain(rootSend.id);
       expect(written.map((turn) => turn.id)).not.toContain(tabSend.id);
@@ -2072,6 +2291,11 @@ describe('useSessionActions', () => {
           expect(metaRepo.getSession(session.id)?.latestUserMsgId).toBeUndefined();
         } else expect(metaRepo.getSession(session.id)).toBeUndefined();
       }
+      openedPreparation.finish();
+      await whenSessionDrained(runtime.pendingSends!, tree.openedSession.id);
+      expect((await readHistory(runtime, tree.openedSession.id)).map((turn) => turn.id)).toContain(
+        openedSend.id
+      );
     }
   );
 
@@ -2137,11 +2361,15 @@ describe('useSessionActions', () => {
     }
   });
 
-  it('archives an already archived root again to repair descendants, tolerating opener cycles', async () => {
-    const { rootSession, openedSession, sessions, sessionMetaCache } = createContainmentSessions(
-      'retry',
-      false
-    );
+  it('archives an already archived root again to repair tabs without following opener cycles', async () => {
+    const {
+      rootSession,
+      tabSession,
+      openedSession,
+      openedFromTabSession,
+      sessions,
+      sessionMetaCache,
+    } = createContainmentSessions('retry', false);
     rootSession.isArchived = true;
     rootSession.openedBySessionId = openedSession.id;
     const metaRepo = createSessionMetaRepo(sessions);
@@ -2152,8 +2380,11 @@ describe('useSessionActions', () => {
     await actions.archiveSession(rootSession.id);
     await actions.archiveSession(rootSession.id);
 
-    for (const session of sessions) {
+    for (const session of [rootSession, tabSession]) {
       expect(metaRepo.getSession(session.id)).toMatchObject({ isArchived: true });
+    }
+    for (const session of [openedSession, openedFromTabSession]) {
+      expect(metaRepo.getSession(session.id)).toEqual(session);
     }
   });
 
@@ -2273,7 +2504,7 @@ describe('useSessionActions', () => {
     expect(metaRepo.getSession(childSession.id)).toBeUndefined();
   });
 
-  it('keeps archived opened Sessions and their machine queues after archive then delete', async () => {
+  it('keeps active opened Sessions and their machine queues after archive then delete', async () => {
     const { rootSession, tabSession, openedSession, openedFromTabSession, sessionMetaCache } =
       createContainmentSessions('archive-delete', false);
     for (const session of [openedSession, openedFromTabSession]) {
@@ -2309,7 +2540,7 @@ describe('useSessionActions', () => {
     await actions.archiveSession(rootSession.id);
     expect(store.get(sessionRunConfigDraftsAtom)).toBe(drafts);
     for (const session of [openedSession, openedFromTabSession]) {
-      expect(metaRepo.getSession(session.id)).toMatchObject({ isArchived: true });
+      expect(metaRepo.getSession(session.id)).toMatchObject({ isArchived: false });
     }
     vi.mocked(runtime.writer.flockRowPut).mockClear();
     vi.mocked(runtime.writer.flockRowDelete).mockClear();
@@ -2323,11 +2554,11 @@ describe('useSessionActions', () => {
     expect(metaRepo.getSession(rootSession.id)).toBeUndefined();
     expect(metaRepo.getSession(tabSession.id)).toBeUndefined();
     expect(metaRepo.getSession(openedSession.id)).toMatchObject({
-      isArchived: true,
+      isArchived: false,
       openedBySessionId: rootSession.id,
     });
     expect(metaRepo.getSession(openedFromTabSession.id)).toMatchObject({
-      isArchived: true,
+      isArchived: false,
       openedBySessionId: tabSession.id,
       openedByRootSessionId: rootSession.id,
     });

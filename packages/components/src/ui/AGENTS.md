@@ -54,8 +54,8 @@ strings on i18n rather than the registry's inline English.
 - Dialog-contained `OptionSelector` menus must portal into the nearest
   `[data-lody-dialog-content]`; a body portal is outside the modal's scroll and
   focus guards. `src/ui/dialog.tsx` emits that attribute on every panel.
-- `DiffViewer` uses the shared `@pierre/diffs` worker pools for syntax work regardless
-  of file size. Do not create or terminate a worker pool per viewer.
+- `DiffViewer` bounds standalone inline parsing by characters AND lines; syntax
+  and other parsing share Workers. Preserve context/fallbacks; no per-viewer pools.
 - Every floating surface passes `useSafeAreaCollisionPadding` as
   `collisionPadding`; the default parks a colliding surface flush against the
   screen edge and caps `--available-height` there too.
@@ -105,12 +105,11 @@ strings on i18n rather than the registry's inline English.
 
 ## Scroll area
 
-- Keep the `@radix-ui/react-scroll-area` patch until an upstream version cancels
-  thumb polling on effect cleanup. Verify both ESM and CommonJS with
-  `tests/scroll-area-lifecycle.test.tsx` when upgrading; removing a thumb during
-  the scroll-end debounce must not retain a frame loop or detached viewport.
-- `loro-sidebar.tsx` uses `type="scroll"` so the overlay thumb appears only while
-  scrolling; do not revert to the Radix default `hover`.
+- Use `@lody/ui/scroll-area` (Base UI). Its `viewportRef` is the scrolling node;
+  never query vendor attributes from the root. Native controls share its tokens
+  through `nativeScrollbar`; `../tailwind/scrollbars.css` covers product containers.
+  Hidden bars, compact tracks and conversation gutters stay local.
+- Sidebar keeps `visibility="scroll"` (visible while scrolling), never `hover`.
 
 ## Slider
 

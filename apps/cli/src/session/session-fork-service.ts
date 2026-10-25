@@ -235,10 +235,10 @@ export class SessionForkService {
    * each room and pull each stream (see ../lib/loro/AGENTS.md). Recovery stays
    * O(in-flight forks), never O(session docs).
    *
-   * Race discipline (same rules as the speculative-worktree sweep): every
-   * candidate is re-read under `withForkOperationLock`, and liveness comes from
-   * `activeOperations`, never from timestamps — a same-target retry that
-   * already restarted must never be rolled back as "interrupted".
+   * Race discipline: every candidate is re-read under `withForkOperationLock`,
+   * and liveness comes from `activeOperations`, never from timestamps — a
+   * same-target retry that already restarted must never be rolled back as
+   * "interrupted".
    */
   async recoverPendingForks(): Promise<void> {
     let markers: SessionForkOperationMarker[];
@@ -568,9 +568,6 @@ export class SessionForkService {
     }
 
     const sourceTitle = source.title?.trim() || 'Untitled session';
-    // One expression shared by the target meta and the recovery marker so a
-    // repaired session can never drift from a normally-forked one's title.
-    const forkTitle = `(fork) ${sourceTitle}`;
     const historyResult = cloneHistoryThroughTurn(
       [...sourceSnapshot.history],
       spec.sourceTurnId,
@@ -719,7 +716,7 @@ export class SessionForkService {
         machineId: source.machineId,
         createdAt: new Date(now).toISOString(),
         lastMessageAt: now,
-        title: forkTitle,
+        title: sourceTitle,
         titleSource: 'generated',
         userId: spec.requestedByUserId,
         status: SessionStatusFactory.initializing(undefined, 'Creating fork worktree'),
@@ -744,7 +741,7 @@ export class SessionForkService {
         targetSessionId,
         operationId: operation.id,
         createdAt: operation.createdAt,
-        title: forkTitle,
+        title: sourceTitle,
         historyBackend: targetMeta.historyBackend,
         cleanup: {
           project: targetProject,
@@ -835,7 +832,7 @@ export class SessionForkService {
       machineId: source.machineId,
       createdAt: new Date(now).toISOString(),
       lastMessageAt: now,
-      title: forkTitle,
+      title: sourceTitle,
       titleSource: 'generated',
       userId: spec.requestedByUserId,
       status: SessionStatusFactory.initializing(),

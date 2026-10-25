@@ -17,12 +17,11 @@ Replacement contract: [shared rules](../../../shared/AGENTS.md#session-history).
   subscription per config/request. Connections stay bounded by workspace/machine
   topology; more configs add serialized RPCs only. Release unowned one-shot handles
   and subscriptions.
-- Startup capability discovery is once per agent config per runtime, recorded in the
-  runtime-owned `refreshedConfigKeys` set. A pass aborted by presence leaving `synced` is
-  re-armed, so a pass-level flag is not the gate: reconnecting must never re-probe a config that
-  already answered, because each probe starts and kills a real agent process. Refresh requests
-  default to the machine's cache; only a user action or a setup/authentication workflow sets
-  `force`. Intent: [capability refresh cache](../../../../specs/acp-capability-refresh-cache.md).
+- Discover startup capabilities once per config/runtime, tracked in `refreshedConfigKeys`.
+  Re-arm passes aborted when presence leaves `synced`; reconnect must not re-probe answered
+  configs or use a pass-level gate. Probes launch real agents. Refresh defaults to machine
+  cache; only user or setup/authentication actions set `force`.
+  Intent: [capability refresh cache](../../../../specs/acp-capability-refresh-cache.md).
 
 ## Workspace switching
 
@@ -41,6 +40,10 @@ Replacement contract: [shared rules](../../../shared/AGENTS.md#session-history).
   [Stuck report](../../../../.agents/notes/implemented/feature/2026-09-26-workspace-sync-stuck-telemetry.md).
 
 ## Workspace runtime
+
+- Readers require backend identity and their Meta plane. Provisional absence/empty
+  history is not legacy evidence; release waits on resolve/retire. Keep Roost
+  capabilities live and wake its bridge on arrival.
 
 - A neutral local warm spare may initialize the implicit workspace runtime without
   publishing route context. A matching claim must retain that runtime or its in-flight
@@ -61,19 +64,18 @@ Replacement contract: [shared rules](../../../shared/AGENTS.md#session-history).
   state into the existing repo document; never replace unsent local edits or share
   the UI repo's persistence/cursors with the worker. Intent:
   [background prefetch](../../../../specs/session-background-prefetch.zh.md).
-- Keep one Repo view; `WorkspaceTargetRouter` owns target/transport selection.
+- Keep one Repo view across auth refresh and unrelated mode-cache changes;
+  `WorkspaceTargetRouter` owns target/transport selection.
   Never restore a second writer or proxy-authoring/write-intent mirror.
 - Runtime close cancels auth, joins attach/reconnect work, then destroys Repo.
   Failed startup shares this close path.
-- Local-only window bootstrap may exchange same-workspace CRDT snapshots from
-  already owned documents. Merge into the receiving Repo; never treat peer state
-  as authoritative sync or open stores solely to answer bootstrap requests.
-  Check disk before requesting peer exports; Web Locks inventory bounds requests
-  to live runtimes, and negative replies must release missing-document waits.
-  Seed cold documents before Repo subscribes, persisting the merged snapshot before
-  adoption; storage-loaded versions must be durable before cursor advancement. Never
-  replace a live document. Import before constructing the history reader to avoid
-  replaying bulk-import events through an initialized projection.
+- Local-only bootstrap exchanges CRDT snapshots only from already owned documents
+  in the same workspace. Merge into the receiving Repo; peer state is not authoritative,
+  and requests must not open stores. Check disk first; Web Locks bound requests to live
+  runtimes, and negative replies release missing-document waits. Seed cold documents
+  before Repo subscribes; persist merged snapshots before adoption and storage-loaded
+  versions before cursor advancement. Never replace live documents. Import before
+  creating the history reader to avoid replaying bulk-import events.
 - Repo storage, LoroDoc cursors and eager-sync high-water state share a per-renderer
   cache namespace. Independently persisted replicas must not share checkpoints.
   Meta/Flock cursors stay repo-owned; delete Meta progress via `repo.getReplicaCheckpointStore`.
@@ -102,7 +104,7 @@ Replacement contract: [shared rules](../../../shared/AGENTS.md#session-history).
   remains pending.
 - Presence is merged by origin. For an origin represented by the local plane, the local
   snapshot is authoritative, including absence; do not resurrect cleared presence from a
-  lagging replica.
+  lagging replica. UI reads the transport's display sync state; raw state drives recovery.
 - Doc-metadata bootstrap and the live repo watch overlap by design: merge per field with
   live winning (`mergeBootstrapMetaCache`), never letting the snapshot undo an archive
   already applied live.

@@ -5,6 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { useOrganization } from '@/hooks/useOrganization';
 import { useStableSession } from '@/hooks/useStableSession';
 import { useCloudQuery } from '@lody/platform/react';
+import { WorkspaceAdmissionGate } from '@/components/workspace-admission-gate';
 import { cloudOperations } from '@/lib/cloud-api-operations';
 import {
   clearPreferredWorkspaceSlugIfMatch,
@@ -351,7 +352,15 @@ function CloudWorkspaceGuardRoute() {
   );
 }
 
-function WorkspaceAuthedRoute({
+function WorkspaceAuthedRoute(props: Parameters<typeof PlaintextWorkspaceAuthedRoute>[0]) {
+  return (
+    <WorkspaceAdmissionGate workspaceName={props.workspaceName}>
+      <PlaintextWorkspaceAuthedRoute {...props} />
+    </WorkspaceAdmissionGate>
+  );
+}
+
+function PlaintextWorkspaceAuthedRoute({
   workspaceName,
   organizations,
   organizationsLoading,

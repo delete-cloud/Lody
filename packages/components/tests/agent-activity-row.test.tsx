@@ -203,7 +203,19 @@ describe('live agent status', () => {
     await advance(2_000);
     await deliverUpdate();
     await advance(250_000);
-    expect(statusRow()?.textContent).toBe('Waiting for permission (Worked for 8m 40s)');
+    expect(statusRow()?.textContent).toBe('Waiting for permission');
+  });
+
+  it('does not turn a question wait into growing command execution time', async () => {
+    useTickingClock('2026-09-19T00:04:29Z');
+    await render(
+      liveTurn([toolCall('a'), { type: 'text', text: 'Which storage should we use?' }]),
+      { label: 'Waiting for your answer', tone: 'warning' },
+      { live: { activity: 'awaitingUser', window: liveNow() } }
+    );
+    await advance(255_000);
+    expect(statusRow()?.textContent).toBe('Waiting for your answer');
+    expect(shimmering()).toEqual([]);
   });
 
   it('keeps a still status row while waiting on the user', async () => {
@@ -211,7 +223,7 @@ describe('live agent status', () => {
       label: 'Waiting for permission',
       tone: 'warning',
     });
-    expect(statusRow()?.textContent).toBe('Waiting for permission (Worked for 30s)');
+    expect(statusRow()?.textContent).toBe('Waiting for permission');
     expect(shimmering()).toEqual([]);
   });
 
@@ -680,6 +692,7 @@ describe('live agent status', () => {
           cacheReadInputTokens: 1_500_000,
           cacheCreationInputTokens: 2000,
           reasoningOutputTokens: 200,
+          costUSD: 0.0182,
         },
       }),
       { label: 'Working' }
@@ -706,6 +719,10 @@ describe('live agent status', () => {
     expect(value('Output')?.getAttribute('title')).toBe('500 · Reasoning 200');
     expect(value('Cache')?.textContent).toBe('1.5M');
     expect(value('Cache')?.getAttribute('title')).toBe('1,502,000 · Read 1,500,000 · Write 2,000');
+    // The cost estimate is one more row of the same token section.
+    expect(document.body.textContent).toContain('Cost estimate');
+    expect(value('Cost estimate')?.textContent).toBe('$0.0182');
+    expect(value('Cost estimate')?.getAttribute('title')).toContain('not an invoice');
     expect(document.body.textContent).not.toContain('No configuration recorded');
   });
 });

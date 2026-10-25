@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   getMachineRoomId,
+  getWorkspaceFlockDocId,
   getSessionRoomId,
   snapshotAgentRole,
   type AcpCapabilityCacheEntry,
@@ -156,7 +157,8 @@ function createFixture(agentType: 'codex' | 'claude', capability?: AcpCapability
     getAgentConfigById: async () => agentConfig,
     syncMetaOrThrow: async () => undefined,
     syncDocOrThrow: async () => undefined,
-    syncFlockDocOrThrow: async () => {
+    syncFlockDocOrThrow: async (docId: string) => {
+      if (docId === getWorkspaceFlockDocId(workspaceId)) return;
       if (!freshnessConfirmed) {
         throw new FlockSyncTimeoutError('Synthetic Machine Flock freshness deadline');
       }
@@ -1137,8 +1139,11 @@ describe('Role create with failed Machine Flock freshness', () => {
     expect(history).toMatchObject([
       {
         id: userTurnId,
-        items: [{ type: 'text', text: 'Review carefully.\n\nContinue' }],
+        // The visible turn keeps only the authored prompt; the Role
+        // instruction is injected into the execution prompt.
+        items: [{ type: 'text', text: 'Continue' }],
         inputConfig: {
+          prompt: 'Review carefully.\n\nContinue',
           ...role.runConfig,
           agentRoleId: role.id,
           agentRoleRevision: role.revision,

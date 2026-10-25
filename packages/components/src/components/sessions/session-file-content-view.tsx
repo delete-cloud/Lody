@@ -49,7 +49,7 @@ import {
   createLocalProjectIpcFileTransport,
   createLocalProjectRpcFileTransport,
 } from '@/lib/local-project-rpc-file-provider';
-import { ScrollArea } from '@/ui/scroll-area';
+import { ScrollArea } from '@lody/ui/scroll-area';
 import {
   hasSessionFileLspProvider,
   type SessionFileProvider,
@@ -63,9 +63,12 @@ import {
 import { normalizePinnedProviderOpenResult } from '@/lib/session-file-provider-open-result';
 import { SessionFileBinaryPreview } from './session-file-binary-preview';
 import { SessionFileCsvPreview } from './session-file-csv-preview';
+import { DocumentSelectionSurface } from './document-selection-surface';
+import type { DocumentSelection } from '@/lib/document-selection';
 import { SessionFileImagePreview } from './session-file-image-preview';
 import { MarkdownRenderer } from '../ai-gui/markdown-renderer';
 import { MarkdownFileResources } from '../ai-gui/markdown-file-image';
+import { SessionLinkProvider } from '../ai-gui/session-link-context';
 import { isSvgPath } from '@/lib/image-file-preview';
 import { logCodeCollabDebug } from '@/lib/code-collab-debug';
 import {
@@ -461,6 +464,7 @@ export type SessionFileContentViewProps = {
   defaultHtmlPreview?: boolean;
   saveRequestSeq?: number;
   copyMarkdownRequestSeq?: number;
+  sessionLinksEnabled?: boolean;
   /**
    * Mobile file drawers use the platform text surface for Markdown source so
    * long-press opens the OS selection controls instead of Monaco's desktop
@@ -494,6 +498,7 @@ export type SessionFileContentViewProps = {
   }) => void;
   visualAnnotationReferenceKeys?: readonly string[];
   onAddVisualAnnotationToChat?: (reference: VisualAnnotationReferencePayload) => boolean | void;
+  onAddSelectionToChat?: (selection: DocumentSelection) => boolean;
   onToggleVisualAnnotationInChat?: (reference: VisualAnnotationReferencePayload) => boolean | void;
 };
 
@@ -525,6 +530,7 @@ function SessionFileContentViewImpl({
   defaultHtmlPreview = false,
   saveRequestSeq,
   copyMarkdownRequestSeq,
+  sessionLinksEnabled = false,
   preferNativeMarkdownSelection = false,
   className,
   active = true,
@@ -536,6 +542,7 @@ function SessionFileContentViewImpl({
   onOpenFile,
   visualAnnotationReferenceKeys,
   onAddVisualAnnotationToChat,
+  onAddSelectionToChat,
   onToggleVisualAnnotationInChat,
 }: SessionFileContentViewProps) {
   const { t } = useTranslation();
@@ -1487,19 +1494,21 @@ function SessionFileContentViewImpl({
   // the left chat Markdown (default = text-sm; was hard-coded large/"base").
   const previewSurface: ReactNode = isMarkdownTextFile ? (
     <div {...stylex.props(styles.markdownPreview)} data-native-selection-allow>
-      {fileProvider ? (
-        <MarkdownFileResources
-          key={`${session.machineId}:${sessionId}`}
-          provider={fileProvider}
-          documentPath={providerEntry?.path ?? normalizedPath}
-          automatic={Boolean(sessionFileActions.localHost)}
-          active={isActiveSurface && showMarkdownRendered}
-        >
+      <SessionLinkProvider enabled={sessionLinksEnabled}>
+        {fileProvider ? (
+          <MarkdownFileResources
+            key={`${session.machineId}:${sessionId}`}
+            provider={fileProvider}
+            documentPath={providerEntry?.path ?? normalizedPath}
+            automatic={Boolean(sessionFileActions.localHost)}
+            active={isActiveSurface && showMarkdownRendered}
+          >
+            <MarkdownRenderer text={markdownPreviewText} size={conversationFontSize} />
+          </MarkdownFileResources>
+        ) : (
           <MarkdownRenderer text={markdownPreviewText} size={conversationFontSize} />
-        </MarkdownFileResources>
-      ) : (
-        <MarkdownRenderer text={markdownPreviewText} size={conversationFontSize} />
-      )}
+        )}
+      </SessionLinkProvider>
     </div>
   ) : isSvgTextFile && data.status === 'ready' && data.snapshot.kind === 'text' ? (
     <SessionFileImagePreview path={normalizedPath} svgText={data.snapshot.text} />
@@ -1598,6 +1607,7 @@ function SessionFileContentViewImpl({
         url={data.snapshot.url}
         active={isActiveSurface}
         fileActions={sessionFileActions.buildErrorActions(normalizedPath, data.snapshot)}
+        onAddSelectionToChat={onAddSelectionToChat}
       />
     );
   } else if (data.snapshot.kind === 'missing') {
@@ -1645,11 +1655,18 @@ function SessionFileContentViewImpl({
     );
   } else if (showCsvRendered && data.snapshot.kind === 'text') {
     body = (
-      <SessionFileCsvPreview
-        text={latestEditorTextRef.current ?? data.snapshot.text}
+      <DocumentSelectionSurface
         path={normalizedPath}
+        source={latestEditorTextRef.current ?? data.snapshot.text}
         active={isActiveSurface}
-      />
+        onAdd={onAddSelectionToChat}
+      >
+        <SessionFileCsvPreview
+          text={latestEditorTextRef.current ?? data.snapshot.text}
+          path={normalizedPath}
+          active={isActiveSurface}
+        />
+      </DocumentSelectionSurface>
     );
   } else if (showSvgRendered || showMarkdownRendered) {
     body = previewSurface;

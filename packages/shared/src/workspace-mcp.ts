@@ -1,4 +1,5 @@
 import type { McpServerId } from './ids';
+import type { ProjectRef } from './project';
 
 /**
  * Lody supports stdio and Streamable HTTP MCP servers. SSE is intentionally
@@ -181,9 +182,6 @@ export const normalizeMcpServerIdSelection = (value: unknown): McpServerId[] | u
   }
   return ids;
 };
-
-export const normalizeMcpServerIdsForDedup = (ids: readonly string[] | undefined): string[] =>
-  [...new Set(ids ?? [])].sort();
 
 export const interpolateEnvVars = (
   value: string,
@@ -392,4 +390,58 @@ export const describeMcpConnection = (
   }
   const parts = [connection.command, ...(connection.args ?? [])].filter((part) => part.length > 0);
   return parts.join(' ') || undefined;
+};
+
+/** A project replaces the workspace defaults as one selection; [] means none. */
+export type ProjectMcpDefault = { ids: McpServerId[] };
+
+/** Identity is workspace-scoped and independent of branch/worktree location. */
+export const getProjectMcpKey = (
+  project: ProjectRef | null | undefined,
+  machineId?: string | null
+): string | undefined => {
+  if (!project) return undefined;
+  if (project.kind === 'github') {
+    const repo = project.repoFullName.trim().toLowerCase();
+    return repo ? JSON.stringify(['v1', 'github', repo]) : undefined;
+  }
+  const machine = machineId?.trim();
+  const id = project.localProjectId.trim();
+  return machine && id ? JSON.stringify(['v1', 'local', machine, id]) : undefined;
+};
+
+export const isProjectMcpKey = (value: string): boolean => {
+  try {
+    const parts: unknown = JSON.parse(value);
+    return (
+      Array.isArray(parts) &&
+      parts[0] === 'v1' &&
+      ((parts[1] === 'github' && parts.length === 3) ||
+        (parts[1] === 'local' && parts.length === 4)) &&
+      parts.slice(2).every((part) => typeof part === 'string' && part.trim().length > 0) &&
+      JSON.stringify(parts) === value
+    );
+  } catch {
+    return false;
+  }
+};
+
+export const normalizeProjectMcpDefault = (value: unknown): ProjectMcpDefault | undefined => {
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.ids) ||
+    value.ids.some((id) => typeof id !== 'string' || !id.trim())
+  )
+    return undefined;
+  return { ids: normalizeMcpServerIdSelection(value.ids) ?? [] };
+};
+
+export const getEffectiveDefaultMcpIds = (
+  servers: readonly WorkspaceMcpServerMeta[],
+  preference?: ProjectMcpDefault
+): McpServerId[] => {
+  const available = new Set(servers.map((server) => server.id));
+  return [...new Set(preference?.ids ?? getDefaultSelectedMcpServerIds(servers))].filter((id) =>
+    available.has(id)
+  );
 };

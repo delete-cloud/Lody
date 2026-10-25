@@ -1,10 +1,17 @@
+import type { MessageContent } from '../ai';
+
 import type { HistoryAction } from './history-actions';
 import type { SessionGoalMessage } from '../goal';
-import type { PermissionOutcome } from '../message';
+import type { PermissionOutcome, SessionHistoryChanges } from '../message';
+import type { SessionHistoryChange } from '../schema';
 import type { SessionId } from '../ids';
 import type { HistoryImportInput } from './history-import';
 import type { SessionSnapshotService } from './snapshot';
 import type { SessionEntry, SessionDirectoryRow, SessionTurn, SessionTurnRead } from './domain';
+
+export type SessionSubagentRun = NonNullable<
+  Extract<MessageContent, { type: 'subagent_task' }>['run']
+>;
 
 // History reads and shared writes use domain DTOs rather than the storage schema.
 // Ordinary commands propagate errors. Import and editable-tail replacement
@@ -122,6 +129,8 @@ export type SessionDataChangeListener = (change: SessionDataChange) => void;
 
 /** One bounded directory window from a backend with reverse pagination. */
 export type SessionHistoryDirectoryPage = {
+  /** Optional owner-scoped checkpoint, negotiated separately from paging. */
+  readonly checkpoint?: string;
   readonly startPosition: number;
   readonly totalCount: number;
   readonly rows: readonly SessionDirectoryRow[];
@@ -167,6 +176,16 @@ export interface SessionHistoryReader {
   readAt(position: number): SessionTurnRead | Promise<SessionTurnRead>;
   /** Authoritative read of one business turn id. */
   readTurn(turnId: string): SessionTurnRead | Promise<SessionTurnRead>;
+  /** Display-only turn: run.items contains at most the latest step's small
+   * summary, not a transcript. Never use this for export, copy, hashes or writes.
+   * Advertise only together with readSubagentRun. */
+  readTurnForDisplay?(turnId: string): SessionTurnRead | Promise<SessionTurnRead>;
+  /** Read exactly one run from its owning turn, preserving root ACP identity. */
+  readSubagentRun?(
+    turnId: string,
+    sessionId: string,
+    runId: string
+  ): SessionSubagentRun | undefined | Promise<SessionSubagentRun | undefined>;
   /** Authoritative read of raw slots `[from, to)`. */
   readRange(
     from: number,
@@ -177,6 +196,20 @@ export interface SessionHistoryReader {
     from: number,
     to: number
   ): readonly SessionDirectoryRow[] | Promise<readonly SessionDirectoryRow[]>;
+  getCheckpoint?(): Promise<string>;
+  /** Native publication and its scoped checkpoint, read as one observation. */
+  getPublication?(): Promise<{
+    readonly checkpoint: string;
+    readonly historyRevision: number;
+    readonly historyCount: number;
+    readonly historyChange: SessionHistoryChange | null;
+  }>;
+  readChanges?(
+    checkpoint: string,
+    options?: { readonly withPatches?: true }
+  ): Promise<SessionHistoryChanges>;
+  /** Bounded commit observation; it owns no database transaction while waiting. */
+  waitForChanges?(checkpoint: string, waitMs: number, signal?: AbortSignal): Promise<void>;
   /** Latest bounded directory page for windowed-history backends. */
   readLatestDirectoryPage?(limit: number): Promise<SessionHistoryDirectoryPage>;
   /** Bounded page immediately older than `cursor`. */

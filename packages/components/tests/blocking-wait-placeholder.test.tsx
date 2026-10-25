@@ -27,6 +27,10 @@ vi.mock('../src/lib/deferred-posthog', () => ({
   },
 }));
 
+vi.mock('../src/components/preloaded-main-layout', () => ({
+  preloadMainLayout: () => Promise.resolve(),
+}));
+
 import 'fake-indexeddb/auto';
 import { docMetaCacheScopeAtom } from '../src/atoms/doc-meta';
 import {
@@ -35,8 +39,18 @@ import {
   type WorkspaceRuntime,
 } from '../src/atoms/runtime';
 import { setWorkspaceContextAtom } from '../src/atoms/workspace-context';
-import { BlockingWaitPlaceholder } from '../src/components/blocking-wait-placeholder';
+import { BootShellProvider } from '../src/components/boot-shell';
+import {
+  BLOCKING_WAIT_RECOVERY_DELAY_MS,
+  BlockingWaitPlaceholder,
+} from '../src/components/blocking-wait-placeholder';
 import { RouteMessage } from '../src/components/route-message';
+import {
+  resetWorkspaceDataReadyForTests,
+  resolveWorkspaceDataWaitKind,
+  useRecordWorkspaceDataReady,
+  WorkspaceDataWait,
+} from '../src/components/workspace-data-wait';
 import { StuckConnectionBannerContainer } from '../src/components/stuck-connection-banner';
 import { browserOnlineAtom, lodyControlConnectionStateAtom } from '../src/atoms/control-connection';
 import { authTokenAtom } from '../src/atoms/runtime';
@@ -102,11 +116,13 @@ function renderNode(store: ReturnType<typeof createStore>, node: ReactNode, slug
   act(() => {
     root.render(
       <Provider store={store}>
-        {slug ? (
-          <WorkspaceRouteTargetProvider slug={slug}>{node}</WorkspaceRouteTargetProvider>
-        ) : (
-          node
-        )}
+        <BootShellProvider path={slug ? `/${slug}/chat` : '/'}>
+          {slug ? (
+            <WorkspaceRouteTargetProvider slug={slug}>{node}</WorkspaceRouteTargetProvider>
+          ) : (
+            node
+          )}
+        </BootShellProvider>
       </Provider>
     );
   });
@@ -126,7 +142,11 @@ function render(store: ReturnType<typeof createStore>) {
   );
 }
 
-const text = () => container.textContent ?? '';
+const text = () => {
+  const visible = container.cloneNode(true) as HTMLElement;
+  visible.querySelectorAll('style').forEach((style) => style.remove());
+  return visible.textContent ?? '';
+};
 const buttonLabels = () =>
   Array.from(container.querySelectorAll('button')).map((button) => button.textContent);
 const click = (label: string) => {
@@ -172,6 +192,7 @@ beforeEach(async () => {
   resetBootClearMemoForTests();
   resetAppActivityGapForTests();
   resetBootRequestFailuresForTests();
+  resetWorkspaceDataReadyForTests();
   app.reloads = 0;
   app.relaunches = [];
   app.events = [];
@@ -271,6 +292,8 @@ describe('BlockingWaitPlaceholder', () => {
       null
     );
     expect(text()).toContain('Signing you in');
+    const shell = container.querySelector('[data-lody-boot-shell]');
+    expect(shell).not.toBeNull();
 
     act(() => {
       vi.advanceTimersByTime(RECOVERY_DELAY_MS);
@@ -279,6 +302,11 @@ describe('BlockingWaitPlaceholder', () => {
     expect(text()).toContain('Lody is taking too long to open');
     expect(text()).toContain(GENERIC);
     expect(buttonLabels()).toContain('Reload Lody');
+    expect(container.querySelector('[data-lody-boot-shell]')).toBeNull();
+    expect(shell?.hasAttribute('inert')).toBe(true);
+    expect(shell?.querySelector('[role="status"]')).toBeNull();
+    click('Reload Lody');
+    expect(app.reloads).toBe(1);
     expect(eventsNamed('workspace/boot_wait_stuck')[0]?.properties).toMatchObject({
       gate: 'session_loading',
       failed: false,
@@ -371,6 +399,83 @@ describe('BlockingWaitPlaceholder', () => {
     expect(report).toContain('Idle before launch: 72h');
     expect(report).toContain('Local clear in the last day: none');
     stopTracking();
+  });
+});
+
+/** The `_auth` route's use: record readiness, otherwise wait by kind. */
+function WorkspaceDataRoute({
+  slug,
+  ready,
+  accountId = 'user-1',
+}: {
+  slug: string;
+  ready: boolean;
+  accountId?: string;
+}) {
+  useRecordWorkspaceDataReady(ready ? slug : null, accountId);
+  if (ready) return <div>Workspace content</div>;
+  return <WorkspaceDataWait kind={resolveWorkspaceDataWaitKind(slug, accountId)} />;
+}
+
+describe('WorkspaceDataWait', () => {
+  const bootShell = () => container.querySelector('[data-lody-boot-shell]');
+
+  it('continues the boot shell on a cold start instead of claiming a switch', () => {
+    const store = createWorkspaceStore({ scan: 'pending' });
+    renderNode(store, <WorkspaceDataRoute slug="acme" ready={false} />, 'acme');
+
+    expect(bootShell()).not.toBeNull();
+    expect(text()).toContain('Loading workspace');
+    expect(text()).not.toContain('Switching workspace');
+  });
+
+  it('says it is switching only when another workspace was open', () => {
+    const store = createWorkspaceStore({ scan: 'pending' });
+    renderNode(store, <WorkspaceDataRoute slug="acme" ready />, 'acme');
+    renderNode(store, <WorkspaceDataRoute slug="beta" ready={false} />, 'beta');
+
+    expect(bootShell()).toBeNull();
+    expect(text()).toContain('Switching workspace');
+  });
+
+  it('reloading the open workspace stays a pane wait without claiming a switch', () => {
+    const store = createWorkspaceStore({ scan: 'pending' });
+    renderNode(store, <WorkspaceDataRoute slug="acme" ready />, 'acme');
+    renderNode(store, <WorkspaceDataRoute slug="acme" ready={false} />, 'acme');
+
+    expect(bootShell()).toBeNull();
+    expect(text()).toContain('Loading workspace');
+    expect(text()).not.toContain('Switching workspace');
+  });
+
+  it('treats a workspace opened by another account as a cold start', () => {
+    const store = createWorkspaceStore({ scan: 'pending' });
+    renderNode(store, <WorkspaceDataRoute slug="acme" ready />, 'acme');
+    renderNode(store, <WorkspaceDataRoute slug="beta" ready={false} accountId="user-2" />, 'beta');
+
+    expect(bootShell()).not.toBeNull();
+    expect(text()).not.toContain('Switching workspace');
+  });
+
+  it('forgets the ready workspace once the authed layout unmounts', () => {
+    const store = createWorkspaceStore({ scan: 'pending' });
+    renderNode(store, <WorkspaceDataRoute slug="acme" ready />, 'acme');
+    // Sign-out leaves the workspace routes.
+    renderNode(store, <div>Sign in</div>, null);
+    renderNode(store, <WorkspaceDataRoute slug="beta" ready={false} />, 'beta');
+
+    expect(bootShell()).not.toBeNull();
+    expect(text()).not.toContain('Switching workspace');
+  });
+
+  it('a cold start that never readies still reaches the recovery page', () => {
+    const store = createWorkspaceStore({ scan: 'pending' });
+    renderNode(store, <WorkspaceDataRoute slug="acme" ready={false} />, 'acme');
+
+    act(() => {
+      vi.advanceTimersByTime(BLOCKING_WAIT_RECOVERY_DELAY_MS);
+    });
+    expect(buttonLabels()).toEqual(expect.arrayContaining(['Reload Lody']));
   });
 });
 

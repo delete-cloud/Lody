@@ -8,27 +8,28 @@ Background: [components](../../../../.agents/docs/components-package.md),
 - Retry immutable Roost input; absent receipts stay unknown. Cache/refresh keeps
   all input. Resolve owner routing per call.
 
+- Markdown caches hold bounded raw ASTs per grammar; clone per use; skip streams.
+
 ## Electron IPC types
 
 - `electron-ipc-client.ts` may import `ElectronIpcServices` from main-process
   registration with `import type` only. Browser/mobile bundles must erase the edge;
   never add an Electron runtime/package dependency or allow Node APIs in shared UI.
-- Keep `experimentalDecorators` and the direct catalog-pinned `@types/node` dependency
-  for the source declarations. Service constructors own invoke signatures; never duplicate them in contracts,
-  Specs or platform ports. Fix resolution/erasure here or reconsider ownership.
-  Push events and one-way sends stay in `@lody/shared/electron-ipc`.
+- Keep `experimentalDecorators` and direct catalog-pinned `@types/node` for declarations.
+  Service constructors own invoke signatures; never duplicate them in contracts,
+  Specs or platform ports. Resolve erasure here or reconsider ownership.
+  Push events/one-way sends stay in `@lody/shared/electron-ipc`.
 
 ## Crash recovery and diagnostics
 
-- `ErrorBoundary`'s `error-boundary-fallback.tsx` shows the real error and one-click
-  full-report copy on every build; details visible by default (`showErrorDetails` opts
-  out). `lib/error-boundary-report.ts` is the pure copy builder.
+- `ErrorBoundary`'s fallback shows the real error and one-click full-report copy on every
+  build, details visible (`showErrorDetails` opts out); `error-boundary-report.ts` builds it.
 - Error/not-found screens use `components/status-page.tsx`; pre-React `boot-failure.ts`
-  draws that column in plain DOM with copied V2 token values, never React/StyleX/Tailwind.
+  copies its V2 tokens into plain DOM, never React/StyleX/Tailwind.
 - Crash screens never reload/restart/reset themselves. `resetKeys` must not clear a captured
   error; the copyable fallback stays until the user presses a recovery button.
-- A cloud query throws into render and keeps throwing. An optional surface inside a larger
-  boundary owns an inline `ErrorBoundary`, so a backend failure degrades locally.
+- A cloud query throws into render and keeps throwing: an optional surface owns an inline
+  `ErrorBoundary`, so a backend failure degrades locally.
 - `lib/clear-local-cache.ts` owns `restartIntoCacheClear` (recoverable `lody*` caches,
   still signed in; reloads one window) and `startHardReset` (full wipe/sign-out,
   host-native first, own confirmation). Defer deletes to next boot; clear synchronous
@@ -38,8 +39,10 @@ Background: [components](../../../../.agents/docs/components-package.md),
   `lody:*` cache keys; retain auth tokens and preferences.
 - Reports copy the `lib/session-render-trace.ts` tail; writers append one compact line,
   never drive behavior from it; surface mount/unmount uses a layout effect.
-- `maybeClearLodyCacheOnBoot` runs once per page load, shared by `AppInitializer` and
-  `RuntimeProvider`, which awaits it before opening repo IndexedDB.
+- Record crashes and unretried failures in `client-log.ts` (sent with bug reports):
+  events and ids, never prompts, history or file content.
+- `maybeClearLodyCacheOnBoot` runs once per page load; `RuntimeProvider` awaits it
+  before opening repo IndexedDB.
 - Route waits are `BlockingWaitPlaceholder` (recovery at 30s), never bare
   `LoadingPlaceholder`/`BootShell`; failures are `RouteMessage` with a `gate` (`null`:
   not a failure). `stuck-connection-banner.tsx` (`MainLayout`, 45s `loading`) opens
@@ -47,12 +50,12 @@ Background: [components](../../../../.agents/docs/components-package.md),
 
 ## File Preview and Code Collab
 
-- Remote file surfaces read the owner-session file-index Flock. Local Electron targets
-  load initial file trees and All Changes from the local `code-collab/get-file-index`
-  Machine RPC snapshot without awaiting Flock, then subscribe to local Flock events.
-  Subscription delay/failure cannot block IPC or trigger cloud fallback. Allow stale
-  join events to converge with the CLI's asynchronous snapshot reconciliation.
-  Machine RPC also serves exact content, save, LSP, and diff requests.
+- Remote file surfaces read the owning session's file-index Flock. Local Electron
+  initial trees and All Changes first use local `code-collab/get-file-index`
+  Machine RPC without awaiting Flock, then subscribe to local Flock events.
+  Delayed/failed subscriptions never block IPC or fall back to cloud. Stale join
+  events converge with CLI asynchronous snapshot reconciliation. Machine RPC
+  also provides exact content, save, LSP and diffs.
 - `openFile` uses File Preview v3 plain reads: no workspace watch, All Changes recompute,
   or Flock publish. Electron verifies disk machine identity and reads via local IPC,
   independent of daemon/index readiness. Unknown targets never fall back to Streams;
@@ -81,12 +84,11 @@ Background: [components](../../../../.agents/docs/components-package.md),
 
 ## File identity, caching, and errors
 
-- `session-file-open-target.ts` alone owns path normalization. Canonical workspace-relative
-  paths (tree, quick open, mobile browser, LSP) travel verbatim. Only Markdown hrefs
-  are URL-decoded and stripped of `:<line>` / `#L<line>` suffixes, absolute host
-  roots; same-machine Electron preserves other worktree paths instead of stripping
-  `.../worktrees/<uuid>/` prefixes. Display shortening never rewrites click targets.
-  Line anchors travel as fields, not inside paths.
+- `session-file-open-target.ts` owns normalization: canonical paths travel verbatim;
+  Markdown hrefs decode URL/line suffixes and host roots; local Electron preserves
+  other worktrees. Relative links negotiate `markdownFileLinks` candidates; multiple
+  matches require a choice, unsupported daemons open as before. Pin the selected
+  canonical path; no short-link cache. Anchors remain fields.
 - Cache resolved opens under BOTH `response.path` (the save identity) and the requested
   path (viewer/change-check identity). After save, refresh EVERY `cacheKeys` alias.
   Preview reads are case-tolerant; `save-text` writes are case-exact.
@@ -109,9 +111,11 @@ Background: [components](../../../../.agents/docs/components-package.md),
 
 ## ACP dispatch
 
-- Automatic Role cleanup requires a fresh matching runtime schema and owner access.
-  Persist through a conditional writer transaction; never overwrite intervening edits
-  or clear model/permission pins. See [intent](../../../../specs/agent-role-schema-reconciliation.md).
+- Independent Plan toggles retain Roles; match other pins.
+
+- Automatic Role cleanup needs a fresh matching runtime schema and owner access.
+  Conditional writer transactions preserve concurrent edits and model/permission pins.
+  [Contract](../../../../specs/agent-role-schema-reconciliation.md).
 
 - Display every provider-supplied rate-limit window name with localized duration via
   `formatAgentRateLimitWindowLabel`, even when duration/utilization/reset match.

@@ -534,6 +534,20 @@ End of synthetic document.`,
     expect(container?.querySelector('strong')?.textContent).toBe('raw');
   });
 
+  it('reapplies HTML policy to the same parsed text after static remounts', async () => {
+    const source =
+      'Hello <strong>raw</strong><img src="x" onerror="alert(1)"><script>alert(1)</script>.';
+    for (const allowHtml of [true, false, true]) {
+      await act(async () => root?.render(null));
+      await renderMarkdown(source, { allowHtml });
+      expect(container?.querySelector('strong')?.textContent ?? null).toBe(
+        allowHtml ? 'raw' : null
+      );
+      expect(container?.querySelector('script')).toBeNull();
+      expect(container?.querySelector('[onerror]')).toBeNull();
+    }
+  });
+
   it('keeps inline LaTeX literal while rendering Mermaid blocks', async () => {
     await renderMarkdown(
       [
@@ -848,6 +862,41 @@ End of synthetic document.`,
     expect(container?.textContent).toContain('\\[list_literal\\]');
     expect(container?.textContent).toContain('\\(nested_literal\\)');
     expect(container?.textContent).toContain('\\(ordered_list_literal\\)');
+  });
+
+  it('renders multiline Codex citations as file cards and opens their exact target', async () => {
+    let opened = '';
+    await renderMarkdown(
+      'Ready: :codex-file-citation{path="\n/tmp/exports/预算 draft.xlsx\n" purpose="output" artifact_kind="workbook"} Done.',
+      {
+        onAgentFileLinkClick: (href) => {
+          opened = decodeURIComponent(href);
+        },
+      }
+    );
+    const button = container?.querySelector<HTMLButtonElement>(
+      'button[aria-label="预算 draft.xlsx"]'
+    );
+    expect(button).not.toBeNull();
+    expect(container?.textContent).not.toContain('codex-file-citation');
+    expect(container?.textContent).toContain('Ready:');
+    expect(container?.textContent).toContain('Done.');
+    expect(container?.querySelector('p div')).toBeNull();
+    await act(async () => {
+      button?.click();
+    });
+    expect(opened).toBe('/tmp/exports/预算 draft.xlsx');
+  });
+
+  it('leaves code examples and incomplete citations as text until completed', async () => {
+    const citation = ':codex-file-citation{path="/tmp/report.pdf"}';
+    await renderMarkdown('`' + citation + '`\n\n```text\n' + citation + '\n```');
+    expect(container?.querySelector('button[aria-label="report.pdf"]')).toBeNull();
+    expect(container?.querySelector('code')?.textContent).toBe(citation);
+    await renderMarkdown(citation.slice(0, -1));
+    expect(container?.querySelector('button[aria-label="report.pdf"]')).toBeNull();
+    await renderMarkdown(citation + ' ' + citation);
+    expect(container?.querySelectorAll('button[aria-label="report.pdf"]')).toHaveLength(2);
   });
 
   it('does not parse dollars inside code spans or link labels as LaTeX', async () => {

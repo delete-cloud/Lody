@@ -1,3 +1,4 @@
+import { notificationLabel } from '@lody/shared/notifications';
 import type { RepoRoomSubscription } from 'loro-repo';
 import {
   canonicalScheduleJson,
@@ -46,6 +47,10 @@ import {
 import { createScheduleSyncGate } from './schedule-sync-gate';
 import { ScheduleStore } from './schedule-store';
 import { ScheduleEngine, ScheduleConfigurationError } from './schedule-engine';
+
+// Ticks plan Schedules serially, so this wait delays every other Schedule. A
+// timeout blocks only this definition until the next tick retries it.
+const DEFINITION_SYNC_TIMEOUT_MS = 8_000;
 
 export type ScheduleWorkspaceHandle = {
   evaluate: () => Promise<void>;
@@ -143,7 +148,10 @@ export async function createScheduleWorkspace(args: {
     list: () => repository.list(),
     read: async (id) => {
       if (!args.localOnly)
-        await manager.syncDocOrThrow(getScheduleRoomId(id), { reason: 'schedule:definition' });
+        await manager.syncDocOrThrow(getScheduleRoomId(id), {
+          reason: 'schedule:definition',
+          timeoutMs: DEFINITION_SYNC_TIMEOUT_MS,
+        });
       return repository.read(id);
     },
     validateTarget: async (run) => {
@@ -180,6 +188,11 @@ export async function createScheduleWorkspace(args: {
       if (prepared.meta.machineId !== run.machineId || prepared.meta.userId !== auth.userId)
         throw new Error('Schedule target ownership changed');
       prepared.meta.scheduleId = run.scheduleId;
+      prepared.userTurn.scheduleRun = {
+        scheduleId: run.scheduleId,
+        turnId: prepared.userTurn.id,
+        title: notificationLabel(run.definition.title) ?? '',
+      };
       prepared.source = {
         id: run.sourceEntryId,
         role: 'system',

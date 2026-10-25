@@ -18,8 +18,7 @@ preparing, or one queued behind such a send in the same conversation, is held
 only in the runtime's in-memory `pendingSends` and written when ready. Nothing
 persists it: closing the page mid-upload loses it, and the page asks first.
 Archive and delete cancel held sends of their targets and join in-flight writes.
-`use-session-preparation` holds an owned warmup lease; attachment takeover cancels
-and joins it. See the [attachment draft Spec](../../../../specs/session-files.md).
+See the [attachment draft Spec](../../../../specs/session-files.md).
 
 | Area                   | Entry point                                                                                                        | Responsibility                                                                             |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
@@ -27,6 +26,14 @@ and joins it. See the [attachment draft Spec](../../../../specs/session-files.md
 | Composer configuration | [`use-session-pending-config.ts`](use-session-pending-config.ts)                                                   | Bridge frozen held-send configuration to history/queue without consuming next-draft edits. |
 | Workspace catalogs     | [`use-agent-role-schema-reconciliation.ts`](use-agent-role-schema-reconciliation.ts)                               | Reconcile owned Roles after matching runtime probes.                                       |
 | Conversation rendering | [`use-conversation-stream-items.ts`](use-conversation-stream-items.ts), [`use-session-doc.ts`](use-session-doc.ts) | Coordinate the hydration window and history publication.                                   |
+
+## MCP default readiness
+
+`use-session-mcp-selection.ts` allows default-derived creation after the local
+catalog loads on local-only platforms. Cloud/dual composition additionally waits
+for the first catalog sync: a nonempty local catalog can still lack the project's
+preference row. Existing conversations and explicit selections bypass this gate.
+No extra transport or cloud request is created by the hook.
 
 ## Session ACP catalogs
 
@@ -36,6 +43,19 @@ atom and passes its current runtime overrides to both models and slash commands.
 Missing or mismatched Providers expose no catalog; extension changes invalidate
 old capabilities until a matching probe arrives. A matching extension catalog
 must not be read as though no extensions were selected.
+
+## Avatar sources
+
+`use-stable-avatar-src.ts` keeps the initial remote URL on a cold mount while
+filling the byte cache, then asks `lib/avatar-cache.ts` to preload and asynchronously
+decode that local blob for a return visit. Only avatars used by this hook are
+decoded; startup restoration does not decode the entire persistent cache. The
+cache entry retains the off-DOM image for the same lifetime as its blob URL.
+Source changes select the current URL synchronously, including delayed profile
+arrival and image removal, while background callbacks remain tied to their source.
+First paint and cache reads never await decoding. Fully cold images and missing
+profile data can still show a fallback. Evidence and limits:
+[avatar continuity](../../../../.agents/notes/proposed/bug-fix/2026-10-20-message-avatar-switch-continuity.md).
 
 ## Cloud query recovery
 
@@ -50,6 +70,14 @@ attempts; 30 seconds of continuously observed success resets the budget. Skipped
 unmounted queries stop retries, and session/query identity fences callbacks and results.
 Public queries, mutations/actions and local-only clients keep their existing behavior.
 See the [decision](../../../../.agents/notes/implemented/bug-fix/2026-10-10-cloud-query-server-recovery.md).
+
+Authentication recovery status is presented separately from query retries:
+`AuthenticatedConvexProvider` owns its budget and actions; `AuthRecoveryEntryProvider`
+places a nonmodal icon beside the existing sidebar workspace control through
+`AuthRecoveryEntrySlot`. No status row is added; composer and footer geometry stay
+unchanged. Details open on request and leave drafts and page focus intact. See the
+[UI decision](../../../../.agents/notes/implemented/feature/2026-10-25-nonblocking-auth-recovery.md)
+for placement and verification limits.
 
 ## Session lifecycle
 
@@ -229,10 +257,12 @@ still paid for a full summary rebuild — hence the leading-edge throttle on the
 anchored to the last emit. The permission candidate is a fresh object per scan, so
 depending on it re-runs the payload memo every render.
 
-The 250ms bridge debounce stays for a different job: a flush lands in the commit
-after the change that requested it, and without the debounce the bridge gets both,
-the stale one marking the alert shown so the fresh one is dropped by the
-already-alerted early return.
+The 250ms bridge debounce coalesces the render requesting a flush with its committed
+snapshot. Permission candidates only accelerate that snapshot; they never add an
+alert. Ordinary Push owns reminders. The previous alert-key Set and early return
+were removed because they both duplicated reminders and froze other conversations
+while one request was pending. The optional bridge alert field remains for legacy
+native clients, but this hook never sends it.
 
 `iosLiveActivitiesEnabledAtom` defaults to true, so without the native-shell check
 every desktop build would rebuild a summary it can never show. The activity id is

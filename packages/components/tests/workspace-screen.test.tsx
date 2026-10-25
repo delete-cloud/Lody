@@ -6,6 +6,7 @@ import { Provider, createStore } from 'jotai';
 import {
   createStaticStore,
   LOCAL_PLATFORM_CAPABILITIES,
+  type PlatformE2eeWorkspaces,
   type PlatformProvider,
 } from '@lody/platform';
 import { PlatformContext } from '@lody/platform/react';
@@ -16,6 +17,7 @@ import {
   WorkspaceScreenView,
 } from '../src/components/onboarding/screens/workspace-screen';
 import { initI18n } from '../src/i18n';
+import { toast } from '../src/lib/toast';
 import { TEST_CLOUD_PLATFORM } from './test-platform';
 
 function findButton(container: HTMLElement, label: string): HTMLButtonElement {
@@ -383,5 +385,86 @@ describe('WorkspaceScreen write recovery', () => {
     expect(updateSlug).toHaveBeenCalledWith('workspace-legacy', 'legacy-workspace');
     expect(setActive).toHaveBeenCalledWith('workspace-legacy');
     expect(onNext).toHaveBeenCalledOnce();
+  });
+
+  function encryptionAwarePlatform(
+    workspace: { id: string; name: string; slug: string; contentMode?: string },
+    describeMode: PlatformE2eeWorkspaces['describe'],
+    setActive: () => Promise<void> = async () => {}
+  ): PlatformProvider {
+    return {
+      ...TEST_CLOUD_PLATFORM,
+      e2eeWorkspaces: {
+        describe: describeMode,
+        create: async () => {
+          throw new Error('unused');
+        },
+        history: async () => {
+          throw new Error('unused');
+        },
+      },
+      workspaces: {
+        state: createStaticStore({
+          status: 'ready' as const,
+          workspaces: [{ ...workspace, role: 'owner' }],
+          activeWorkspaceId: workspace.id,
+        }),
+        setActive,
+      },
+    };
+  }
+
+  async function confirm(platform: PlatformProvider, name: string, onNext: () => void) {
+    await act(async () => {
+      root?.render(
+        <PlatformContext.Provider value={platform}>
+          <Provider store={createStore()}>
+            <WorkspaceScreen onBack={vi.fn()} onNext={onNext} />
+          </Provider>
+        </PlatformContext.Provider>
+      );
+    });
+    await act(async () => {
+      findButton(container, name).dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    await act(async () => {
+      findButton(container, 'Next').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  }
+
+  it('continues with the current ordinary workspace without waiting for a mode check', async () => {
+    const onNext = vi.fn();
+    const errorToast = vi.spyOn(toast, 'error');
+    await confirm(
+      encryptionAwarePlatform(
+        { id: 'workspace-a', name: 'Alpha', slug: 'alpha' },
+        () => Promise.reject(new Error('e2ee_workspace_mode_unavailable')),
+        // An unanswered activation proves the already-active short-circuit.
+        () => new Promise(() => {})
+      ),
+      'Alpha',
+      onNext
+    );
+    expect(onNext).toHaveBeenCalledOnce();
+    expect(errorToast).not.toHaveBeenCalled();
+  });
+
+  it('reports a failed mode check of an encrypted-listed workspace with the generic switch copy', async () => {
+    const onNext = vi.fn();
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const errorToast = vi.spyOn(toast, 'error');
+    await confirm(
+      encryptionAwarePlatform(
+        { id: 'workspace-e', name: 'Vault', slug: 'vault', contentMode: 'e2ee' },
+        () => Promise.reject(new Error('e2ee_workspace_mode_unavailable'))
+      ),
+      'Vault',
+      onNext
+    );
+    expect(onNext).not.toHaveBeenCalled();
+    expect(errorToast).toHaveBeenCalledWith('Could not switch workspace. Try again.', undefined);
+    expect(findButton(container, 'Next').disabled).toBe(false);
   });
 });
