@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import type { CodeCollabV2WorkspaceResolver } from '../src/lib/code-collab/code-collab-v2-service';
 import { updateTestHistory } from './history-port-fixture';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LoroRepo } from 'loro-repo';
@@ -79,6 +80,7 @@ type MessageHandlerHost = {
   ): Promise<void>;
   appendAssistantFileBlocksToActiveTurn(...args: unknown[]): Promise<boolean>;
   resolveSessionWorkspaceRoot(sessionId: SessionId): string | null;
+  resolveCodeCollabV2Workspace: CodeCollabV2WorkspaceResolver;
   validateSessionFileUploadPath(...args: unknown[]): Promise<ValidatedUploadFile>;
   uploadValidatedSessionFile(...args: unknown[]): Promise<UploadedSessionFile>;
   createAssistantImageGroupEntry(args: {
@@ -558,6 +560,10 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
         const filePath = join(workspaceRoot, 'result.txt');
         vi.spyOn(handler, 'appendAssistantFileBlocksToActiveTurn').mockResolvedValue(false);
         vi.spyOn(handler, 'resolveSessionWorkspaceRoot').mockReturnValue(workspaceRoot);
+        vi.spyOn(handler, 'resolveCodeCollabV2Workspace').mockResolvedValue({
+          ok: true, ownerSessionId: sessionId, workspaceRoot,
+          fileRoots: [{ id: 'main', absolutePath: workspaceRoot }],
+        });
         vi.spyOn(handler, 'validateSessionFileUploadPath').mockResolvedValue({
           absolutePath: filePath,
           fileName: 'result.txt',

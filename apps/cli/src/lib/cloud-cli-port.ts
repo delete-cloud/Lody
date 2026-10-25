@@ -11,6 +11,7 @@ import {
   buildLoroStreamsTokenEndpoint,
   PreviewControlVerificationSchema,
   createLoroStreamsTokenProviderLegacy,
+  describeLoroStreamsTokenCause,
   makeLoroStreamsTokenProvider,
   makeLoroStreamsTokenWebPorts,
   LoroStreamsTokenPorts,
@@ -37,7 +38,8 @@ import {
 } from './workspace';
 import { NotificationService } from './notifications';
 import { UsageTrackingService, type RecordSessionUsageInput } from './usage/usage-tracking-service';
-import { GitHubTokenManager } from './github-token-manager';
+import { GitHubTokenManager, createSharedGitHubTokenManagers } from './github-token-manager';
+import { makeStreamsTokenShares } from './loro/streams-token-shares';
 import { submitBugReportFromMachine } from './bug-report';
 import { createCloudPrAssociationPort } from './cloud-pr-association';
 
@@ -111,30 +113,40 @@ export function createCloudStreamsTokenPort(options: {
   const fetchImpl = getCliHttpFetch({ logger: options.logger });
   let retiring = false;
   const legacyOwners = new Map<ReturnType<typeof createLoroStreamsTokenProviderLegacy>, boolean>();
+  // Durable sync, presence and Machine RPC of one workspace borrow one kernel.
+  const shares = makeStreamsTokenShares(
+    (workspaceId) =>
+      makeLoroStreamsTokenProvider({
+        endpoint: buildLoroStreamsTokenEndpoint(authSiteUrl),
+        workspaceId,
+      }).pipe(
+        Effect.provideService(
+          LoroStreamsTokenPorts,
+          makeLoroStreamsTokenWebPorts({
+            credential: Effect.succeed(options.token),
+            fetchImpl,
+          })
+        )
+      ),
+    {
+      onCleanupReported: (cause) =>
+        options.logger.debug(
+          `[streams-token] Recovered ended release failure ${JSON.stringify(describeLoroStreamsTokenCause(cause))}`
+        ),
+    }
+  );
   return {
     createTokenProvider: ({ workspaceId }) =>
       Effect.suspend(() => {
         if (retiring) return Effect.die(new Error('Streams token port closed'));
-        return makeLoroStreamsTokenProvider({
-          endpoint: buildLoroStreamsTokenEndpoint(authSiteUrl),
-          workspaceId,
-        }).pipe(
-          Effect.provideService(
-            LoroStreamsTokenPorts,
-            makeLoroStreamsTokenWebPorts({
-              credential: Effect.succeed(options.token),
-              fetchImpl,
-            })
-          )
-        );
+        return shares.acquire(workspaceId);
       }),
     createTokenProviderLegacy: ({ workspaceId }) => {
       if (retiring) throw new Error('Streams token port closed');
+      // Legacy entry: borrowing is synchronous, and its view closes with the facade.
       const provider = createLoroStreamsTokenProviderLegacy({
-        endpoint: buildLoroStreamsTokenEndpoint(authSiteUrl),
-        workspaceId,
-        authToken: () => options.token,
-        fetchImpl,
+        provider: Effect.runSync(shares.borrow(workspaceId)),
+        executor: Effect,
       });
       legacyOwners.set(provider, false);
       return provider;
@@ -180,7 +192,15 @@ export function createCloudCliPort(options: CloudCliPortOptions): CloudPort {
     cliToken: options.token,
     logger: options.logger,
   });
-  const tokenManagers = new Set<GitHubTokenManager>();
+  const githubTokenManagers = createSharedGitHubTokenManagers(
+    (workspaceId) =>
+      new GitHubTokenManager({
+        serverUrl: authBaseUrl,
+        cliToken: options.token,
+        workspaceId,
+        logger: options.logger,
+      })
+  );
   const streamsTokens = createCloudStreamsTokenPort({
     token: options.token,
     authBaseUrl,
@@ -270,16 +290,7 @@ export function createCloudCliPort(options: CloudCliPortOptions): CloudPort {
     },
     billing,
     githubTokens: {
-      createTokenManager: (workspaceId) => {
-        const manager = new GitHubTokenManager({
-          serverUrl: authBaseUrl,
-          cliToken: options.token,
-          workspaceId,
-          logger: options.logger,
-        });
-        tokenManagers.add(manager);
-        return manager;
-      },
+      createTokenManager: (workspaceId) => githubTokenManagers.acquire(workspaceId),
     },
     bugReports: {
       submit: async (report) =>
@@ -344,8 +355,7 @@ export function createCloudCliPort(options: CloudCliPortOptions): CloudPort {
       baseUrl: resolveRuntimeArtifactsBaseUrl(options.runtimeArtifactsBaseUrl),
     },
     dispose: async () => {
-      await Promise.allSettled([...tokenManagers].map(async (manager) => await manager.shutdown()));
-      tokenManagers.clear();
+      await githubTokenManagers.shutdownAll();
       await streamsTokens.closeLegacy();
       await subscriptionClient.close();
     },

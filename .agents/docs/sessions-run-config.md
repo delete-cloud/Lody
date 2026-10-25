@@ -54,12 +54,6 @@ this page is the full text of the rules summarised there.
   Submenus do not center against the whole parent
   popup or clamp to its bottom. Intent:
   [run-config submenu placement](../../specs/composer-run-config-submenu-placement.md).
-  Builtin DeepSeek Harness sessions using a non-Pro model show the same linked
-  delegation-cost warning here and in `MobileRunConfigSheet`: until upstream DSH
-  fixes child-route inheritance, a delegated child may use the session's
-  creation-time DeepSeek-V4-Pro seed rather than the parent's visible model.
-  Keep the warning tied to that agent/model combination and its upstream
-  discussion rather than turning it into a global banner.
   Agent/Model/Reasoning option selection closes the dropdown and must not return
   keyboard focus to its trigger; Plan/Fast toggle rows intentionally stay open.
   Once the model list reaches `OPTION_SEARCH_MIN_OPTIONS`
@@ -129,7 +123,13 @@ this page is the full text of the rules summarised there.
   ready because its transient provider defaults are not a valid run config.
   Programmatic Turns inherit the current
   Role only after their final run-config overrides are applied; if an override
-  breaks a value the Role pins, freeze explicit None instead of a lying Role id.
+  breaks a non-Plan value the Role pins, freeze explicit None. Independent Plan
+  is a per-turn override: valid boolean `plan_mode` toggles and legacy
+  `collaboration_mode` default/plan switches retain the Role, revision, snapshot,
+  and memory. Selecting the Role still seeds its saved Plan value; dispatch uses
+  the actual composer/override value, without rewriting the Role catalog. Missing
+  or invalid Plan values still fail matching. Permission-based Plan (`modeId`
+  or permission options) remains a pinned permission, not this exception.
   A legacy/non-composer Turn with both fields absent inherits the most recent
   explicit selection; only `agentRoleId: null` means None. Keep unsynced catalog
   rows and not-yet-hydrated Session docs in the unknown state — neither may
@@ -207,13 +207,14 @@ this page is the full text of the rules summarised there.
   two dispatches disagreeing about a runtime-omitted key plus options rebuilt
   from the selection was a synchronous #185 render loop on session open. The footer names a Role only while
   `isComposerAgentRoleApplied` still holds (`lib/composer-agent-roles.ts`):
-  every value the Role pins is what will run. Moving a knob takes the name away
+  every non-Plan pin matches, and independent Plan may be overridden as above.
+  Moving another pinned knob takes the name away
   rather than clearing the preference, which would re-seed the value just
   changed. With a Role selected the TRIGGER carries the Role and nothing else,
   and the model/reasoning/permission/Plan/Fast values render beside it as inert
-  dimmed text: a Role IS the whole configuration, so changing one of those by
-  hand is exactly what unnames it, and a knob that silently unnames the thing
-  next to it is a trap. Permission is one of those values
+  dimmed text. Changing a pinned non-Plan value by hand unnames the Role;
+  independent Plan remains adjustable inside the menu. Permission is pinned
+  when present
   (`doesAgentRolePinPermissionMode`), so `DesktopPermissionModeButton` is not
   rendered at all while a Role that pins it is selected — but it STAYS a button
   when the Role pins nothing there, because an agent with no permission control

@@ -227,6 +227,71 @@ describe('LodyOperationStore', () => {
     }
   });
 
+  it('inherits complete scoped batch provenance and waits for every result or descendant', async () => {
+    const store = await makeStore();
+    const base = baseInput();
+    const input = {
+      workspaceId: base.workspaceId,
+      sessionId: base.requesterSessionId,
+      userId: base.requesterUserId,
+      inputId: 'summary',
+      kind: 'human' as const,
+      config: {},
+    };
+    const accept = (id: string, origins: string[], userId = input.userId) =>
+      store.accept({
+        ...base,
+        operationId: id,
+        requesterUserId: userId,
+        frozenContinuationConfig: {
+          ...base.frozenContinuationConfig,
+          notificationOriginTurnIds: origins,
+        },
+      });
+    const finish = (id: string) =>
+      store.finish(input.sessionId, id, { type: 'result', value: { items: [] } });
+    try {
+      store.inbox.activate(input.workspaceId, 'owner');
+      // The second request occurs beyond the 50-member inline preview.
+      for (let i = 0; i < 52; i++) {
+        accept(`child-${i}`, [i < 51 ? 'request-a' : 'request-b']);
+        finish(`child-${i}`);
+      }
+      accept('delegated', []);
+      finish('delegated');
+      accept('another-user', ['foreign-request'], 'user-2');
+      finish('another-user');
+      store.inbox.accept(input);
+      store.inbox.begin(input, 'exec');
+      const batch = store.inbox.prepare(input, 'owner')!;
+      expect(batch.memberCount).toBe(53);
+      expect(store.notificationOriginsForBatch(batch).sort()).toEqual(['request-a', 'request-b']);
+      expect(store.notificationOriginsForBatch({ ...batch, userId: 'user-3' })).toEqual([]);
+      expect(
+        store.pendingNotificationOrigins(input, ['request-a', 'request-b', 'foreign-request'])
+      ).toEqual(new Set(['request-a', 'request-b']));
+      expect(store.inbox.fence(batch, 'exec')).toBe(true);
+      store.inbox.settle(batch, 'settled');
+      expect(store.pendingNotificationOrigins(input, ['request-a', 'request-b'])).toEqual(
+        new Set()
+      );
+      accept('follow-up', ['request-a']);
+      expect(store.pendingNotificationOrigins(input, ['request-a', 'request-b'])).toEqual(
+        new Set(['request-a'])
+      );
+      expect(
+        store.get(input.sessionId, 'follow-up').frozenContinuationConfig.notificationOriginTurnIds
+      ).toEqual(['request-a']);
+      finish('follow-up');
+      // A finished child still has work outstanding until its result is consumed.
+      expect(store.pendingNotificationOrigins(input, ['request-a'])).toEqual(
+        new Set(['request-a'])
+      );
+    } finally {
+      store.close();
+    }
+  });
+
   it('counts wakeable queued receipts and retained execution as work; pause makes receipts passive', async () => {
     const store = await makeStore();
     const op = baseInput();
@@ -568,6 +633,7 @@ describe('LodyOperationStore', () => {
               modeId: 'default',
               builtinDefaultModeId: 'default',
               modelId: 'gpt-5',
+              mcpServerIds: [],
               configOptionValues: { fast: true },
               inheritedDispatchConfig: { modelId: 'gpt-5', configOptionValues: { fast: true } },
               memory: { providerId: 'nowledge-mem', memoryId: 'reviewer' },
@@ -583,6 +649,7 @@ describe('LodyOperationStore', () => {
           modeId: 'default',
           builtinDefaultModeId: 'default',
           modelId: 'gpt-5',
+          mcpServerIds: [],
           configOptionValues: { fast: true },
           inheritedDispatchConfig: { modelId: 'gpt-5', configOptionValues: { fast: true } },
           memory: { providerId: 'nowledge-mem', memoryId: 'reviewer' },
@@ -628,7 +695,10 @@ describe('LodyOperationStore', () => {
       };
       return {
         resolve: (dispatchConfig: ResolvedTurnDispatchConfig) =>
-          resolveEffectiveSessionCreateDispatchConfig({ ...args, dispatchConfig }),
+          resolveEffectiveSessionCreateDispatchConfig({
+            ...args,
+            dispatchConfig: { mcpServerIds: [], ...dispatchConfig },
+          }),
         setCapability: (next: AcpCapabilityCacheEntry | undefined, confirmed: boolean) => {
           capability = next;
           freshnessConfirmed = confirmed;
@@ -795,6 +865,76 @@ describe('LodyOperationStore', () => {
       ).toThrowError(
         expect.objectContaining<LodyOperationStoreError>({ code: 'OPERATION_ID_REUSED' })
       );
+    } finally {
+      store.close();
+    }
+  });
+
+  it('adopts an identical active create retried from the same source Turn under a fresh id', async () => {
+    const store = await makeStore();
+    try {
+      const create = { ...baseInput(), kind: 'session_create' as const };
+      const first = store.accept(create, { materializationClaimToken: 'claim-1' });
+      const retried = { ...create, operationId: 'review-round-1-retry' };
+
+      expect(
+        store.findMatchingRetry(
+          retried.requesterSessionId,
+          retried.operationId,
+          retried.kind,
+          { target: 'target-1', prompt: 'review' },
+          retried.requesterUserId,
+          retried.frozenContinuationConfig.sourceTurnId
+        )
+      ).toMatchObject({ operationId: 'review-round-1' });
+      const adopted = store.accept(
+        {
+          ...retried,
+          items: [
+            {
+              status: 'active' as const,
+              target: { sessionId: 'target-2' as SessionId, userTurnId: 'turn-2' },
+              inputDurable: false,
+            },
+          ],
+        },
+        { materializationClaimToken: 'claim-2' }
+      );
+
+      expect(first).toMatchObject({ created: true, claimedItemIndexes: [0] });
+      expect(adopted).toMatchObject({ created: false, claimedItemIndexes: [] });
+      expect(adopted.operation.operationId).toBe('review-round-1');
+      expect(adopted.operation.items[0]).toMatchObject({ target: { sessionId: 'target-1' } });
+      expect(() => store.get(retried.requesterSessionId, retried.operationId)).toThrowError(
+        expect.objectContaining<LodyOperationStoreError>({ code: 'OPERATION_NOT_FOUND' })
+      );
+
+      // Different work, another Turn, and non-create kinds stay independent.
+      const otherPrompt = store.accept({
+        ...create,
+        operationId: 'other-prompt',
+        canonicalCommand: { prompt: 'implement', target: 'target-1' },
+      });
+      const otherTurn = store.accept({
+        ...create,
+        operationId: 'other-turn',
+        frozenContinuationConfig: {
+          ...create.frozenContinuationConfig,
+          sourceTurnId: 'source-turn-2',
+        },
+      });
+      store.accept({ ...baseInput(), operationId: 'chat-1' });
+      const chat = store.accept({ ...baseInput(), operationId: 'chat-2' });
+      expect([otherPrompt.created, otherTurn.created, chat.created]).toEqual([true, true, true]);
+
+      // A finished create is history, not an in-flight request to adopt.
+      store.finish(create.requesterSessionId, create.operationId, {
+        type: 'result',
+        value: { items: [] },
+      });
+      const again = store.accept({ ...create, operationId: 'review-round-1-again' });
+      expect(again.created).toBe(true);
+      expect(again.operation.operationId).toBe('review-round-1-again');
     } finally {
       store.close();
     }

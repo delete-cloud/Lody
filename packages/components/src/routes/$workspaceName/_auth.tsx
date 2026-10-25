@@ -1,16 +1,11 @@
-import { createFileRoute, Outlet } from '@tanstack/react-router';
+import { createFileRoute } from '@tanstack/react-router';
+import { AuthenticatedWorkspaceContent } from '@/components/authenticated-workspace-content';
 import { BootNavigate } from '@/components/boot-navigate';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useOrganization } from '@/hooks/useOrganization';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { runtimeInitializingAtom, userAtom } from '@/atoms';
-import { WorkspaceCheckoutPendingDialog } from '@/components/workspace-checkout-pending-dialog';
-import { ElectronSessionCompletionNotifier } from '@/components/electron-session-completion-notifier';
-import { ElectronMenuHandler } from '@/components/electron-menu-handler';
-import { AppCommands } from '@/components/app-commands';
-import { CommandPalette } from '@/components/commands/command-palette';
-import { AutoArchivePrWatcher } from '@/components/auto-archive-pr-watcher';
 import { useStableSession } from '@/hooks/useStableSession';
 import { useOnlineMachineIds } from '@/hooks/use-machine-online-status';
 import { usePostHog } from '@posthog/react';
@@ -38,6 +33,11 @@ import { isNativeIOSAppShell } from '@/lib/native-platform';
 import { isLocalAppPlatform } from '@/lib/app-platform';
 import { useResolvedWorkspaceScope } from '../../hooks/use-resolved-workspace-scope';
 import { WorkspaceSyncStuckReporter } from '@/components/workspace-sync-stuck-reporter';
+import {
+  resolveWorkspaceDataWaitKind,
+  useRecordWorkspaceDataReady,
+  WorkspaceDataWait,
+} from '@/components/workspace-data-wait';
 import { useBillingOverviewPreload } from '../../hooks/use-billing-overview-preload';
 
 const AUTH_ROUTE_ONESIGNAL_LOGIN_IDLE_TIMEOUT_MS = 10_000;
@@ -362,6 +362,7 @@ function AuthedLayoutRoutes({
   useBillingOverviewPreload(user ? currentWorkspaceId : null);
   const [orgSettled, setOrgSettled] = useState(!organizationsLoading);
   const [userSettled, setUserSettled] = useState(Boolean(user) && Boolean(currentWorkspaceId));
+  useRecordWorkspaceDataReady(currentWorkspaceId ? workspaceName : null, user?.id ?? null);
 
   useEffect(() => {
     if (!organizationsLoading) {
@@ -381,14 +382,13 @@ function AuthedLayoutRoutes({
     }
 
     if (!currentWorkspaceId) {
+      const waitKind = resolveWorkspaceDataWaitKind(workspaceName, user?.id ?? null);
+      if (waitKind === 'cold-start') {
+        return <WorkspaceDataWait kind={waitKind} />;
+      }
       return (
         <PreloadedMainLayout workspaceReady={false}>
-          <BlockingWaitPlaceholder
-            gate="workspace_data"
-            variant="content"
-            title={t('workspace.route.switchingTitle')}
-            description={t('workspace.route.switchingDescription')}
-          />
+          <WorkspaceDataWait kind={waitKind} />
         </PreloadedMainLayout>
       );
     }
@@ -469,23 +469,5 @@ function AuthedLayoutRoutes({
     <PreloadedMainLayout>
       <AuthenticatedWorkspaceContent showWorkspaceCheckout />
     </PreloadedMainLayout>
-  );
-}
-
-function AuthenticatedWorkspaceContent({
-  showWorkspaceCheckout = false,
-}: {
-  showWorkspaceCheckout?: boolean;
-}) {
-  return (
-    <>
-      <Outlet />
-      <ElectronSessionCompletionNotifier />
-      <ElectronMenuHandler />
-      <AppCommands />
-      <CommandPalette />
-      <AutoArchivePrWatcher />
-      {showWorkspaceCheckout && <WorkspaceCheckoutPendingDialog />}
-    </>
   );
 }

@@ -1,5 +1,9 @@
 import {
   deleteWorkspaceMcpServerFromFlock,
+  getEffectiveDefaultMcpIds,
+  getProjectMcpDefaults,
+  getProjectMcpKey,
+  type ProjectRef,
   getWorkspaceFlockDocId,
   listWorkspaceMcpServers,
   readWorkspaceFlockRowsFromFlock,
@@ -98,5 +102,21 @@ export async function deleteWorkspaceMcpCatalogEntry(
 ): Promise<McpCatalogWriteResult> {
   return commitCatalogChange(repo, workspaceId, options, (flock) =>
     deleteWorkspaceMcpServerFromFlock(flock, mcpServerId)
+  );
+}
+
+/** Read a single ready workspace snapshot; explicit selections bypass defaults. */
+export async function readProjectDefaultMcpIds(
+  repo: WorkspaceMcpReadableRepo,
+  workspaceId: WorkspaceId,
+  project: ProjectRef | undefined,
+  machineId: string
+): Promise<McpServerId[]> {
+  const handle = await repo.openFlockDoc(getWorkspaceFlockDocId(workspaceId));
+  const rows = readWorkspaceFlockRowsFromFlock(handle.flock);
+  const key = getProjectMcpKey(project, machineId);
+  return getEffectiveDefaultMcpIds(
+    listWorkspaceMcpServers(rows),
+    key ? getProjectMcpDefaults(rows)[key] : undefined
   );
 }

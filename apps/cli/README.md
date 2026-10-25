@@ -22,6 +22,23 @@ retain the production-only check. `tsconfig.tests.json` remains the explicit
 test-inclusive check; existing test typing errors are not part of the production
 check.
 
+## Roost cache recovery tests
+
+Regular `pnpm test` runs the Native recovery contract with 1 and 120 retained turns
+(three 40-turn pages). It checks the complete cached history against the owner and
+rejects requests for unchanged pages during recovery.
+
+Run the same assertions with 2,000 turns outside regular CI:
+
+```sh
+corepack pnpm --dir apps/cli test:roost-recovery:perf
+```
+
+Run this command from the repository root. The scale test allows 120 seconds for
+the Native SQLite import; regular setup and recovery each keep a 30-second limit.
+Vitest reports recovery's test-body duration separately from the file duration,
+which also includes setup. This is a scale regression test, not a network benchmark.
+
 ## Daemon upgrades and autostart
 
 Remote upgrades install globally using the daemon's npm environment, resolve the
@@ -53,6 +70,14 @@ An already-running old watchdog cannot acquire this fix merely by downloading it
 the one-time launcher correction and restart are needed for that deployment.
 Older releases without versioned readiness cannot be verified by the new remote
 handoff and must be started explicitly if a rollback is required.
+
+The launcher waits up to three minutes for the new Worker to become ready.
+Releases before this change waited 30 seconds, and the old watchdog applies
+its own limit during the handoff. So on a machine where cold start exceeds
+30 seconds, remote upgrades from those releases keep falling back to the old
+version. They also fail `daemon start`. Install the fixed release globally,
+then run `daemon stop` and `daemon start` with its launcher (steps 2 and 4
+above). Later remote upgrades use the longer limit.
 
 ## Structured Session output
 
@@ -119,6 +144,36 @@ These workspace queries use the existing cloud command runtime. The OSS local
 composition does not enable cloud queries; local project listing remains available.
 Catalog `--offline` skips catalog synchronization but still verifies authorization;
 GitHub repository listing requires connectivity.
+
+## Import Magpie providers on a server
+
+Run on the machine hosting both Lody and Magpie, with Lody signed in and its daemon
+running. This uses the existing workspace command runtime, not the OSS local-only
+composition. Explicit command execution authorizes the import; no desktop is needed.
+
+```sh
+lody agent-config import-magpie --workspace team --json
+lody agent-config import-magpie --workspace team --targets pi,codex --gateway http://127.0.0.1:3425 --json
+lody agent-config import-magpie --workspace team --link 'lody://provider/import?v=1&data=…' --json
+```
+
+Without `--targets`, import all seven (`claude,codex,pi,dsh,kimi,grok,bub`), or all
+those offered by `--link`. A target subset cannot expand a link's offered targets.
+`--gateway` and `--link` are mutually exclusive. The gateway must be a literal
+loopback HTTP origin; upstream credentials stay in Magpie. The command always
+uses the invoking machine, ignoring `LODY_MACHINE_ID`; there is no remote-machine
+flag. The daemon must advertise `magpieImport` and `providerSetup`, plus `builtinPi`
+when Pi is selected. Unsupported selections fail before any writes.
+
+Existing providers are preserved. Repeated imports reuse providers or pending setup
+IDs for the same gateway/runtime, and requeue failed setups with their existing
+configuration. Managed runtimes and Bub enter the normal daemon setup queue;
+DSH is saved directly. Bub still needs a user-installed `bub acp` and ACP plugin.
+JSON lists each target, `agentConfigId`, and status (`existing`, `created`, or a
+setup status). `queued` is not ready: follow progress in Providers. `synced: false`
+means saved locally but publication is unconfirmed; rerun after connectivity recovers.
+Import does not verify upstream inference. Startup generates native configuration
+from the gateway's live catalog as described in the [Magpie contract](../../specs/magpie-provider-import.md).
 
 ## Agent configuration output
 

@@ -1,4 +1,5 @@
 export * from './types';
+export * from './history-patches';
 export { type SessionSnapshot, type SessionSnapshotService } from './snapshot';
 export * from './domain';
 export {
@@ -37,7 +38,12 @@ export {
 
 export * from './history-import';
 
-export { applyHistoryAction, historyActionTarget, type HistoryAction } from './history-actions';
+export {
+  applyHistoryAction,
+  planHistoryAction,
+  historyActionTarget,
+  type HistoryAction,
+} from './history-actions';
 
 export {
   findProgressMessageId,

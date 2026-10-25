@@ -9,7 +9,7 @@ this page is the full text of the rules summarised there.
 
 - Desktop top bar is ONE merged row (no repo-title header row): `SessionTabBar`
   with `leftSlot` (sidebar expand + macOS traffic-light inset via `className`)
-  and `rightSlot` = a `SessionChatInterface headerVariant="toolbar"` instance
+  and `rightSlot` receives a portal from the existing root chat controller
   (IDE launcher / Browser / "…" menu / sidebar toggle — no title, no PR badge).
   All macOS traffic-light insets (sidebar `h-11 pt-[2px]` header, this bar's
   `pl-[4.5rem]`, `reserveMacTrafficLightInset`, landing `left-[96px]`, and the
@@ -144,7 +144,7 @@ this page is the full text of the rules summarised there.
     In a multi-member workspace, `SessionAccessControl` sits in the desktop toolbar
     before the "…" menu only while effective access is `Private`; Team and unresolved
     states stay hidden. Single-member workspaces do not resolve or pass sharing state.
-    Its menu action enters the existing parent-owned confirmation flow. Keep the full
+    Its popover's team action enters the existing parent-owned confirmation flow. Keep the full
     status/action in `SessionHeaderMenu` as the mobile/compact fallback.
     The "…" menu's `Change owner` submenu writes `SessionMeta.userId` — the OWNER
     field, which drives the sidebar My/Team split, the row author avatar, CLI

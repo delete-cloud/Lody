@@ -1,3 +1,5 @@
+import { decodeSessionFilePath } from './project-path';
+import type { AgentRoleProposalMeta } from './agent-role-proposal';
 import type { LodyRateLimitsCapability } from 'acp-extension-core';
 import type { MemoryBinding } from './memory-provider';
 import type { AcpModelControls } from './acp-model-capabilities';
@@ -1322,6 +1324,7 @@ export type SystemNoticeName =
   | 'agent_warning'
   | 'task_proposal'
   | 'schedule_proposal'
+  | 'agent_role_proposal'
   | 'session_fork_origin';
 
 /**
@@ -1494,6 +1497,7 @@ export type SystemNoticeMeta = {
   agent_warning: AgentWarningMeta;
   task_proposal: TaskProposalMeta;
   schedule_proposal: ScheduleProposalMeta;
+  agent_role_proposal: AgentRoleProposalMeta;
   session_fork_origin: SessionForkOriginMeta;
 };
 
@@ -1545,6 +1549,14 @@ export type SessionFileTransport = 'r2' | 'local';
  * absolute or parent-traversing path when it reaches a different machine.
  */
 export function isSessionFileSourcePath(value: string): boolean {
+  if (value.startsWith('\0')) {
+    const decoded = decodeSessionFilePath(value);
+    return (
+      decoded !== undefined &&
+      decoded.rootId !== 'main' &&
+      isSessionFileSourcePath(decoded.relativePath)
+    );
+  }
   if (value.length === 0 || value.includes('\0')) return false;
   const normalized = value.replace(/\\/g, '/');
   if (normalized === '.' || normalized.startsWith('/') || /^[A-Za-z]:/.test(normalized)) {

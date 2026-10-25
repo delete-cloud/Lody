@@ -17,7 +17,7 @@ Translation: current
 
 一台负载较高的 Linux daemon 上的一次失败展示了完整过程。turn 到达时的设置与预备 Session
 不一致，接管失败，冷启动按照
-[预备交接](../../../../specs/session-worktree-lifecycle.md#preparation-handoff)
+[预备交接](../../implemented/simplification/2026-10-16-remove-draft-session-preparation.zh.md)
 的要求等待预备 Session 回收。回收结束了 agent，并在按仓库加的文件锁下删除了预备的
 worktree 和分支。分支删除后约十秒，回收以空原因失败，turn 在等待 75 秒后失败。
 
@@ -49,6 +49,7 @@ claim key、就绪状态还是兼容性不同，调查只能猜测是哪个设�
   包装中重复。需要完整 `Cause` 的调用方仍可从错误对象上拿到。
 - **回收时重试或忽略释放超时。** 推迟。这会改变“释放失败会阻止同一 Session 被替换”的保证
   （[回收重试](2026-10-15-unreleased-session-resources-retry.zh.md)），需要单独决定。
+  后续变更：锁释放超时不再让持有者失败，见[持有者释放](../architecture/2026-10-16-file-lock-holder-release.zh.md)。
 
 ## 取舍与限制
 

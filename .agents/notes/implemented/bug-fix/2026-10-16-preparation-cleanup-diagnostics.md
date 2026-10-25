@@ -21,7 +21,7 @@ transient lock-release timeout should still fail the turn is left open.
 One failing turn on a loaded Linux daemon shows the sequence. The turn arrived
 with settings that did not match its warm preparation, so the claim missed and
 the cold start awaited the preparation's retirement, as the
-[preparation handoff](../../../../specs/session-worktree-lifecycle.md#preparation-handoff)
+[preparation handoff](../../implemented/simplification/2026-10-16-remove-draft-session-preparation.md)
 requires. Retirement killed the agent and removed the prepared worktree and
 branch under the per-repository file lock. About ten seconds after the branch
 was deleted, retirement rejected with an empty cause, and the turn failed after
@@ -66,6 +66,8 @@ differed, so the investigation could only guess which setting changed.
   change the guarantee that a failed release fences same-Session replacement
   ([retirement retry](2026-10-15-unreleased-session-resources-retry.md)) and
   needs its own decision.
+  Later change: a lock-release timeout no longer fails the holder; see
+  [holder release](../architecture/2026-10-16-file-lock-holder-release.md).
 
 ## Trade-offs and limits
 

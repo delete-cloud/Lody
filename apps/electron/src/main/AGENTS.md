@@ -7,6 +7,12 @@ Main authentication uses `auth-fetch.ts` with Electron Chromium networking after
 app readiness. Preserve Better Auth cookie hooks and cancellation; never bypass
 certificate verification. Behavior: [login Spec](../../../../specs/desktop-browser-login.md).
 
+When `AuthService.getSession` retries a rejected renderer bearer using its durable
+cookie, preserve the fallback's error/result. A network failure or 5xx must never
+be replaced by the earlier 401: shared session verification would interpret two
+such results as confirmed sign-out. Cached identity remains scoped to the auth
+generation and is cleared by explicit sign-out or definitive session rejection.
+
 ## Diagnostics
 
 Resource links use `lody://` in every channel; startup never replaces an existing
@@ -38,3 +44,41 @@ The [window Spec](../../../../specs/desktop-windows.md) owns the behavior contra
   never reaches that store. Every `conf` store built at import or startup goes through
   `createSettingsStoreWithFallback` (`createMainSettingsStore` for new `userData` stores):
   `conf` validates in its constructor, so a malformed file would otherwise stop launch.
+
+## E2EE key custody
+
+`e2ee-custody.mts` selects Electron OS protection for core node-custody, which owns an explicit Scope, a wrapped KEK and
+XChaCha20-Poly1305 protected blobs. It never joins the renderer IPC registry or
+starts from application bootstrap. The explicit E2EE IPC methods create
+or reopen an account-bound local pending request and workspace runtime; they expose public state and signed genesis bytes only, with no arbitrary signing or key export. It rejects local composition
+before authentication/native access and checks the main-process account session.
+Content synchronization remains closed until its separate encrypted adapter exists.
+`e2ee-custody-electron.ts` is the readiness-gated native composition factory.
+Reject unavailable native encryption and Linux `basic_text`/unknown backends;
+never reuse auth cookie plaintext overrides or fall back to plaintext files.
+
+All installed/candidate binding fields are authenticated AAD and encrypted in the
+core payload. For new workspaces, use `prepareDevice` only for local genesis signing, then
+`retainDevice(actualGenesis, prepared)` before any network/CAS; failed preparations
+use `discardDevice` and never delete retained originals. Device private keys are
+encrypted on disk and imported as nonextractable native handles; Recovery secrets have no persistence method.
+Hand custody to `@lody/e2ee-core` only through `desktopE2eePorts` (KeyProtector,
+CandidateProtector, DeviceIdentity); keep the two protection purposes distinct.
+Caller-owned recipient handles must remain within the custody owner's Scope:
+WebCrypto provides no deterministic handle destruction or JS-string erasure.
+Stop admission before shutdown, await actual native work, then clear owned KEK
+bytes. Failed opens preserve originals; no key deletion or migration. Interrupted
+KEK rewrap recovers only a validated same-key wrapper under the native OS mutex;
+never infer lock ownership from PID/age or generate a replacement KEK on failure.
+
+`services/e2ee-bootstrap.mts` commits immutable creation intent and signed genesis
+before retaining device/epoch keys. Return only after native device reopen and core
+epoch commitment verification. Exact retries retain original bytes and metadata;
+incomplete local writes, unknown remote outcomes and corruption must never trigger
+replacement keys or deletion. SQLite owns the cross-process creation mutex; scopes
+await admitted native work before releasing it. No network or plaintext data-plane
+activation belongs in this host workflow.
+
+The owning test uses synthetic authenticated safeStorage plus real crypto,
+filesystem and another OS process. It does not prove an OS keychain or all-platform
+packaging result; native safeStorage assurance needs an isolated platform run.

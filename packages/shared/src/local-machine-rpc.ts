@@ -1,3 +1,5 @@
+import { SessionFileRootIdSchema } from './project-path';
+import { ProjectLocalMemberProbeSchema } from './workspace-project';
 import { MemoryProviderRequestSchema, MemoryProviderResponseSchema } from './memory-provider';
 import {
   IosSimulatorCommandSchema,
@@ -84,6 +86,8 @@ export const SessionActiveInvocationContextResultSchema = z.discriminatedUnion('
       requesterUserId: z.string().trim().min(1),
       sourceTurnId: z.string().trim().min(1),
       inputConfig: z.record(z.string(), z.unknown()),
+      notificationOriginTurnIds: z.array(z.string().min(1)).optional(),
+      notificationProvenancePending: z.boolean().optional(),
     })
     .strict(),
 ]);
@@ -108,6 +112,10 @@ export const SessionToolResultSchema = z
   .strict();
 
 export const LocalMachineRpcRequestSchema = z.discriminatedUnion('method', [
+  BaseLocalMachineRpcRequestSchema.extend({
+    method: z.literal('project/probe-local-member'),
+    params: z.object({ localProjectId: z.string().trim().min(1) }).strict(),
+  }).strict(),
   BaseLocalMachineRpcRequestSchema.extend({
     method: z.literal('ios-simulator/agent-control'),
     params: z.object({ sessionId: SessionIdSchema, command: IosSimulatorCommandSchema }).strict(),
@@ -181,6 +189,7 @@ export const LocalMachineRpcRequestSchema = z.discriminatedUnion('method', [
     method: z.literal('code-collab/lsp-definition'),
     params: z
       .object({
+        rootId: SessionFileRootIdSchema.optional(),
         sessionId: z.string().trim().min(1),
         path: z.string().min(1),
         line: z.number().int().nonnegative().optional(),
@@ -192,6 +201,7 @@ export const LocalMachineRpcRequestSchema = z.discriminatedUnion('method', [
     method: z.literal('code-collab/lsp-references'),
     params: z
       .object({
+        rootId: SessionFileRootIdSchema.optional(),
         sessionId: z.string().trim().min(1),
         path: z.string().min(1),
         line: z.number().int().nonnegative().optional(),
@@ -348,7 +358,14 @@ export const LocalMachineRpcRequestSchema = z.discriminatedUnion('method', [
 export type LocalMachineRpcRequest = z.infer<typeof LocalMachineRpcRequestSchema>;
 export type LocalMachineRpcRequestValidated = LocalMachineRpcRequest;
 
+export const ProjectProbeLocalMemberResultSchema = ProjectLocalMemberProbeSchema.extend({
+  type: z.literal('project/probe-local-member'),
+}).strict();
+
+export type ProjectProbeLocalMemberResult = z.infer<typeof ProjectProbeLocalMemberResultSchema>;
+
 export const LocalMachineRpcResultSchema = z.union([
+  ProjectProbeLocalMemberResultSchema,
   MemoryProviderResponseSchema,
   IosSimulatorResponseSchema,
   McpToolListResultSchema,

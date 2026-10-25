@@ -9,6 +9,7 @@ import {
 import { getLoroStreamsRemoteCursorUrlAliases, type WorkspaceId } from '@lody/shared';
 import { SqliteRepoStore } from 'loro-repo/storage/sqlite';
 import { getLodyDataDir } from '@lody/shared/node/installation-profile';
+import { sqliteLockReporterLegacy } from './sqlite-lock-diagnostics';
 
 export const getLoroRepoStorageBaseDir = (workspaceId: WorkspaceId): string =>
   path.join(getLodyDataDir(), 'loro-repo', workspaceId);
@@ -76,7 +77,8 @@ export type CliSqliteRepoStore = {
 };
 
 export const createCliSqliteRepoStore = async (
-  workspaceId: WorkspaceId
+  workspaceId: WorkspaceId,
+  onWriteFailure?: (error: Error) => void
 ): Promise<CliSqliteRepoStore> => {
   const baseDir = getLoroRepoStorageBaseDir(workspaceId);
   await fs.mkdir(baseDir, { recursive: true });
@@ -85,7 +87,9 @@ export const createCliSqliteRepoStore = async (
   // only durable together with FileSystemStorageAdaptor snapshots; migrating
   // cursors without doc/meta state could skip required stream replay.
   const dbPath = getLoroRepoSqliteDbPath(workspaceId);
-  const sqliteStore = new SqliteRepoStore({ path: dbPath });
+  const sqliteStore = new SqliteRepoStore({ path: dbPath, onWriteFailure });
+  // Lock contention reported for this database will name its other openers.
+  sqliteLockReporterLegacy.register(dbPath);
 
   return {
     sqliteStore,

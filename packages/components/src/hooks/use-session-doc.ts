@@ -124,9 +124,9 @@ export function useSessionDoc(
       humanInputReceipts: {},
       cancelRequest: undefined,
       forkOperation: undefined,
+      notification: undefined,
       preview: undefined,
       externalHistoryCursor: undefined,
-      roostHistoryCursor: undefined,
       acpRuntimeConfig: undefined,
     }),
     [sessionId]

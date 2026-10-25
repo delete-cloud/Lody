@@ -2,8 +2,10 @@ import { withHistoryPort } from './history-port-fixture';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Effect, Exit, Scope } from 'effect';
+import type { SessionEntry } from '@lody/shared/session-data';
+import type { NotificationPresentation } from '@lody/shared/notifications';
 import type { SessionActivePresenceControllerLegacy } from '../src/lib/loro/session-active-presence-legacy';
 
 import {
@@ -23,7 +25,9 @@ import {
 import { deriveRepoIdFromLocalProjectPath } from '@lody/shared/node/worktree-paths';
 import { MessageHandler } from '../src/lib/message-handler';
 import type { LoroDocumentManager } from '../src/lib/loro/doc';
-import type { SessionManager } from '../src/session/session-manager';
+import { SessionManager } from '../src/session/session-manager';
+import { Session } from '../src/session/session';
+import type { WorktreeOwnerState } from '../src/session/worktree/worktree-gc';
 import { getWorktreeManager } from '../src/session/worktree/worktree-manager';
 import type { Logger } from '../src/utils/logger';
 import { createTestCloudPort } from './test-cloud-port';
@@ -42,10 +46,16 @@ const createSilentLogger = (): Logger => ({
 });
 
 type MessageHandlerInternals = {
+  buildNotificationPresentation: (
+    sessionId: SessionId,
+    origins: readonly string[],
+    assistantTurnId?: string
+  ) => Promise<NotificationPresentation | undefined>;
   cleanup: () => Promise<void>;
   codeCollabV2DiffStore: { close: () => Promise<void> };
   sessionActivePresence: SessionActivePresenceControllerLegacy;
   handleSessionArchived: (sessionId: SessionId) => Promise<void>;
+  readWorktreeOwnerState: (sessionId: SessionId) => Promise<WorktreeOwnerState>;
   handleSessionDeleted: (sessionId: SessionId) => Promise<void>;
   discardLegacySessionCommands: () => Promise<void>;
   worktreeGc: { schedule: () => Promise<{ removed: SessionId[] }> };
@@ -69,6 +79,7 @@ type MessageHandlerInternals = {
 };
 
 function createHarness(options?: {
+  history?: SessionEntry[];
   sessionId?: SessionId;
   childSessionIds?: SessionId[];
   closeSessionTerminals?: (sessionId: SessionId) => void;
@@ -111,6 +122,8 @@ function createHarness(options?: {
     if (rowIndex >= 0) machineFlockRows.splice(rowIndex, 1);
   });
   const sessionDoc = withHistoryPort({
+    getHistory: () => options?.history ?? [],
+    getMetaState: async () => ({ title: 'Fix sign-in', repoFullName: 'team/lody' }),
     updateHistory: vi.fn(async (updater: (history: unknown[]) => unknown[]) => {
       updater([]);
     }),
@@ -192,7 +205,9 @@ function createHarness(options?: {
   const sessionManager = {
     on: vi.fn(),
     setRequestPermissionHandler: vi.fn(),
-    getActiveChildSessionIds: vi.fn(() => childSessionIds),
+    getActiveChildSessionIds: vi.fn<SessionManager['getActiveChildSessionIds']>(
+      () => childSessionIds
+    ),
     hasSession: vi.fn((id: SessionId) => activeSessionIds.has(id)),
     terminateSession: vi.fn(async (id: SessionId) => {
       activeSessionIds.delete(id);
@@ -225,6 +240,7 @@ function createHarness(options?: {
   };
 
   return {
+    sessionDoc,
     handler: internal,
     presenceEntries,
     sessionId,
@@ -242,6 +258,59 @@ function createHarness(options?: {
 }
 
 describe('MessageHandler terminal cleanup', () => {
+  it('reads the completed assistant entry even after a newer reply exists', async () => {
+    const history: SessionEntry[] = ['completed', 'newer'].map((id) => ({
+      id,
+      role: 'assistant',
+      timestamp: '2026-10-23T00:00:00.000Z',
+      items: [{ type: 'text', text: `${id} reply` }],
+    }));
+    const { handler, sessionId, sessionDoc } = createHarness({ history });
+    expect(
+      await handler.buildNotificationPresentation(sessionId, ['input'], 'completed')
+    ).toMatchObject({
+      conversationTitle: 'Fix sign-in',
+      projectName: 'lody',
+      replyPreview: 'completed reply',
+    });
+    expect(
+      (await handler.buildNotificationPresentation(sessionId, ['input'], 'missing'))?.replyPreview
+    ).toBeUndefined();
+    expect(
+      (await handler.buildNotificationPresentation(sessionId, ['input']))?.replyPreview
+    ).toBeUndefined();
+    const readTurn = sessionDoc.sessionData.history.readTurn;
+    sessionDoc.sessionData.history.readTurn = (id) => {
+      if (id === 'completed') throw new Error('Reply unavailable');
+      return readTurn(id);
+    };
+    expect(
+      await handler.buildNotificationPresentation(sessionId, ['input'], 'completed')
+    ).toMatchObject({
+      conversationTitle: 'Fix sign-in',
+      projectName: 'lody',
+    });
+  });
+  let isolatedDataRoot: string;
+  let previousDataDir: string | undefined;
+  let previousLocksDir: string | undefined;
+
+  beforeEach(() => {
+    isolatedDataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lody-terminal-cleanup-'));
+    previousDataDir = process.env.LODY_DATA_DIR;
+    previousLocksDir = process.env.LODY_LOCKS_DIR;
+    process.env.LODY_DATA_DIR = path.join(isolatedDataRoot, 'data');
+    process.env.LODY_LOCKS_DIR = path.join(isolatedDataRoot, 'locks');
+  });
+
+  afterEach(() => {
+    if (previousDataDir === undefined) delete process.env.LODY_DATA_DIR;
+    else process.env.LODY_DATA_DIR = previousDataDir;
+    if (previousLocksDir === undefined) delete process.env.LODY_LOCKS_DIR;
+    else process.env.LODY_LOCKS_DIR = previousLocksDir;
+    fs.rmSync(isolatedDataRoot, { recursive: true, force: true });
+  });
+
   it('keeps a native Turn lease through archive callbacks until its owning Scope releases', async () => {
     const { handler, sessionId, presenceEntries } = createHarness();
     const lease = Effect.runSync(Scope.make());
@@ -321,33 +390,78 @@ describe('MessageHandler terminal cleanup', () => {
     expect(sessionManager.archiveSession).toHaveBeenCalledWith(sessionId);
   });
 
-  it('terminates an active session and its children when it becomes archived', async () => {
-    const childSessionId = 'child-1' as SessionId;
-    const { handler, sessionId, closeSessionTerminals, isSessionActive, getSessionMeta } =
-      createHarness({
-        childSessionIds: [childSessionId],
-        activeSessionIds: ['session-1' as SessionId, childSessionId],
-        sessionMetas: [
+  it('releases only contained runtimes and keeps independently opened worktree owners active', async () => {
+    const root = {
+      id: 'session-1' as SessionId,
+      machineId: 'machine-1',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      userId: 'user-1',
+      cliType: 'codex',
+      agentType: 'codex',
+      status: SessionStatusFactory.running(),
+      isArchived: true,
+    } as SessionMeta;
+    const child = { ...root, id: 'child-1' as SessionId, parentSessionId: root.id };
+    const opened = {
+      ...root,
+      id: 'opened-1' as SessionId,
+      openedBySessionId: root.id,
+      isArchived: false,
+    };
+    const openedByTab = {
+      ...opened,
+      id: 'opened-by-tab' as SessionId,
+      openedBySessionId: child.id,
+      openedByRootSessionId: root.id,
+    };
+    const openedChild = {
+      ...root,
+      id: 'opened-child' as SessionId,
+      parentSessionId: openedByTab.id,
+      isArchived: false,
+    };
+    const independentSessions = [opened, openedByTab, openedChild];
+    const sessions = [root, child, ...independentSessions];
+    const terminalSessions = new Set(sessions.map((session) => session.id));
+    const { handler, sessionManager, isSessionActive, getSessionMeta } = createHarness({
+      activeSessionIds: sessions.map((session) => session.id),
+      sessionMetas: sessions,
+      closeSessionTerminals: (id) => {
+        terminalSessions.delete(id);
+      },
+    });
+    // Exercise the real containment selectors without creating processes or worktrees.
+    const runtimeManager = {
+      sessions: new Map(
+        sessions.map((meta) => [
+          meta.id,
           {
-            id: 'session-1' as SessionId,
-            machineId: 'machine-1',
-            createdAt: '2026-01-01T00:00:00.000Z',
-            userId: 'user-1',
-            cliType: 'codex',
-            agentType: 'codex',
-            status: SessionStatusFactory.running(),
-            isArchived: true,
-          } as SessionMeta,
-        ],
-      });
+            getParentSessionId: () =>
+              Session.prototype.getParentSessionId.call({ config: meta } as unknown as Session),
+          },
+        ])
+      ),
+    } as unknown as SessionManager;
+    sessionManager.getActiveChildSessionIds.mockImplementation((id) =>
+      SessionManager.prototype.getActiveChildSessionIds.call(runtimeManager, id)
+    );
+    // This test reads GC eligibility directly and must never scan the host data directory.
+    handler.worktreeGc = { schedule: async () => ({ removed: [] }) };
 
-    await handler.handleSessionArchived(sessionId);
+    await handler.handleSessionArchived(root.id);
 
-    expect(closeSessionTerminals).toHaveBeenCalledWith(childSessionId);
-    expect(closeSessionTerminals).toHaveBeenCalledWith(sessionId);
-    expect(isSessionActive(sessionId)).toBe(false);
-    expect(isSessionActive(childSessionId)).toBe(false);
-    expect(getSessionMeta(sessionId)).toMatchObject({ status: SessionStatusFactory.idle() });
+    expect(isSessionActive(root.id)).toBe(false);
+    expect(isSessionActive(child.id)).toBe(false);
+    expect(terminalSessions).toEqual(new Set(independentSessions.map((session) => session.id)));
+    expect(getSessionMeta(root.id)).toMatchObject({ status: SessionStatusFactory.idle() });
+    expect(await handler.readWorktreeOwnerState(root.id)).toMatchObject({ kind: 'archived' });
+    // Child Tabs share their parent's directory, so even archived children own no GC target.
+    expect(await handler.readWorktreeOwnerState(child.id)).toEqual({ kind: 'active' });
+    for (const session of independentSessions) {
+      expect(isSessionActive(session.id)).toBe(true);
+      expect(getSessionMeta(session.id)).toEqual(session);
+      expect(await handler.readWorktreeOwnerState(session.id)).toEqual({ kind: 'active' });
+    }
   });
 
   // A process that survives SIGKILL (stuck in uninterruptible I/O) must not

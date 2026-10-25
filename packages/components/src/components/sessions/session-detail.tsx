@@ -1,3 +1,9 @@
+import { FileLinkCandidateDialog } from './file-link-candidate-dialog';
+import {
+  useArchiveConfirmationRequest,
+  useArchiveSessionWithConfirmation,
+} from './session-archive-confirmation';
+import type { FileLinkCandidate } from '@lody/shared';
 import { getIpcServices } from '@/lib/electron-ipc-client';
 import { buildDraftUserHistoryEntry } from '@/lib/session-attachment-draft';
 import { pendingSessionLinkAtom } from '@/lib/session-deep-link';
@@ -20,14 +26,12 @@ import {
   Link,
   LockKeyhole,
   Monitor,
-  PanelBottom,
-  PanelLeft,
-  PanelRight,
   Pencil,
   Search,
   Trash2,
   Users,
 } from 'lucide-react';
+import { CuidaSidebarExpandOutline } from '@lody/ui';
 import { Spinner } from '@lody/ui/spinner';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@lody/ui/button';
@@ -45,11 +49,12 @@ import {
   isLoroRepoDocDeleted,
   resolveProjectGitHubRepo,
   SessionForkOperationSchema,
+  MACHINE_PROTOCOL_CAPABILITIES,
+  machineSupportsProtocolCapability,
   type CommentReferencePayload,
   type LocalProjectHistoryProvider,
   type LocalProjectId,
   type LocalProjectMeta,
-  type PrStatus,
   type ProjectRef,
   type SessionId,
   type SessionMeta,
@@ -61,6 +66,8 @@ import {
 import {
   SessionChatInterface,
   type SessionChatInterfaceHandle,
+  type SessionChatInterfaceProps,
+  type SessionChatToolbar,
 } from '@/components/sessions/session-chat-interface';
 import { WorktreeIcon } from '@/components/icons/worktree-icon';
 import {
@@ -132,6 +139,7 @@ import {
   sessionMetaCacheSettledAtomFamily,
 } from '@/atoms/doc-meta';
 import { sessionLiveStatusAtomFamily } from '@/atoms/presence';
+import { sessionProjectMemberSelectionAtomFamily } from '@/atoms/session-project-member-selection';
 import { SessionTabBar, type ViewerTabItem } from './session-tab-bar';
 import {
   getSideChatLauncherState,
@@ -184,7 +192,7 @@ import { getCommandKeybindings, useCommand } from '@/lib/commands';
 import { useDesktopTabCloser } from '@/lib/desktop-tab-or-window-close';
 import { useSemanticActionRouter } from '@/lib/commands/use-semantic-action-router';
 import type { SemanticActionRouter } from '@/lib/commands/semantic-action-router';
-import { semanticShortcutsFeatureEnabledAtom } from '@/atoms/settings';
+import { allChangesDiffScopeAtom, semanticShortcutsFeatureEnabledAtom } from '@/atoms/settings';
 import { cn, getBasename } from '@/lib';
 
 import {
@@ -194,10 +202,7 @@ import {
 import { isSessionMarkdownPath } from '@/lib/session-file-language';
 import { SessionNotFound } from './session-not-found';
 import { SessionSyncingIndicator } from './session-syncing-indicator';
-// Aliased while the vaul drawer below still holds the bare name; the two
-// merge when the mobile drawers migrate onto this primitive.
-import { Drawer as UiDrawer } from '@lody/ui/drawer';
-import { SessionMobileDiffDrawerContent } from './session-mobile-diff-drawer-content';
+import { SessionMobileDiffDrawer, type MobileDiffView } from './session-mobile-diff-drawer';
 import { Drawer, DrawerContent, DrawerTitle } from '@/ui/drawer';
 import { VaulDrawerBody } from '@/components/mobile/vaul-drawer-edge-back-zone';
 import { Dialog } from '@/ui/dialog';
@@ -240,6 +245,10 @@ import {
   getPullRequestRepoFullName,
   getSessionGitHubState,
 } from '@/lib/session-github-state';
+import {
+  buildSessionProjectMemberRows,
+  resolveSessionProjectMemberRow,
+} from '@/lib/session-project-members';
 import {
   resolveMachineDotlodyPath,
   resolveSessionWorkspacePath,
@@ -387,6 +396,7 @@ type MobileDiffState = {
   focusComment?: DiffCommentFocusTarget | null;
   focusRequestSeq: number;
   mode?: 'conversation' | 'base';
+  view?: MobileDiffView;
 } | null;
 
 type PendingSessionShare = {
@@ -535,6 +545,8 @@ const detailStyles = stylex.create({
     width: '16px',
     height: '16px',
   },
+  bottomPanelIcon: { rotate: '-90deg' },
+  rightPanelIcon: { rotate: '180deg' },
   rootFill: {
     height: '100%',
   },
@@ -562,11 +574,6 @@ const detailStyles = stylex.create({
     fontSize: '0.875rem',
     lineHeight: '1.25rem',
     color: 'hsl(var(--muted-foreground))',
-  },
-  drawerBody: {
-    minHeight: 0,
-    flex: 1,
-    overflow: 'hidden',
   },
   columnFill: {
     display: 'flex',
@@ -644,6 +651,10 @@ const detailStyles = stylex.create({
   absoluteFill: {
     position: 'absolute',
     inset: 0,
+  },
+  conversationContainment: {
+    // Absolute inset fixes the surface size; conversation content must not size the shell.
+    contain: 'strict',
   },
   invisibleFill: {
     visibility: 'hidden',
@@ -959,15 +970,72 @@ const TerminalDockToggleButton = memo(function TerminalDockToggleButton() {
       title={label}
       className={stylex.props(detailStyles.shrink).className}
     >
-      <PanelBottom {...stylex.props(detailStyles.icon16)} />
+      <CuidaSidebarExpandOutline
+        {...stylex.props(detailStyles.icon16, detailStyles.bottomPanelIcon)}
+        aria-hidden="true"
+      />
     </Button>
   );
 });
 
-/**
- * Session detail page component.
- * Displays the chat interface for a single session.
- */
+/** Keeps per-session imperative refs and event handlers stable across parent updates. */
+function SessionChatSurface({
+  registerChatRef,
+  ...props
+}: SessionChatInterfaceProps & {
+  registerChatRef: (id: string, handle: SessionChatInterfaceHandle | null) => void;
+}) {
+  const id = props.session.id;
+  const setChatRef = useCallback(
+    (handle: SessionChatInterfaceHandle | null) => registerChatRef(id, handle),
+    [id, registerChatRef]
+  );
+  const openBrowser = useStableCallback(() => props.onOpenBrowser?.());
+  const openExistingBrowser = useStableCallback(() => props.onOpenExistingBrowser?.());
+  const openIosSimulator = useStableCallback(() => props.onOpenIosSimulator?.());
+  const forkLastAssistant = useStableCallback(
+    (...args: Parameters<NonNullable<SessionChatInterfaceProps['onForkLastAssistant']>>) =>
+      props.onForkLastAssistant?.(...args)
+  );
+  const annotationReferencesSubmitted = useStableCallback(
+    (
+      ...args: Parameters<
+        NonNullable<SessionChatInterfaceProps['onVisualAnnotationReferencesSubmitted']>
+      >
+    ) => props.onVisualAnnotationReferencesSubmitted?.(...args)
+  );
+  const navigateToComment = useStableCallback(
+    (...args: Parameters<NonNullable<SessionChatInterfaceProps['onNavigateToComment']>>) =>
+      props.onNavigateToComment?.(...args)
+  );
+  const openPrTab = useStableCallback(
+    (...args: Parameters<NonNullable<SessionChatInterfaceProps['onOpenPrTab']>>) =>
+      props.onOpenPrTab?.(...args)
+  );
+  const openAllChanges = useStableCallback(() => props.onOpenAllChanges?.());
+  const navigateSession = useStableCallback(
+    (...args: Parameters<NonNullable<SessionChatInterfaceProps['onNavigateSession']>>) =>
+      props.onNavigateSession?.(...args)
+  );
+  return (
+    <SessionChatInterface
+      {...props}
+      ref={setChatRef}
+      onOpenBrowser={props.onOpenBrowser ? openBrowser : undefined}
+      onOpenExistingBrowser={props.onOpenExistingBrowser ? openExistingBrowser : undefined}
+      onOpenIosSimulator={props.onOpenIosSimulator ? openIosSimulator : undefined}
+      onForkLastAssistant={props.onForkLastAssistant ? forkLastAssistant : undefined}
+      onVisualAnnotationReferencesSubmitted={
+        props.onVisualAnnotationReferencesSubmitted ? annotationReferencesSubmitted : undefined
+      }
+      onNavigateToComment={props.onNavigateToComment ? navigateToComment : undefined}
+      onOpenPrTab={props.onOpenPrTab ? openPrTab : undefined}
+      onOpenAllChanges={props.onOpenAllChanges ? openAllChanges : undefined}
+      onNavigateSession={props.onNavigateSession ? navigateSession : undefined}
+    />
+  );
+}
+
 const SessionDetail = ({
   sessionId,
   urlTab,
@@ -999,13 +1067,17 @@ const SessionDetail = ({
   const windowsCaptionBorderedRowPadClass = useWindowsCaptionRowPadClass({
     bottomBorder: true,
   });
-  const macTrafficLightRowPadClass = useMacTrafficLightRowPadClass();
+  const macTrafficLightRowPadClass = useMacTrafficLightRowPadClass({
+    insideWorkspaceFrame: true,
+  });
   const macTrafficLightBorderedRowPadClass = useMacTrafficLightRowPadClass({
     bottomBorder: true,
+    insideWorkspaceFrame: true,
   });
   // Publish ephemeral "viewing this session" presence (drives the owning
   // machine's PR poller priority); actively cleared on switch/hide/unmount.
   usePublishSessionViewing(sessionId);
+  const [desktopToolbarContainer, setDesktopToolbarContainer] = useState<HTMLElement | null>(null);
   const chatRefsMap = useRef<
     Map<string, SessionChatInterfaceHandle | DraftSessionChatInterfaceHandle | null>
   >(new Map());
@@ -1297,6 +1369,9 @@ const SessionDetail = ({
   const [mountedSideSessionIds, setMountedSideSessionIds] = useState<Set<SessionId>>(
     () => new Set()
   );
+  const [mountedChatSessionIds, setMountedChatSessionIds] = useState<Set<SessionId>>(
+    () => new Set()
+  );
   const [tabOrder, setTabOrderState] = useState<string[]>(() => readStoredTabOrder(sessionId));
   const tabRestoreNavigationRequestIdRef = useRef(0);
   const [pendingTabRestoreNavigation, setPendingTabRestoreNavigation] = useState<{
@@ -1330,6 +1405,7 @@ const SessionDetail = ({
     setDirtyForkConfirmation(null);
     setClosingSideSessionIds(new Set());
     setMountedSideSessionIds(new Set());
+    setMountedChatSessionIds(new Set());
     setTabOrderState(readStoredTabOrder(sessionId));
     setViewerTabs(nextInitialTabState.viewerTabs);
     setActiveViewerTabId(nextInitialTabState.activeViewerTabId);
@@ -1512,6 +1588,25 @@ const SessionDetail = ({
     if (activeTabSessionId === sessionId) return sessionId;
     return visibleChildSessions.find((s) => s.id === activeTabSessionId)?.id ?? null;
   }, [activeTabSessionId, sessionId, visibleChildSessions]);
+  const childSessionToMount =
+    activeSessionTabId !== sessionId &&
+    activeSessionTabId !== null &&
+    !closedConversationIds.has(activeSessionTabId)
+      ? activeSessionTabId
+      : null;
+  // Selection remains URL-owned. This set only retains bodies already visited
+  // in this workspace; unopened child tabs must not acquire chat controllers.
+  if (
+    !isMobile &&
+    ((childSessionToMount !== null && !mountedChatSessionIds.has(childSessionToMount)) ||
+      [...mountedChatSessionIds].some((id) => closedConversationIds.has(id)))
+  ) {
+    setMountedChatSessionIds((current) => {
+      const next = new Set([...current].filter((id) => !closedConversationIds.has(id)));
+      if (childSessionToMount) next.add(childSessionToMount);
+      return next;
+    });
+  }
   // The session meta for the currently active tab (may be parent or a child)
   const activeTabSession = useMemo(() => {
     if (activeTabSessionId === EMPTY_SESSION_TAB_ID) return null;
@@ -1546,6 +1641,13 @@ const SessionDetail = ({
   const activeSessionMachineId = activeSession?.machineId ?? null;
   const { machine: sessionMachine, machineFlockRows } =
     useResolvedMachineMeta(activeSessionMachineId);
+  const allChangesDiffScope = useAtomValue(allChangesDiffScopeAtom);
+  const setAllChangesDiffScope = useSetAtom(allChangesDiffScopeAtom);
+  const allChangesScopeSupported = machineSupportsProtocolCapability(
+    sessionMachine,
+    MACHINE_PROTOCOL_CAPABILITIES.codeCollabAllChangesScope
+  );
+  const effectiveAllChangesDiffScope = allChangesScopeSupported ? allChangesDiffScope : 'branch';
   const canForkSession = useCallback(
     (target: SessionMeta): boolean => {
       if (target.isArchived || !target.agentConfigId || !resolveSessionAcpTargetId(target))
@@ -1994,14 +2096,33 @@ const SessionDetail = ({
     return 'idle';
   }, [activeSession, activeSessionLiveStatus]);
   useTabStatus(tabStatus);
+  // The Repositories panel in the conversation selects a Member; the PR tab,
+  // URL target and header must describe that same repository.
+  const projectMemberOwnerSession = workspaceOwnerSession ?? activeTabSession;
+  const selectedProjectMemberId = useAtomValue(
+    sessionProjectMemberSelectionAtomFamily(projectMemberOwnerSession?.id ?? ('' as SessionId))
+  );
+  const activeProjectRepository = useMemo<string | null | undefined>(() => {
+    if (!projectMemberOwnerSession?.projectRun) return undefined;
+    const rows = buildSessionProjectMemberRows(projectMemberOwnerSession);
+    const legacyRepoFullName =
+      resolveProjectGitHubRepo(projectMemberOwnerSession.project) ??
+      projectMemberOwnerSession.repoFullName;
+    const selected = resolveSessionProjectMemberRow(
+      rows,
+      selectedProjectMemberId,
+      legacyRepoFullName
+    );
+    return selected?.repoFullName ?? null;
+  }, [projectMemberOwnerSession, selectedProjectMemberId]);
   const {
     sourceSessionId: prSessionId,
     latestPr,
     repoFullName,
     canShowGitHubActions,
   } = useMemo(
-    () => getSessionGitHubState(activeTabSession, workspaceOwnerSession),
-    [activeTabSession, workspaceOwnerSession]
+    () => getSessionGitHubState(activeTabSession, workspaceOwnerSession, activeProjectRepository),
+    [activeProjectRepository, activeTabSession, workspaceOwnerSession]
   );
   const latestPrNumber = getPullRequestNumber(latestPr);
   const latestPrRepoFullName = getPullRequestRepoFullName(latestPr) ?? repoFullName;
@@ -2911,37 +3032,47 @@ const SessionDetail = ({
     [router, workspaceSlug]
   );
 
+  const archiveSessionWithConfirmation = useArchiveSessionWithConfirmation(archiveSession);
+  const requestArchiveConfirmation = useArchiveConfirmationRequest();
   // Archive the parent session from the header menu (desktop)
   const handleArchiveCurrentSession = useCallback(async () => {
     if (!activeSession) return;
-    await archiveSession(activeSession.id);
+    if (!(await archiveSessionWithConfirmation(activeSession.id))) return;
     handleBackToList();
-  }, [activeSession, archiveSession, handleBackToList]);
+  }, [activeSession, archiveSessionWithConfirmation, handleBackToList]);
 
-  // Archive the active tab (mobile more menu) — archives child if child is active, parent otherwise
-  const handleArchiveActiveTab = useCallback(async () => {
-    if (!activeSession || isEmptyConversation) return;
-    if (activeDraftTab) {
-      closeDraftTab(activeDraftTab.id);
-      return;
-    }
-    if (activeTabSessionId && activeTabSessionId !== sessionId) {
-      await archiveSession(activeTabSessionId as SessionId);
-    } else {
-      // Archiving the parent
-      await archiveSession(activeSession.id);
-      handleBackToList();
-    }
-  }, [
-    activeDraftTab,
-    activeSession,
-    activeTabSessionId,
-    archiveSession,
-    closeDraftTab,
-    handleBackToList,
-    isEmptyConversation,
-    sessionId,
-  ]);
+  // Archive the active tab (mobile more menu, keyboard shortcut) — archives child if
+  // child is active, parent otherwise. `confirm` always asks (the shortcut is easy to
+  // fire by accident); the one shared dialog then also carries the sub-conversation
+  // choice, so it never stacks a second confirmation.
+  const handleArchiveActiveTab = useCallback(
+    async (options?: { confirm?: boolean }) => {
+      if (!activeSession || isEmptyConversation) return;
+      if (activeDraftTab) {
+        if (options?.confirm && (await requestArchiveConfirmation()) === null) return;
+        closeDraftTab(activeDraftTab.id);
+        return;
+      }
+      if (activeTabSessionId && activeTabSessionId !== sessionId) {
+        await archiveSessionWithConfirmation(activeTabSessionId as SessionId, options);
+      } else {
+        // Archiving the parent
+        if (!(await archiveSessionWithConfirmation(activeSession.id, options))) return;
+        handleBackToList();
+      }
+    },
+    [
+      activeDraftTab,
+      activeSession,
+      activeTabSessionId,
+      archiveSessionWithConfirmation,
+      requestArchiveConfirmation,
+      closeDraftTab,
+      handleBackToList,
+      isEmptyConversation,
+      sessionId,
+    ]
+  );
 
   // Restore the current archived session from the header menu. Restore is a
   // lifecycle action only; every tab keeps its close state.
@@ -2966,12 +3097,6 @@ const SessionDetail = ({
 
   // Confirmation state for permanently deleting the current archived session
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
-
-  // Confirmation state for archiving the current chat via the keyboard shortcut. The
-  // shortcut is easy to fire by accident, so it asks before archiving (Enter confirms,
-  // Esc cancels). Menu/button archive actions stay immediate.
-  const [archiveConfirmOpen, setArchiveConfirmOpen] = useState(false);
-  const archiveConfirmButtonRef = useRef<HTMLButtonElement>(null);
 
   // Rename dialog target for the mobile header more menu
   const [renameDialogTarget, setRenameDialogTarget] = useState<RenameSessionDialogTarget | null>(
@@ -3585,6 +3710,38 @@ const SessionDetail = ({
     setMobileDiffState(null);
   }, []);
 
+  const handleSelectMobileChange = useCallback(
+    (filePath: string, filePaths: string[]) => {
+      const requestSeq = nextFocusRequestSeq();
+      setMobileDiffState((current) =>
+        current?.mode === 'base'
+          ? {
+              ...current,
+              filePaths,
+              focusFilePath: filePath,
+              focusComment: null,
+              focusRequestSeq: requestSeq,
+              view: 'diff',
+            }
+          : current
+      );
+      captureSessionDetailEvent('session/viewer_diff_opened', {
+        source: 'changes_sidebar',
+        turn_id: 'all-changes',
+        mode: 'base',
+        file_count: filePaths.length,
+        focus_file_extension: getFileExtension(filePath),
+        surface: 'mobile_sheet',
+      });
+    },
+    [captureSessionDetailEvent, nextFocusRequestSeq]
+  );
+  const handleBackToMobileChanges = useCallback(() => {
+    setMobileDiffState((current) =>
+      current?.mode === 'base' ? { ...current, view: 'files-with-diff' } : current
+    );
+  }, []);
+
   useEffect(() => {
     const nextViewerTabs = viewerTabs.map((tab) => {
       if (tab.type !== 'diff') {
@@ -3689,12 +3846,12 @@ const SessionDetail = ({
         focusComment: null,
         focusRequestSeq: nextFocusRequestSeq(),
         mode: 'base',
+        view: 'files',
       });
-      captureSessionDetailEvent('session/viewer_diff_opened', {
+      captureSessionDetailEvent('session/sidebar_tab_selected', {
         source: 'info_bar_diff_stat',
-        turn_id: 'all-changes',
-        mode: 'base',
-        file_count: filePaths.length,
+        sidebar_tab: 'changes',
+        change_file_count: filePaths.length,
         surface: 'mobile_sheet',
       });
     } else {
@@ -3758,44 +3915,6 @@ const SessionDetail = ({
   const handleClosePrTab = useCallback(() => {
     replaceSessionUrlPr(undefined);
   }, [replaceSessionUrlPr]);
-
-  // When the PR tab resolves live GitHub details, push the canonical status
-  // back into the owner session's persisted PR meta so the sidebar + session
-  // header badges (which read that persisted value, not live details) reflect
-  // reality — most visibly `draft`, which the webhook/CLI may not have
-  // propagated yet. Best-effort and idempotent: only writes on a real change.
-  // Durable session meta writes must go through the writer seam so Electron
-  // local-first mode keeps the CLI as the sole author.
-  const reconcilePersistedPrStatus = useCallback(
-    (status: PrStatus) => {
-      const ownerSession = workspaceOwnerSession;
-      const prNumber = latestPrNumber;
-      if (!runtime || !ownerSession || prNumber == null) return;
-      const list = ownerSession.pullRequests ?? [];
-      if (
-        !list.some(
-          (pr) =>
-            (getPullRequestNumber(pr) === prNumber || pr.url === latestPr?.url) &&
-            pr.status !== status
-        )
-      )
-        return;
-      const next = list.map((pr) =>
-        getPullRequestNumber(pr) === prNumber || pr.url === latestPr?.url
-          ? { url: pr.url, status }
-          : pr
-      );
-      void runtime.writer
-        .upsertDocMeta(getSessionRoomId(ownerSession.id), {
-          pullRequests: next,
-        } satisfies Partial<SessionMeta>)
-        .catch((error: unknown) => {
-          // Best-effort: the PR tab badge still shows live truth regardless.
-          console.error('Failed to reconcile persisted PR status', error);
-        });
-    },
-    [latestPr?.url, latestPrNumber, runtime, workspaceOwnerSession]
-  );
 
   const handleOpenBrowser = useCallback(
     (tabSessionId?: SessionId, navigateCandidate = false) => {
@@ -3866,8 +3985,31 @@ const SessionDetail = ({
     replaceSessionUrlSimulator(false);
   }, [replaceSessionUrlSimulator]);
 
+  // A newer open or a session change supersedes an in-flight link resolution.
+  const fileLinkRequestRef = useRef(0);
+  const fileLinkSessionKey = JSON.stringify([
+    currentWorkspaceId,
+    activeSessionMachineId,
+    activeBrowserSession?.id,
+    activeSessionWorkspacePath,
+  ]);
+  useEffect(
+    () => () => {
+      fileLinkRequestRef.current += 1;
+    },
+    [fileLinkSessionKey, runtime]
+  );
+  const [fileLinkChoice, setFileLinkChoice] = useState<{
+    sessionKey: string;
+    candidates: readonly FileLinkCandidate[];
+    options: SessionDetailOpenFileOptions;
+  } | null>(null);
+
   const handleOpenFile = useStableCallback(
     (filePath: string, options: SessionDetailOpenFileOptions = {}) => {
+      const request = ++fileLinkRequestRef.current;
+      const sessionKey = fileLinkSessionKey;
+      setFileLinkChoice(null);
       const claimCloseTarget = semanticRouterRef.current?.deferActivation('side-panel');
       setFileProviderRequestedByInteraction(true);
       void (async () => {
@@ -3889,11 +4031,57 @@ const SessionDetail = ({
           ...(options.startLine === undefined ? {} : { startLine: options.startLine }),
           ...(options.endLine === undefined ? {} : { endLine: options.endLine }),
         });
+        let openingPath = target.filePath;
+        if (
+          target.resolveMarkdownLink &&
+          runtime &&
+          activeSessionMachineId &&
+          activeBrowserSession
+        ) {
+          const link = await runtime.requestFilePreview(
+            activeSessionMachineId,
+            {
+              sessionId: activeBrowserSession.id,
+              path: openingPath,
+              resolveMarkdownLink: true,
+            },
+            {
+              ownerSessionId: activeBrowserSession.parentSessionId ?? activeBrowserSession.id,
+              workspaceRoot: activeSessionWorkspacePath,
+            }
+          );
+          if (request !== fileLinkRequestRef.current) return;
+          if (link.status === 'resolved-link') {
+            if (link.candidates.length > 1) {
+              setFileLinkChoice({
+                sessionKey,
+                candidates: link.candidates,
+                options: {
+                  ...options,
+                  pathKind: 'canonical',
+                  startLine: target.startLine,
+                  endLine: target.endLine,
+                },
+              });
+              return;
+            }
+            openingPath = link.candidates[0]!.path;
+          } else if (link.status === 'error' && link.code !== 'unsupported_protocol') {
+            toast.error(
+              t(
+                'sessions.fileLinks.resolveFailed',
+                'Could not resolve this file link. Retry, or ask the agent for an absolute path.'
+              )
+            );
+            return;
+          }
+          // Older daemons cannot discover worktrees: open against the session root as before.
+        }
         const resolution = await resolveSessionFileProviderOpenPath(
           activeSessionFileProvider,
-          target.filePath
+          openingPath
         ).catch((): SessionFileProviderOpenPathResolution => ({
-          path: target.filePath,
+          path: openingPath,
           redirected: false,
         }));
         const resolvedFilePath = resolution.path;
@@ -3923,6 +4111,15 @@ const SessionDetail = ({
       })();
     }
   );
+
+  const fileLinkDialog =
+    fileLinkChoice?.sessionKey === fileLinkSessionKey ? (
+      <FileLinkCandidateDialog
+        candidates={fileLinkChoice.candidates}
+        onClose={() => setFileLinkChoice(null)}
+        onSelect={(candidate) => handleOpenFile(candidate.path, fileLinkChoice.options)}
+      />
+    ) : null;
 
   const handleOpenHtmlFile = useStableCallback((filePath: string) => {
     handleOpenFile(filePath, {
@@ -4675,7 +4872,7 @@ const SessionDetail = ({
     when: () =>
       Boolean(activeTabSession) && !isEmptyConversation && activeSession?.isArchived !== true,
     run: () => {
-      setArchiveConfirmOpen(true);
+      void handleArchiveActiveTab({ confirm: true });
     },
   });
 
@@ -5441,6 +5638,105 @@ const SessionDetail = ({
     }`
   );
 
+  const sidebarToggleButton = useMemo(
+    () => (
+      <Button
+        type="button"
+        variant="ghost"
+        size="small"
+        icon
+        onClick={handleToggleSidebar}
+        aria-label={
+          isSidebarVisible
+            ? t('sessions.sidebar.hide', 'Hide sidebar')
+            : t('sessions.sidebar.show', 'Show sidebar')
+        }
+        className={
+          stylex.props(detailStyles.shrink, !isSidebarVisible && detailStyles.sidebarToggleMargin)
+            .className
+        }
+      >
+        <CuidaSidebarExpandOutline
+          {...stylex.props(detailStyles.icon16, detailStyles.rightPanelIcon)}
+          aria-hidden="true"
+        />
+      </Button>
+    ),
+    [handleToggleSidebar, isSidebarVisible, t]
+  );
+
+  const desktopToolbar = useMemo<SessionChatToolbar | undefined>(() => {
+    if (!activeSession) return undefined;
+    return {
+      container: desktopToolbarContainer,
+      className: stylex.props(detailStyles.fillNoShrink).className,
+      endSlot: (
+        <>
+          <TerminalDockToggleButton />
+          {!isSidebarVisible ? sidebarToggleButton : null}
+        </>
+      ),
+      actions: {
+        onArchiveSession: handleArchiveCurrentSession,
+        onRestoreSession: handleRestoreCurrentSession,
+        onDeleteSession: handleRequestDeleteCurrentSession,
+        onOpenSearch: handleOpenSearch,
+        onCopyConversationHistory: handleCopyConversationHistory,
+        onRequestRename: !activeDraftTab ? handleRenameCurrentSession : undefined,
+        onForkSession:
+          !activeDraftTab && activeTabSession && canForkSession(activeTabSession)
+            ? handleForkCurrentSession
+            : undefined,
+        forkWorktreeAvailability: activeTabSession
+          ? getForkWorktreeAvailability(activeTabSession)
+          : 'hidden',
+        onForkWorktreeMenuOpen: activeTabSession
+          ? () => {
+              void resolveForkWorktreeAvailability(activeTabSession);
+            }
+          : undefined,
+        forkingAssistantMessageId: activeTabSession
+          ? pendingForks[activeTabSession.id]?.turnId
+          : null,
+        sharing: activeSessionSharing ?? undefined,
+        onShareWithTeam: showSessionSharing
+          ? () => handleRequestShareSession(activeSession)
+          : undefined,
+        onShareAsImage: activeDraftTab
+          ? undefined
+          : () => {
+              void handleShareAsImage().catch((error: unknown) => {
+                console.error('Failed to load conversation for image sharing', error);
+                toast.error(t('sessions.shareImage.empty', 'No conversation to share'));
+              });
+            },
+      },
+    };
+  }, [
+    desktopToolbarContainer,
+    isSidebarVisible,
+    sidebarToggleButton,
+    handleArchiveCurrentSession,
+    handleRestoreCurrentSession,
+    handleRequestDeleteCurrentSession,
+    handleOpenSearch,
+    handleCopyConversationHistory,
+    activeDraftTab,
+    handleRenameCurrentSession,
+    activeTabSession,
+    canForkSession,
+    handleForkCurrentSession,
+    getForkWorktreeAvailability,
+    resolveForkWorktreeAvailability,
+    pendingForks,
+    activeSessionSharing,
+    showSessionSharing,
+    handleRequestShareSession,
+    activeSession,
+    handleShareAsImage,
+    t,
+  ]);
+
   useEffect(() => {
     if (sessionPresenceState === 'loading') {
       return;
@@ -5555,42 +5851,6 @@ const SessionDetail = ({
     </Dialog.Root>
   );
 
-  const archiveConfirmDialog = (
-    <Dialog.Root open={archiveConfirmOpen} onOpenChange={setArchiveConfirmOpen}>
-      <Dialog.Content
-        className={cn(isMobile ? '' : 'max-w-sm')}
-        // Focus the confirm button on open so Enter archives; Esc still cancels (Radix
-        // default close-on-escape). Rejected onKeyDown-on-content: it double-fires when a
-        // button already has focus.
-        initialFocus={() => archiveConfirmButtonRef.current}
-      >
-        <Dialog.Header>
-          <Dialog.Title>{t('sessions.archiveConfirm.title', 'Archive chat?')}</Dialog.Title>
-          <Dialog.Description>
-            {t(
-              'sessions.archiveConfirm.description',
-              'This chat will move to the archive. You can restore it later.'
-            )}
-          </Dialog.Description>
-        </Dialog.Header>
-        <Dialog.Footer>
-          <Button variant="secondary" onClick={() => setArchiveConfirmOpen(false)}>
-            {t('common.cancel', 'Cancel')}
-          </Button>
-          <Button
-            ref={archiveConfirmButtonRef}
-            onClick={() => {
-              setArchiveConfirmOpen(false);
-              void handleArchiveActiveTab();
-            }}
-          >
-            {t('sessions.archiveConfirm.confirm', 'Archive')}
-          </Button>
-        </Dialog.Footer>
-      </Dialog.Content>
-    </Dialog.Root>
-  );
-
   const worktreeForkObservers = Object.entries(pendingForks)
     .filter(
       ([, pending]) => pending.placement === 'worktree' && pending.phase === 'awaiting-history'
@@ -5685,8 +5945,21 @@ const SessionDetail = ({
         htmlPreviewRequestSeq={tab.htmlPreviewRequestSeq}
         saveRequestSeq={viewerTabSaveStates[tab.id]?.saveRequestSeq ?? 0}
         copyMarkdownRequestSeq={viewerTabSaveStates[tab.id]?.copyMarkdownRequestSeq ?? 0}
+        sessionLinksEnabled={!!handleNavigateSession}
         defaultHtmlPreview={isMobile}
         preferNativeMarkdownSelection={isMobile}
+        onAddSelectionToChat={
+          activeSession.isArchived
+            ? undefined
+            : (selection) => {
+                const chat = chatRefsMap.current.get(activeSession.id);
+                return !closedConversationIds.has(activeSession.id) &&
+                  chat &&
+                  'addDocumentSelection' in chat
+                  ? chat.addDocumentSelection(selection)
+                  : false;
+              }
+        }
         fileProvider={activeSessionFileProvider}
         fileProviderPending={activeSessionFileProviderPending}
         fileProviderMessage={activeSessionFileProviderMessage}
@@ -5723,6 +5996,7 @@ const SessionDetail = ({
       />
     ) : (
       <SessionConversationDiffPanel
+        active={active}
         sessionId={activeSession.id}
         turnId={tab.turnId}
         filePaths={tab.filePaths}
@@ -5730,6 +6004,9 @@ const SessionDetail = ({
         focusComment={tab.focusComment}
         focusRequestSeq={tab.focusRequestSeq}
         mode={tab.mode ?? 'conversation'}
+        allChangesScope={effectiveAllChangesDiffScope}
+        allChangesScopeSupported={allChangesScopeSupported}
+        onAllChangesScopeChange={setAllChangesDiffScope}
         refreshToken={(tab.mode ?? 'conversation') === 'base' ? allChangesRefreshToken : undefined}
         fileDiffs={(tab.mode ?? 'conversation') === 'base' ? [] : resolveTurnFileDiffs(tab.turnId)}
         fileDiffsPending={!sessionDiffReady}
@@ -6108,8 +6385,8 @@ const SessionDetail = ({
                 }
                 aria-hidden={!isActive}
               >
-                <SessionChatInterface
-                  ref={(el) => setChatTabRef(tabSession.id, el)}
+                <SessionChatSurface
+                  registerChatRef={setChatTabRef}
                   claimNavigationFocus={
                     isActive && tabSession.id === sessionId ? claimNavigationFocus : undefined
                   }
@@ -6216,63 +6493,67 @@ const SessionDetail = ({
         </div>
 
         {/* Mobile diff sheet */}
-        <UiDrawer.Root
-          side="bottom"
+        <SessionMobileDiffDrawer
           open={mobileDiffState !== null}
           onOpenChange={(open) => !open && handleCloseMobileDiff()}
+          view={mobileDiffState?.view}
+          onBackToFiles={mobileDiffState?.mode === 'base' ? handleBackToMobileChanges : undefined}
+          changes={{
+            ready: sessionDiffReady,
+            synced: sessionDiffSynced,
+            unavailableMessage: sessionDiffUnavailableMessage,
+            changeEntries,
+            changeFilePaths,
+            onOpenChangesDiff: handleSelectMobileChange,
+          }}
         >
-          <SessionMobileDiffDrawerContent side="bottom" className="h-[85vh] flex flex-col p-0">
-            <UiDrawer.Header className="shrink-0 border-b border-border px-4 py-3">
-              <UiDrawer.Title className="text-sm font-medium">
-                {t('sessions.diffTab', 'Changes')}
-              </UiDrawer.Title>
-            </UiDrawer.Header>
-            <div {...stylex.props(detailStyles.drawerBody)}>
-              {mobileDiffState && (
-                <SessionConversationDiffPanel
-                  sessionId={activeSession.id}
-                  turnId={mobileDiffState.turnId}
-                  filePaths={mobileDiffState.filePaths}
-                  focusFilePath={mobileDiffState.focusFilePath}
-                  focusComment={mobileDiffState.focusComment}
-                  focusRequestSeq={mobileDiffState.focusRequestSeq}
-                  mode={mobileDiffState.mode ?? 'conversation'}
-                  refreshToken={
-                    (mobileDiffState.mode ?? 'conversation') === 'base'
-                      ? allChangesRefreshToken
-                      : undefined
-                  }
-                  fileDiffs={
-                    (mobileDiffState.mode ?? 'conversation') === 'base'
-                      ? []
-                      : resolveTurnFileDiffs(mobileDiffState.turnId)
-                  }
-                  fileDiffsPending={!sessionDiffReady}
-                  session={activeSession}
-                  workspaceSession={workspaceOwnerSession}
-                  onSendToChat={handleAddCommentReferenceToActiveChatInput}
-                  commentReferenceKeys={activeCommentReferenceKeys}
-                  fileProvider={
-                    (mobileDiffState.mode ?? 'conversation') === 'base' ||
-                    canOpenHistoricalDiffs ||
-                    activeSessionFileProviderRequested
-                      ? activeSessionFileProvider
-                      : null
-                  }
-                  fileProviderPending={
-                    (mobileDiffState.mode ?? 'conversation') === 'base' ||
-                    canOpenHistoricalDiffs ||
-                    activeSessionFileProviderRequested
-                      ? activeSessionFileProviderPending
-                      : false
-                  }
-                  onOpenFile={handleOpenFileFromDiff}
-                  className={stylex.props(detailStyles.rootFill).className}
-                />
-              )}
-            </div>
-          </SessionMobileDiffDrawerContent>
-        </UiDrawer.Root>
+          {mobileDiffState && (
+            <SessionConversationDiffPanel
+              active={mobileDiffState.view === undefined || mobileDiffState.view === 'diff'}
+              sessionId={activeSession.id}
+              turnId={mobileDiffState.turnId}
+              filePaths={mobileDiffState.filePaths}
+              focusFilePath={mobileDiffState.focusFilePath}
+              focusComment={mobileDiffState.focusComment}
+              focusRequestSeq={mobileDiffState.focusRequestSeq}
+              mode={mobileDiffState.mode ?? 'conversation'}
+              allChangesScope={effectiveAllChangesDiffScope}
+              allChangesScopeSupported={allChangesScopeSupported}
+              onAllChangesScopeChange={setAllChangesDiffScope}
+              refreshToken={
+                (mobileDiffState.mode ?? 'conversation') === 'base'
+                  ? allChangesRefreshToken
+                  : undefined
+              }
+              fileDiffs={
+                (mobileDiffState.mode ?? 'conversation') === 'base'
+                  ? []
+                  : resolveTurnFileDiffs(mobileDiffState.turnId)
+              }
+              fileDiffsPending={!sessionDiffReady}
+              session={activeSession}
+              workspaceSession={workspaceOwnerSession}
+              onSendToChat={handleAddCommentReferenceToActiveChatInput}
+              commentReferenceKeys={activeCommentReferenceKeys}
+              fileProvider={
+                (mobileDiffState.mode ?? 'conversation') === 'base' ||
+                canOpenHistoricalDiffs ||
+                activeSessionFileProviderRequested
+                  ? activeSessionFileProvider
+                  : null
+              }
+              fileProviderPending={
+                (mobileDiffState.mode ?? 'conversation') === 'base' ||
+                canOpenHistoricalDiffs ||
+                activeSessionFileProviderRequested
+                  ? activeSessionFileProviderPending
+                  : false
+              }
+              onOpenFile={handleOpenFileFromDiff}
+              className={stylex.props(detailStyles.rootFill).className}
+            />
+          )}
+        </SessionMobileDiffDrawer>
         {viewerTabs
           .filter((tab): tab is Extract<ViewerTab, { type: 'file' }> => tab.type === 'file')
           .map((tab) => {
@@ -6416,7 +6697,6 @@ const SessionDetail = ({
                   repoFullName={latestPrRepoFullName}
                   prNumber={latestPrNumber}
                   headCommitSha={getSessionPullRequestLegacyFields(latestPr).headCommitSha}
-                  onResolvedPrStatus={reconcilePersistedPrStatus}
                   className={stylex.props(detailStyles.rootFill).className}
                   leadingSlot={
                     <Button
@@ -6547,8 +6827,8 @@ const SessionDetail = ({
         </Drawer>
         {fileQuickOpenDialog}
         {deleteConfirmDialog}
-        {archiveConfirmDialog}
         {dirtyForkDialog}
+        {fileLinkDialog}
         {worktreeForkObservers}
         <SessionShareDialog
           open={showSessionSharing && pendingSessionShare != null}
@@ -6607,7 +6887,6 @@ const SessionDetail = ({
         repoFullName={latestPrRepoFullName}
         prNumber={latestPrNumber}
         headCommitSha={getSessionPullRequestLegacyFields(latestPr).headCommitSha}
-        onResolvedPrStatus={reconcilePersistedPrStatus}
         className={stylex.props(detailStyles.background).className}
         // The side panel stays mounted while collapsed, so GitHub polling has
         // to be paused explicitly — same signal SessionBrowserPanel takes.
@@ -6694,27 +6973,6 @@ const SessionDetail = ({
     ? { main: 75, sidebar: 25 }
     : { main: 60, sidebar: 40 };
 
-  const sidebarToggleButton = (
-    <Button
-      type="button"
-      variant="ghost"
-      size="small"
-      icon
-      onClick={handleToggleSidebar}
-      aria-label={
-        isSidebarVisible
-          ? t('sessions.sidebar.hide', 'Hide sidebar')
-          : t('sessions.sidebar.show', 'Show sidebar')
-      }
-      className={
-        stylex.props(detailStyles.shrink, !isSidebarVisible && detailStyles.sidebarToggleMargin)
-          .className
-      }
-    >
-      <PanelRight {...stylex.props(detailStyles.icon16)} />
-    </Button>
-  );
-
   const leftSidebarExpandButton = isLeftSidebarHidden ? (
     <Button
       type="button"
@@ -6725,76 +6983,11 @@ const SessionDetail = ({
       aria-label={t('sessions.leftSidebar.show', 'Show navigation sidebar')}
       className={stylex.props(detailStyles.shrink).className}
     >
-      <PanelLeft {...stylex.props(detailStyles.icon16)} />
+      <CuidaSidebarExpandOutline {...stylex.props(detailStyles.icon16)} aria-hidden="true" />
     </Button>
   ) : null;
 
-  /* Right-side window controls for the merged top bar: the parent session's
-     header toolbar (IDE launcher / preview / "…" menu) + the sidebar toggle.
-     Rendered by SessionChatInterface (headerVariant="toolbar") so the menu
-     keeps root-scoped presentation while selected-tab actions are delegated. */
-  const desktopHeaderToolbar = (
-    <SessionChatInterface
-      session={activeSession}
-      workspaceSession={activeSession}
-      className={stylex.props(detailStyles.fillNoShrink).className}
-      headerVariant="toolbar"
-      headerEndSlot={
-        <>
-          <TerminalDockToggleButton />
-          {!isSidebarVisible ? sidebarToggleButton : null}
-        </>
-      }
-      titleSyncing={activeSessionDocIsSyncing}
-      hideMessageArea
-      onArchiveSession={handleArchiveCurrentSession}
-      onRestoreSession={handleRestoreCurrentSession}
-      onDeleteSession={handleRequestDeleteCurrentSession}
-      onOpenSearch={handleOpenSearch}
-      onCopyConversationHistory={handleCopyConversationHistory}
-      onRequestRename={!activeDraftTab ? handleRenameCurrentSession : undefined}
-      onForkSession={
-        !activeDraftTab && activeTabSession && canForkSession(activeTabSession)
-          ? handleForkCurrentSession
-          : undefined
-      }
-      forkWorktreeAvailability={
-        activeTabSession ? getForkWorktreeAvailability(activeTabSession) : 'hidden'
-      }
-      onForkWorktreeMenuOpen={
-        activeTabSession
-          ? () => {
-              void resolveForkWorktreeAvailability(activeTabSession);
-            }
-          : undefined
-      }
-      forkingAssistantMessageId={
-        activeTabSession ? pendingForks[activeTabSession.id]?.turnId : null
-      }
-      sharing={activeSessionSharing ?? undefined}
-      onShareWithTeam={
-        showSessionSharing ? () => handleRequestShareSession(activeSession) : undefined
-      }
-      onShareAsImage={
-        activeDraftTab
-          ? undefined
-          : () => {
-              void handleShareAsImage().catch((error: unknown) => {
-                console.error('Failed to load conversation for image sharing', error);
-                toast.error(t('sessions.shareImage.empty', 'No conversation to share'));
-              });
-            }
-      }
-      onOpenPrTab={handleOpenPrTab}
-      onNavigateSession={handleNavigateSession}
-      browserActionSession={activeBrowserSession}
-      onOpenBrowser={() => {
-        if (activeBrowserSession) {
-          handleOpenBrowser(activeBrowserSession.id);
-        }
-      }}
-    />
-  );
+  const desktopHeaderToolbar = <div ref={setDesktopToolbarContainer} />;
 
   /* Single-row desktop top bar: [sidebar expand] [session tabs …] [toolbar].
      Replaces the old two-row header (repo title row + tab bar) — repo identity
@@ -6830,11 +7023,9 @@ const SessionDetail = ({
         ).className,
         // The macOS traffic lights sit over the LEFT sidebar (or, when it is
         // collapsed, over the horizontally-cleared `pl-[4.5rem]` gap below),
-        // never over this top bar — so it must not reserve vertical inset.
-        //
-        // Flush with the window/sidebar top so this h-11 row shares y=0 with
-        // the sidebar header; the macOS row pad centers its controls on the
-        // traffic-light centerline. Re-derive if the row or pill height changes.
+        // never over this top bar. The row begins below WorkspaceCard's thin
+        // top rim, so its frame-aware pad lifts controls onto the same y=23
+        // centreline without removing their visual clearance from the card.
         macTrafficLightRowPadClass,
         windowsCaptionRowPadClass,
         !isSidebarVisible && windowsCaptionPadClass
@@ -6853,13 +7044,14 @@ const SessionDetail = ({
   ) => {
     const pendingForkSourceId = pendingForkSourceByTargetSessionId.get(chatSession.id);
     return {
-      ref: (element: SessionChatInterfaceHandle | null) => setChatTabRef(chatSession.id, element),
+      registerChatRef: setChatTabRef,
       claimNavigationFocus:
         isActive && chatSession.id === sessionId ? claimNavigationFocus : undefined,
       session: chatSession,
       workspaceSession: activeSession,
       className: stylex.props(detailStyles.rootFill).className,
       hideHeader: true,
+      toolbar: chatSession.id === sessionId ? desktopToolbar : undefined,
       syncEnabled: isActive || pendingForkSourceId !== undefined,
       isVisible,
       onFileDiffClick: handleOpenFileDiffForChat,
@@ -6894,49 +7086,66 @@ const SessionDetail = ({
       excludeSessionId={sessionMentionExcludeId}
       onDropSessionId={handleInsertDroppedSessionMention}
     >
-      {[activeSession, ...visibleChildSessions].map((tabSession) => {
-        const isActive = tabSession.id === activeTabSessionId;
-        const externalHistoryRefresh = externalHistoryRefreshBySessionId[tabSession.id];
-        const externalHistoryProviderLabel = externalHistoryRefresh
-          ? getExternalHistoryProviderLabel(externalHistoryRefresh.provider)
-          : undefined;
-        return (
-          <div
-            key={tabSession.id}
-            className={
-              stylex.props(detailStyles.absoluteFill, !isActive && detailStyles.hidden).className
-            }
-            aria-hidden={!isActive}
-          >
-            <SessionChatInterface
-              {...getSharedChatSurfaceProps(tabSession, isActive)}
-              paintSessionMentionOverlay={false}
-              isChildTab={tabSession.id !== sessionId}
-              isExternalHistoryRefreshing={externalHistoryRefresh !== undefined}
-              externalHistoryProviderLabel={externalHistoryProviderLabel}
-              messageFileDiffEntriesByTurn={
-                tabSession.id === activeSessionTabId ? messageFileDiffEntriesByTurn : undefined
+      {[activeSession, ...visibleChildSessions]
+        .filter(
+          (tabSession) =>
+            tabSession.id === sessionId ||
+            tabSession.id === activeTabSessionId ||
+            mountedChatSessionIds.has(tabSession.id) ||
+            pendingForkSourceByTargetSessionId.has(tabSession.id)
+        )
+        .map((tabSession) => {
+          const isActive = tabSession.id === activeTabSessionId;
+          const externalHistoryRefresh = externalHistoryRefreshBySessionId[tabSession.id];
+          const externalHistoryProviderLabel = externalHistoryRefresh
+            ? getExternalHistoryProviderLabel(externalHistoryRefresh.provider)
+            : undefined;
+          return (
+            <div
+              key={tabSession.id}
+              className={
+                stylex.props(
+                  detailStyles.absoluteFill,
+                  detailStyles.conversationContainment,
+                  !isActive && detailStyles.hidden
+                ).className
               }
-              onOpenBrowser={() => handleOpenBrowser(tabSession.id, true)}
-              changesDiffStat={changesDiffStat}
-              onForkLastAssistant={
-                canForkSession(tabSession)
-                  ? (turnId, destination) => handleForkDestination(tabSession, turnId, destination)
-                  : undefined
-              }
-              forkWorktreeAvailability={getForkWorktreeAvailability(tabSession)}
-              forkingAssistantMessageId={pendingForks[tabSession.id]?.turnId}
-            />
-          </div>
-        );
-      })}
+              aria-hidden={!isActive}
+            >
+              <SessionChatSurface
+                {...getSharedChatSurfaceProps(tabSession, isActive)}
+                paintSessionMentionOverlay={false}
+                isChildTab={tabSession.id !== sessionId}
+                isExternalHistoryRefreshing={externalHistoryRefresh !== undefined}
+                externalHistoryProviderLabel={externalHistoryProviderLabel}
+                messageFileDiffEntriesByTurn={
+                  tabSession.id === activeSessionTabId ? messageFileDiffEntriesByTurn : undefined
+                }
+                onOpenBrowser={() => handleOpenBrowser(tabSession.id, true)}
+                changesDiffStat={changesDiffStat}
+                onForkLastAssistant={
+                  canForkSession(tabSession)
+                    ? (turnId, destination) =>
+                        handleForkDestination(tabSession, turnId, destination)
+                    : undefined
+                }
+                forkWorktreeAvailability={getForkWorktreeAvailability(tabSession)}
+                forkingAssistantMessageId={pendingForks[tabSession.id]?.turnId}
+              />
+            </div>
+          );
+        })}
       {draftTabs.map((draft) => {
         const isActive = draft.id === activeTabSessionId;
         return (
           <div
             key={draft.id}
             className={
-              stylex.props(detailStyles.absoluteFill, !isActive && detailStyles.hidden).className
+              stylex.props(
+                detailStyles.absoluteFill,
+                detailStyles.conversationContainment,
+                !isActive && detailStyles.hidden
+              ).className
             }
             aria-hidden={!isActive}
           >
@@ -6989,11 +7198,15 @@ const SessionDetail = ({
         <div
           key={sideSession.id}
           className={
-            stylex.props(detailStyles.absoluteFill, !isActive && detailStyles.hidden).className
+            stylex.props(
+              detailStyles.absoluteFill,
+              detailStyles.conversationContainment,
+              !isActive && detailStyles.hidden
+            ).className
           }
           aria-hidden={!isActive}
         >
-          <SessionChatInterface
+          <SessionChatSurface
             {...getSharedChatSurfaceProps(sideSession, isActive, isActive && isSidebarVisible)}
             isChildTab
           />
@@ -7089,11 +7302,11 @@ const SessionDetail = ({
         sidebarRestoreSeq={sidebarRestoreSeq}
       />
       {/* These dialogs live at the desktop root too (the mobile branch renders its own
-          copies) so the `session.renameCurrent` / `session.archiveCurrent` keyboard
-          shortcuts have a mounted target on desktop. They portal out, so tree position
+          copies) so keyboard shortcuts such as `session.renameCurrent` have a mounted
+          target on desktop. They portal out, so tree position
           doesn't matter. */}
-      {archiveConfirmDialog}
       {dirtyForkDialog}
+      {fileLinkDialog}
       {worktreeForkObservers}
       <SessionShareDialog
         open={showSessionSharing && pendingSessionShare != null}

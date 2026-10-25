@@ -19,6 +19,7 @@ import {
   loadWorkspaceAgentRoleCatalog,
   resolveAgentRoleCreate,
   resolveAgentRoleCreateFromCatalog,
+  selectAgentRoleTarget,
   selectUniqueAgentRoleByIdOrName,
 } from './agent-role-create';
 import { __lodyMcpServerInternals } from '../mcp/lody-mcp-server';
@@ -101,7 +102,7 @@ describe('selectUniqueAgentRoleByIdOrName', () => {
 });
 
 describe('resolveAgentRoleCreate', () => {
-  it('composes the Prompt prefix and freezes the Role run config', () => {
+  it('keeps the authored prompt, binds the Prompt prefix separately and freezes the Role run config', () => {
     const role = agentRole({
       runConfig: {
         modeId: 'default',
@@ -113,7 +114,10 @@ describe('resolveAgentRoleCreate', () => {
 
     const resolved = resolveAgentRoleCreate({ role, prompt: 'Review the current diff.' });
 
-    expect(resolved.prompt).toBe('Act as a careful reviewer.\n\nReview the current diff.');
+    expect(resolved.prompt).toBe('Review the current diff.');
+    const options: CreateOptions = {};
+    applyAgentRoleCreateTarget(options, resolved);
+    expect(options.agentRolePromptPrefix).toBe('Act as a careful reviewer.');
     expect(resolved.dispatchConfig).toEqual({
       modeId: 'default',
       modelId: 'opus',
@@ -269,6 +273,8 @@ describe('MCP resolution parity', () => {
     expect(mcpOptions.agentRoleId).toBe(cliOptions.agentRoleId);
     expect(mcpOptions.agentRoleRevision).toBe(cliOptions.agentRoleRevision);
     expect(mcpOptions.agentRoleSnapshot).toEqual(cliOptions.agentRoleSnapshot);
+    expect(mcpOptions.agentRolePromptPrefix).toBe('Act as a careful reviewer.');
+    expect(mcpOptions.agentRolePromptPrefix).toBe(cliOptions.agentRolePromptPrefix);
   });
 });
 
@@ -280,5 +286,87 @@ describe('loadWorkspaceAgentRoleCatalog', () => {
     const catalog = await loadWorkspaceAgentRoleCatalog(manager, 'workspace-id' as WorkspaceId);
 
     expect(catalog.get(role.id)).toEqual(role);
+  });
+});
+
+describe('a Role on several machines', () => {
+  const both = agentRole({
+    runConfig: { modelId: 'opus' },
+    alias: 'Reviewer-Remote',
+    additionalTargets: [
+      {
+        machineId: 'laptop' as MachineId,
+        agentConfigId: 'codex' as AgentConfigId,
+        runConfig: { modelId: 'gpt-5.6' },
+        alias: 'Reviewer-Laptop',
+      },
+    ],
+  });
+
+  it('selects a target by alias or by id plus machine, and never picks one itself', () => {
+    expect(selectAgentRoleTarget([both], 'Reviewer-Laptop')).toMatchObject({
+      machineId: 'laptop',
+      agentConfigId: 'codex',
+    });
+    expect(selectAgentRoleTarget([both], 'reviewer', { machineId: 'laptop' }).runConfig).toEqual({
+      modelId: 'gpt-5.6',
+    });
+    expect(() => selectAgentRoleTarget([both], 'Reviewer')).toThrow(
+      /runs on several machines; name one\. Machines: remote-machine \(Reviewer-Remote\), laptop \(Reviewer-Laptop\)/
+    );
+    expect(() => selectAgentRoleTarget([both], 'reviewer', { machineId: 'ci' })).toThrow(
+      /does not run on machine ci/
+    );
+  });
+
+  it('lets --machine pick the target instead of reporting it as overridden', async () => {
+    const { manager } = createRoleCatalogManager([
+      both,
+      agentRole({ id: 'solo' as AgentRoleId, name: 'Solo' }),
+    ]);
+    const picked = await resolveAgentRoleCreateFromCatalog({
+      manager,
+      workspaceId: 'workspace-id' as WorkspaceId,
+      selector: 'reviewer',
+      prompt: 'Review this.',
+      overrides: { machine: 'laptop', model: 'manual' },
+    });
+    expect(picked).toMatchObject({ machineId: 'laptop', agentConfigId: 'codex' });
+    expect(picked.dispatchConfig.modelId).toBe('gpt-5.6');
+    expect(picked.ignoredOverrides).toEqual(['--model']);
+
+    // A single-machine Role keeps its machine; --machine stays an ignored flag.
+    const solo = await resolveAgentRoleCreateFromCatalog({
+      manager,
+      workspaceId: 'workspace-id' as WorkspaceId,
+      selector: 'solo',
+      prompt: 'Review this.',
+      overrides: { machine: 'laptop' },
+    });
+    expect(solo.machineId).toBe('remote-machine');
+    expect(solo.ignoredOverrides).toEqual(['--machine']);
+  });
+
+  it('requires agentRoleMachineId over MCP and dispatches that target', () => {
+    const invoking = undefined;
+    const requester = { machineId: 'current-machine' as MachineId, project: undefined };
+    const input = { operationId: 'multi-1', prompt: 'Review.', agentRoleId: 'reviewer' };
+    expect(() => resolveMcpSessionCreate(input, invoking, requester, both)).toThrow(
+      expect.objectContaining({ code: 'AGENT_ROLE_MACHINE_REQUIRED' })
+    );
+    expect(() =>
+      resolveMcpSessionCreate({ ...input, agentRoleMachineId: 'ci' }, invoking, requester, both)
+    ).toThrow(expect.objectContaining({ code: 'AGENT_ROLE_MACHINE_NOT_FOUND' }));
+
+    const resolved = resolveMcpSessionCreate(
+      { ...input, agentRoleMachineId: 'laptop' },
+      invoking,
+      requester,
+      both
+    );
+    expect(resolved.input).toMatchObject({ machineId: 'laptop', agentConfigId: 'codex' });
+    expect(resolved.input).not.toHaveProperty('agentRoleMachineId');
+    expect(resolved.dispatchConfig).toEqual({ modelId: 'gpt-5.6', inheritSessionDefaults: false });
+    expect(resolved.role).toMatchObject({ id: 'reviewer', machineId: 'laptop' });
   });
 });

@@ -3,25 +3,12 @@ import { ConvexHttpClient } from 'convex/browser';
 import type { FunctionReference, OptionalRestArgs } from 'convex/server';
 import type { GitHubTokenPort, GitHubTokenErrorResult } from '@/lib/github-token-port';
 import { getRegisteredAuthClient } from '@/lib/auth-client-singleton';
+import { requestCurrentConvexJwt } from '@/lib/convex-jwt';
 import { convexClient } from './convex-provider';
 
-let inFlightRefresh: Promise<string | null> | null = null;
-
 async function mintFreshConvexJwt(): Promise<string | null> {
-  if (inFlightRefresh) return inFlightRefresh;
   const authClient = getRegisteredAuthClient();
-  if (!authClient) return null;
-  inFlightRefresh = (async () => {
-    try {
-      const { data } = await authClient.convex.token({ fetchOptions: { throw: false } });
-      return data?.token ?? null;
-    } catch {
-      return null;
-    } finally {
-      inFlightRefresh = null;
-    }
-  })();
-  return inFlightRefresh;
+  return authClient ? await requestCurrentConvexJwt(authClient) : null;
 }
 
 async function runActionWithUnauthorizedRetry<

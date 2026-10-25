@@ -26,6 +26,7 @@ import {
   resolveWorkspaceLocalProjectRootPathWithRetry,
   resolveWorkspaceLocalProjectWithSyncOnMiss,
   upsertMachineLocalProject,
+  readLocalProjectRootResolveSyncTimeoutMs,
 } from '@/lib/local-project-meta';
 import { preflightLocalProjectWorktreeRemoval } from '@/lib/local-project-removal';
 import type { LocalSessionControlConfig } from '@/lib/local-session-control';
@@ -69,11 +70,10 @@ import {
   CliType,
   MachineId,
   WorkspaceId,
-  createServerTimeFetcher,
   getServerNow,
   getSessionRoomId,
   isLoroRepoDocDeleted,
-  syncTime,
+  startTimeSyncLegacy,
   type CliRuntimeConnectivity,
   type CliRuntimeWorkspace,
   type LocalProjectControlErrorCode,
@@ -101,16 +101,9 @@ const FLEET_RECONCILE_RETRY_INITIAL_DELAY_MS = 5_000;
 const FLEET_RECONCILE_RETRY_MAX_DELAY_MS = 5 * 60_000;
 const FLEET_WORKSPACE_START_CONCURRENCY = 4;
 
-export async function syncCliServerTime(logger: Logger, serverUrl: string): Promise<void> {
-  await traceAsync(logger, 'startup.sync_time', undefined, async () => {
-    try {
-      await syncTime(createServerTimeFetcher(`${serverUrl}/api/time`));
-      logger.debug('Time synchronized with server');
-    } catch (error) {
-      logger.debug(
-        `Failed to sync time with server ${serverUrl}: ${error instanceof Error ? error.message : 'Unknown error'}`
-      );
-    }
+export function syncCliServerTime(logger: Logger, serverUrl: string) {
+  return startTimeSyncLegacy(`${serverUrl}/api/time`, () => {
+    logger.debug('Time synchronization unavailable; retaining the previous calibration.');
   });
 }
 
@@ -129,6 +122,7 @@ type WorkspaceRuntimeState = {
   unsubscribeTerminalCleanup: () => void;
   prPollerWorkspace: PrPollerWorkspaceHandle;
   schedules: ScheduleWorkspaceHandle;
+  localProjectReconciliation?: { stop: AbortController; done: Promise<void> };
   cleanupOwner?: ReturnType<typeof workspaceCleanupOwnerLegacy>;
   cleanupReceipt?: Promise<void>;
   cleanupFailure?: unknown;
@@ -266,7 +260,7 @@ export class LodyFleet {
       initCliAnalytics();
     }
     this.memoryPressure.start();
-    // Sync time once before any time-sensitive operations (heartbeats, unread
+    // Await the first calibration attempt before time-sensitive operations (heartbeats, unread
     // detection). Local platform: no time server; getServerNow() falls back to
     // the local clock.
     if (this.startupTimeSync) {
@@ -833,6 +827,7 @@ export class LodyFleet {
       try {
         lody = await Lody.create({
           logger: workspaceLogger,
+          onStorageWriteFailure: () => this.runtimeStateReporter.reportStorageWriteFailure(),
           builtinAgentConfigCliTypes: this.builtinAgentConfigCliTypes,
           supportRegistryAgentTypes: this.supportRegistryAgentTypes,
           workspaceId: workspace.id as WorkspaceId,
@@ -859,17 +854,6 @@ export class LodyFleet {
         }
 
         await lody.start();
-
-        await reconcileMachineLocalProjectRootPaths(
-          lody.documentManager.repo,
-          workspace.id as WorkspaceId,
-          this.machineId,
-          lody.documentManager
-        ).catch((error: unknown) => {
-          workspaceLogger.warn(
-            `Failed to reconcile local project paths: ${formatErrorMessage(error)}`
-          );
-        });
 
         if (!this.desiredWorkspaces.has(workspace.id) || this.stopped) {
           await lody.cleanup();
@@ -910,13 +894,14 @@ export class LodyFleet {
           hasSessionWork: (sessionId) => startedLody.hasAutomationSessionWork(sessionId),
         });
         stopSchedules = schedules.dispose;
-        this.runtimes.set(workspace.id, {
+        const runtime: WorkspaceRuntimeState = {
           workspace,
           lody: startedLody,
           unsubscribeTerminalCleanup,
           prPollerWorkspace,
           schedules,
-        });
+        };
+        this.runtimes.set(workspace.id, runtime);
         this.prStatusPoller.registerWorkspace(prPollerWorkspace);
         void this.remoteBridge?.attachRuntimeIfAllowed(workspace.id);
         this.logger.debug(`[fleet] Connected workspace: ${workspaceLabel} (${workspace.id})`);
@@ -927,6 +912,19 @@ export class LodyFleet {
         );
         this.runtimeStateReporter.clearIssue(`workspace_start_failed:${workspace.id}`);
         this.refreshRuntimeState();
+        // Observation is not a prerequisite for pollers, schedules or runtime readiness.
+        // Keep its lifetime with this runtime so shutdown never closes its document mid-write.
+        const stop = new AbortController();
+        const done = reconcileMachineLocalProjectRootPaths(
+          startedLody.documentManager.repo,
+          workspace.id as WorkspaceId,
+          this.machineId,
+          startedLody.documentManager,
+          stop.signal
+        ).catch((error: unknown) => {
+          workspaceLogger.warn(`Failed to reconcile local projects: ${formatErrorMessage(error)}`);
+        });
+        runtime.localProjectReconciliation = { stop, done };
       } catch (error) {
         if (lody) {
           const retained = lody;
@@ -1017,6 +1015,10 @@ export class LodyFleet {
     if (state.cleanupReceipt && !recover) return state.cleanupReceipt;
     this.cleanupOwners.set(state.workspace.id, state);
     state.cleanupOwner ??= workspaceCleanupOwnerLegacy([
+      async () => {
+        state.localProjectReconciliation?.stop.abort();
+        await state.localProjectReconciliation?.done;
+      },
       () => state.schedules.dispose(),
       async () => {
         await state.lody.cleanup();
@@ -1578,7 +1580,7 @@ export class LodyFleet {
         lastOpenedAtMs: nowMs,
       },
       nowMs,
-      { sync: runtime.lody.documentManager, reason: 'local-project-add' }
+      { sync: runtime.lody.documentManager, reason: 'local-project-add', refreshGitHubRemote: true }
     );
   }
 
@@ -1715,7 +1717,7 @@ export class LodyFleet {
         requestSync: () =>
           runtime.lody.documentManager.syncMachineFlockDoc(this.machineId, {
             reason: 'local-project-control-resolve',
-            timeoutMs: readTimeoutEnv('LODY_LOCAL_PROJECT_RESOLVE_SYNC_TIMEOUT_MS', 1_500),
+            timeoutMs: readLocalProjectRootResolveSyncTimeoutMs(),
           }),
       }
     );

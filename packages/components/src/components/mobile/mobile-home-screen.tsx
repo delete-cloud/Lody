@@ -30,6 +30,7 @@ import {
   Search,
   Settings,
   Share2,
+  SlidersHorizontal,
   Terminal,
   X,
 } from 'lucide-react';
@@ -46,7 +47,6 @@ import { getDownloadPageUrl } from '@/lib/lody-urls';
 import { observeResizeOnAnimationFrame } from '@/lib/resize-observer';
 import { cn } from '@/lib/utils';
 import { usePullToRefresh } from '@/hooks/use-pull-to-refresh';
-import { CarbonSettingsAdjust } from '@/components/icons/carbon-settings-adjust';
 import { GlassIconButton } from '@/components/mobile/glass-icon-button';
 import { type MobileConversationItem } from './mobile-project-screen';
 import {
@@ -824,7 +824,7 @@ function ChatListFilterToggle({
         open && 'border-primary/40 bg-primary/15 text-primary'
       )}
     >
-      <CarbonSettingsAdjust className="h-4 w-4 text-current" aria-hidden="true" />
+      <SlidersHorizontal className="h-4 w-4 text-current" strokeWidth={1.8} aria-hidden="true" />
       {hasActiveFilters && !open ? (
         <span
           aria-hidden="true"
@@ -2466,7 +2466,7 @@ export function MobileHomeOnboarding({
           </div>
           <p className="mt-2.5 text-[0.75rem] leading-relaxed text-muted-foreground">
             {labels.commandHint ??
-              '在服务器、虚拟机或你的电脑上运行（需 Node.js 22.14+）。命令会发起登录；没有浏览器的机器会打印链接，用这台手机打开即可完成授权。'}
+              '在服务器、虚拟机或你的电脑上运行（需 Node.js 22.23.4+（22.x）、24.22.1+（24.x）或 26.12.1+（26.x））。命令会发起登录；没有浏览器的机器会打印链接，用这台手机打开即可完成授权。'}
           </p>
         </section>
 

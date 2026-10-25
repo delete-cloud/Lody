@@ -49,8 +49,8 @@ record: [process tree layer](../../../../.agents/notes/implemented/architecture/
   after failed Scope close. Only named Legacy application boundaries execute.
   Preserve timeout/release failure owners; never cache failure as empty success. Read [the decision](../../../../.agents/notes/implemented/architecture/2026-10-10-effect-login-shell-probe.md)
   before changing the probe or either cache consumer.
-- `process.ts` stays one module with no relative imports: Electron's
-  `node --test` cannot resolve extensionless relative imports.
+- `process.ts` stays one module with no relative imports (Electron's
+  `node --test` resolves them only via `node-test-ts-resolve.mjs`).
 - Missing a capability (a new spawn shape, a pid-only kill)? Add it to
   `process.ts` with a test and a facade; never work around the layer in a caller.
 - End processes through the official Effect handle or `terminateTree`; never add another
@@ -98,12 +98,13 @@ record: [process tree layer](../../../../.agents/notes/implemented/architecture/
   candidates and giving unidentified preparation a 30-minute grace period. Decision and limits:
   [file lock lifecycle](../../../../.agents/notes/implemented/architecture/2026-10-10-effect-file-lock-lifecycle.md).
 
-- Bound each release wait independently (5 seconds), retain and join the original
-  pending OS deletion, and block replacement until actual completion. A timeout
-  never proves unlink stopped. Only settled failures permit a new deletion attempt.
-- Retry acquisition only; body/release failures preserve the full Cause. Use
-  `squashFileLockFailure` at Legacy boundaries to retain every lock cleanup owner
-  alongside process leases and the original operation failure.
+- The holder waits once (5 seconds) for its file and scratch. A slow or failed
+  deletion never fails that holder: the service retains it, and successors join
+  it within their acquisition deadline, charged once per attempt (later ones fail fast).
+  Only `LockOwnershipLost` fails the holder.
+  Only settled failures permit a new deletion attempt.
+- Retry acquisition only. Use `squashFileLockFailure` at Legacy boundaries
+  ([holder release](../../../../.agents/notes/implemented/architecture/2026-10-16-file-lock-holder-release.md)).
 
 ## Supervised Inbox compatibility
 
