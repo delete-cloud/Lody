@@ -1,6 +1,22 @@
+import { join } from 'node:path';
+import type { CodeCollabV2WorkspaceResolver } from '../src/lib/code-collab/code-collab-v2-service';
 import { updateTestHistory } from './history-port-fixture';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LoroRepo } from 'loro-repo';
+import { LoroDoc, LoroMap } from 'loro-crdt';
+import { createSessionMirror, type HistoryWriter } from '@lody/shared';
+import { createLoroSessionData, readSessionHistory } from '@lody/shared/session-data';
+
+const readSessionHistoryFromReplica = (doc: LoroDoc, writer: HistoryWriter) => {
+  const data = createLoroSessionData({ doc, sessionId: 'read-replica' as SessionId, writer });
+  try {
+    return readSessionHistory(data.history);
+  } finally {
+    data.dispose();
+  }
+};
+import { toSessionTranscriptEntries } from '../src/commands/session';
+import { buildSessionArtifacts } from '../src/lib/session-export';
 
 import type {
   ACPSessionId,
@@ -11,6 +27,7 @@ import type {
 } from '@lody/shared';
 
 import { MessageHandler } from '../src/lib/message-handler';
+import type { SessionTransientStore } from '../src/lib/session-transient-store';
 import { SessionDocument } from '../src/lib/loro/doc';
 import type { LoroDocumentManager } from '../src/lib/loro/doc';
 import type { SessionManager } from '../src/session/session-manager';
@@ -20,6 +37,10 @@ import type { Logger } from '../src/utils/logger';
 import { loadEnv } from '../src/utils/const';
 import { createTestCloudPort } from './test-cloud-port';
 import type { RequestPermissionRequest, RequestPermissionResponse } from '@agentclientprotocol/sdk';
+import type {
+  UploadedSessionFile,
+  ValidatedUploadFile,
+} from '../src/lib/session-attachment-transfer';
 import type { AgentClient, AgentSessionWarning } from '../src/agent/agent-client';
 import type {
   AcpSessionConfigTarget,
@@ -44,9 +65,33 @@ type MessageHandlerHost = {
   applyAcpModeAndModel(
     session: AcpSessionConfigTarget,
     config: AcpSessionRunConfig,
-    context: { sessionDoc: SessionDocument }
+    context: { sessionDoc: SessionDocument; basedOnUserTurnId?: string }
   ): Promise<void>;
-  recordAgentWarning(sessionId: SessionId, warning: AgentSessionWarning): Promise<void>;
+  recordChatFailure(
+    sessionDoc: SessionDocument,
+    reason: 'agent_disconnected',
+    message?: string,
+    code?: undefined,
+    association?: { userTurnId?: string }
+  ): Promise<void>;
+  handleSessionFileUpload(
+    message: { type: 'session/file-upload'; sessionId: SessionId; paths: string[] },
+    context: { source: 'local'; send(response: unknown): void }
+  ): Promise<void>;
+  appendAssistantFileBlocksToActiveTurn(...args: unknown[]): Promise<boolean>;
+  resolveSessionWorkspaceRoot(sessionId: SessionId): string | null;
+  resolveCodeCollabV2Workspace: CodeCollabV2WorkspaceResolver;
+  validateSessionFileUploadPath(...args: unknown[]): Promise<ValidatedUploadFile>;
+  uploadValidatedSessionFile(...args: unknown[]): Promise<UploadedSessionFile>;
+  createAssistantImageGroupEntry(args: {
+    sessionId: SessionId;
+    sessionDoc: SessionDocument;
+  }): Promise<string>;
+  recordAgentWarning(
+    sessionId: SessionId,
+    warning: AgentSessionWarning,
+    association?: { userTurnId?: string }
+  ): Promise<void>;
   appendACPUpdatesToAssistantEntry(...args: unknown[]): Promise<void>;
   flushACPUpdatesNow(sessionId: SessionId): Promise<void>;
   handleAgentPermissionRequest(
@@ -62,6 +107,24 @@ type MessageHandlerHost = {
     gateContext?: { dispatchSource?: SessionDispatchSource; sessionDoc: SessionDocument }
   ): string;
   enqueueACPUpdate(sessionId: SessionId, update: AcpSessionNotification): void;
+  store: SessionTransientStore;
+  finalizeACPState(sessionId: SessionId, turnId?: string): Promise<void>;
+  executionService: {
+    recordSilentTurnFailure(options: {
+      sessionId: SessionId;
+      sessionDoc: SessionDocument;
+      turnId: string;
+      userTurnId: string;
+    }): Promise<void>;
+  };
+  sessionDispatchWatcher: {
+    markDispatchAccessDenied(
+      sessionId: SessionId,
+      doc: SessionDocument,
+      userTurnId: string,
+      reason: 'not_visible'
+    ): Promise<void>;
+  };
   createAssistantEntryForTurn(
     sessionId: SessionId,
     sessionDoc: SessionDocument,
@@ -88,7 +151,7 @@ const createHandlerHarness = async (sessionId: SessionId) => {
     vi.useRealTimers();
   }
   const repo = await LoroRepo.create({});
-  const doc = new SessionDocument(repo, sessionId);
+  const doc = new SessionDocument(repo, sessionId, async () => {});
   await doc.initOffline();
   if (fakeTimersActive) {
     vi.useFakeTimers();
@@ -127,13 +190,13 @@ const createHandlerHarness = async (sessionId: SessionId) => {
     }
   );
 
-  return { repo, doc, handler: handler as unknown as MessageHandlerHost };
+  return { repo, doc, handler: handler as unknown as MessageHandlerHost, sessionManager };
 };
 
 const userEntry = (id: string): SessionHistoryInput => ({
   id,
   role: 'user',
-  timestamp: new Date().toISOString(),
+  timestamp: '2026-10-16T00:00:00.000Z',
   read: false,
   userId: 'u-1',
   fileDiff: [],
@@ -149,9 +212,13 @@ const agentChunk = (sessionId: SessionId, text: string): AcpSessionNotification 
 });
 
 describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
-  it.each(['codex', 'claude'])(
-    'persists a rejected %s model as a GUI notice after the driving user turn',
-    async (agentType) => {
+  it.each(
+    ['codex', 'claude'].flatMap((agentType) =>
+      [false, true].map((clearDuringConfig) => ({ agentType, clearDuringConfig }))
+    )
+  )(
+    'persists a rejected $agentType model with clearDuringConfig=$clearDuringConfig',
+    async ({ agentType, clearDuringConfig }) => {
       const sessionId = `model-rejection-${agentType}` as SessionId;
       const { repo, doc, handler } = await createHandlerHarness(sessionId);
       try {
@@ -174,6 +241,7 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
                 { id: 'model', category: 'model', type: 'select', currentValue: 'active-model' },
               ],
               unstable_setSessionModel: async () => {
+                if (clearDuringConfig) handler.store.clearTurnState(sessionId);
                 throw new Error('Requested model is unavailable');
               },
             } as unknown as AgentClient,
@@ -187,6 +255,7 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
         const history = await doc.sessionData.history.readAll();
         expect(history[0]?.id).toBe('user-model-selection');
         const notice = history.find((entry) => entry.role === 'system');
+        expect(notice?.userTurnId).toBe('user-model-selection');
         expect(notice?.items).toEqual([
           expect.objectContaining({
             type: 'system_notice',
@@ -380,6 +449,389 @@ describe('MessageHandler turn history gate (RPC fast path ordering)', () => {
 
       const history = await doc.sessionData.history.readAll();
       expect(history.map((entry) => [entry.role, entry.id])).toEqual([['assistant', turnId]]);
+    } finally {
+      await destroyRepoOnRealTimers(repo);
+    }
+  });
+
+  it.each([
+    'stream',
+    'restart',
+    'chat-failed',
+    'agent-warning',
+    'file',
+    'image',
+    'dispose',
+    'dispose-notice',
+    'dispose-warning',
+    'supersede',
+    'file-restart',
+    'failed-finalized',
+    'silent-finalized',
+    'machine-denied',
+    'warning-after-clear',
+  ] as const)('reads late replica sync causally for %s', async (path) => {
+    const clearTurn = path === 'restart';
+    const sessionId = `s-gate-replicas-${path}` as SessionId;
+    const userTurnId = 'late-user';
+    const { repo, doc, handler, sessionManager } = await createHandlerHarness(sessionId);
+    const daemon = doc.handle?.doc;
+    if (!daemon) throw new Error('Missing real session document');
+    daemon.setPeerId('1');
+    const client = new LoroDoc();
+    client.import(daemon.export({ mode: 'snapshot' }));
+    client.setPeerId('2');
+    const clientMirror = createSessionMirror({ doc: client, initialState: {} });
+    const storedIds = (replica: LoroDoc) =>
+      replica
+        .getList('history')
+        .toJSON()
+        .map((entry: { id: string }) => entry.id);
+    try {
+      clientMirror.historyWriter.append(userEntry(userTurnId));
+      const turnId = handler.beginConversationTurn(sessionId, userTurnId, {
+        dispatchSource: 'rpc',
+        sessionDoc: doc,
+      });
+      const pendingNotice =
+        path === 'dispose-notice'
+          ? handler.recordChatFailure(doc, 'agent_disconnected', 'synthetic failure')
+          : path === 'dispose-warning'
+            ? handler.recordAgentWarning(sessionId, { message: 'synthetic warning' })
+            : undefined;
+      handler.enqueueACPUpdate(sessionId, agentChunk(sessionId, 'before sync'));
+      if (['dispose', 'dispose-notice', 'dispose-warning', 'supersede'].includes(path)) {
+        if (path === 'supersede') handler.beginConversationTurn(sessionId, 'next-user');
+        else handler.store.clearTurnState(sessionId);
+        await vi.advanceTimersByTimeAsync(200);
+        await pendingNotice;
+      } else {
+        await vi.advanceTimersByTimeAsync(DEFAULT_TURN_HISTORY_GATE_TIMEOUT_MS + 200);
+      }
+      if (['failed-finalized', 'silent-finalized', 'machine-denied'].includes(path)) {
+        vi.spyOn(doc, 'waitUntilSynced').mockResolvedValue(true);
+        await handler.finalizeACPState(sessionId, turnId);
+        expect(handler.store.get(sessionId).turn.phase).toBe('idle');
+        if (path === 'failed-finalized')
+          await handler.recordChatFailure(
+            doc,
+            'agent_disconnected',
+            'post-finalization failure',
+            undefined,
+            { userTurnId }
+          );
+        if (path === 'silent-finalized')
+          await handler.executionService.recordSilentTurnFailure({
+            sessionId,
+            sessionDoc: doc,
+            turnId,
+            userTurnId,
+          });
+        if (path === 'machine-denied')
+          await handler.sessionDispatchWatcher.markDispatchAccessDenied(
+            sessionId,
+            doc,
+            userTurnId,
+            'not_visible'
+          );
+      }
+      if (path === 'warning-after-clear') {
+        let release!: () => void;
+        handler.store.get(sessionId).historyNoticePersistChain = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const onWarning = sessionManager.on.mock.calls.find(
+          ([name]) => name === 'onAgentWarning'
+        )?.[1] as ((id: SessionId, warning: AgentSessionWarning) => void) | undefined;
+        if (!onWarning) throw new Error('Missing warning listener');
+        onWarning(sessionId, { message: 'queued warning' });
+        handler.store.clearTurnState(sessionId);
+        release();
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      if (path === 'chat-failed')
+        await handler.recordChatFailure(doc, 'agent_disconnected', 'synthetic failure');
+      if (path === 'agent-warning')
+        await handler.recordAgentWarning(sessionId, { message: 'synthetic warning' });
+      if (path === 'image')
+        await handler.createAssistantImageGroupEntry({ sessionId, sessionDoc: doc });
+      if (path === 'file' || path === 'file-restart') {
+        const workspaceRoot = process.cwd();
+        const filePath = join(workspaceRoot, 'result.txt');
+        vi.spyOn(handler, 'appendAssistantFileBlocksToActiveTurn').mockResolvedValue(false);
+        vi.spyOn(handler, 'resolveSessionWorkspaceRoot').mockReturnValue(workspaceRoot);
+        vi.spyOn(handler, 'resolveCodeCollabV2Workspace').mockResolvedValue({
+          ok: true, ownerSessionId: sessionId, workspaceRoot,
+          fileRoots: [{ id: 'main', absolutePath: workspaceRoot }],
+        });
+        vi.spyOn(handler, 'validateSessionFileUploadPath').mockResolvedValue({
+          absolutePath: filePath,
+          fileName: 'result.txt',
+          mimeType: 'text/plain',
+          sizeBytes: 1,
+          sha256: 'a'.repeat(64),
+          textPreview: true,
+        });
+        vi.spyOn(handler, 'uploadValidatedSessionFile').mockImplementation(async () => {
+          if (path === 'file-restart') handler.beginConversationTurn(sessionId, 'next-user');
+          return {
+            type: 'file',
+            fileId: 'uploaded-file',
+            fileName: 'result.txt',
+            mimeType: 'text/plain',
+            sizeBytes: 1,
+            sha256: 'a'.repeat(64),
+            textPreview: true,
+            transport: 'r2',
+            uploadedAt: Date.parse('2026-10-16T00:00:00.000Z'),
+            downloadUrl: 'https://example.test/result.txt',
+          };
+        });
+        const responses: unknown[] = [];
+        await handler.handleSessionFileUpload(
+          { type: 'session/file-upload', sessionId, paths: [filePath] },
+          {
+            source: 'local',
+            send: (response) => responses.push(response),
+          }
+        );
+        expect(responses).toEqual([
+          expect.objectContaining({ success: true, attachedTo: 'new_entry' }),
+        ]);
+      }
+      const beforeSync = doc.sessionData.writer.readStored();
+      const associatedRows = beforeSync.filter((row) => row.id !== turnId);
+      if (
+        [
+          'chat-failed',
+          'agent-warning',
+          'file',
+          'file-restart',
+          'image',
+          'dispose-notice',
+          'dispose-warning',
+          'failed-finalized',
+          'silent-finalized',
+          'machine-denied',
+          'warning-after-clear',
+        ].includes(path)
+      ) {
+        expect(associatedRows).toHaveLength(1);
+        expect(associatedRows[0]?.userTurnId).toBe(userTurnId);
+      }
+      expect(storedIds(daemon)).toContain(turnId);
+      const expected = [userTurnId, ...storedIds(daemon)];
+      const clientUserContainer = client.getList('history').get(0) as LoroMap;
+      if (clearTurn) {
+        handler.store.clearTurnState(sessionId);
+        handler.beginConversationTurn(sessionId, userTurnId, {
+          dispatchSource: 'rpc',
+          sessionDoc: doc,
+        });
+      }
+      client.import(daemon.export({ mode: 'snapshot' }));
+      expect(storedIds(client)).toEqual([...expected.slice(1), userTurnId]);
+      expect(
+        readSessionHistoryFromReplica(client, clientMirror.historyWriter).map((row) => row.id)
+      ).toEqual(expected);
+      daemon.import(client.export({ mode: 'snapshot' }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(readSessionHistory(doc.sessionData.history).map((row) => row.id)).toEqual(expected);
+      expect(
+        doc.sessionData.writer
+          .readStored()
+          .filter((row) => row.id !== userTurnId && row.id !== turnId)
+      ).toEqual(associatedRows);
+      expect((daemon.getList('history').get(expected.length - 1) as LoroMap).id).toBe(
+        clientUserContainer.id
+      );
+      clientUserContainer.set('inputConfig', { modelId: 'concurrent-model' });
+      client.commit();
+      client.import(daemon.export({ mode: 'snapshot' }));
+      daemon.import(client.export({ mode: 'snapshot' }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(
+        readSessionHistoryFromReplica(client, clientMirror.historyWriter).map((row) => row.id)
+      ).toEqual(expected);
+      expect(storedIds(daemon)).toEqual(storedIds(client));
+      expect(readSessionHistory(doc.sessionData.history)[0]?.inputConfig?.modelId).toBe(
+        'concurrent-model'
+      );
+      expect(
+        readSessionHistory(doc.sessionData.history).find((row) => row.id === turnId)?.items
+      ).toEqual([{ type: 'text', text: 'before sync' }]);
+      if (
+        [
+          'dispose',
+          'dispose-notice',
+          'dispose-warning',
+          'supersede',
+          'file-restart',
+          'failed-finalized',
+          'silent-finalized',
+          'machine-denied',
+          'warning-after-clear',
+        ].includes(path)
+      )
+        handler.beginConversationTurn(sessionId, userTurnId);
+      handler.enqueueACPUpdate(sessionId, agentChunk(sessionId, ' after repair'));
+      await vi.advanceTimersByTimeAsync(200);
+      handler.beginConversationTurn(sessionId, userTurnId, {
+        dispatchSource: 'rpc',
+        sessionDoc: doc,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      await handler.createAssistantEntryForTurn(sessionId, doc, turnId, undefined, userTurnId);
+      handler.enqueueACPUpdate(sessionId, agentChunk(sessionId, ' after restart'));
+      await vi.advanceTimersByTimeAsync(200);
+      client.import(daemon.export({ mode: 'snapshot' }));
+      expect(
+        readSessionHistoryFromReplica(client, clientMirror.historyWriter).map((row) => row.id)
+      ).toEqual(expected);
+      expect(
+        readSessionHistory(doc.sessionData.history).find((row) => row.id === turnId)?.items
+      ).toEqual([{ type: 'text', text: 'before sync after repair after restart' }]);
+    } finally {
+      handler.store.clearTurnState(sessionId);
+      clientMirror.dispose();
+      await destroyRepoOnRealTimers(repo);
+    }
+  });
+
+  it('keeps stored entries unchanged after disposal and late import', async () => {
+    const sessionId = 's-gate-doc-dispose' as SessionId;
+    const { repo, doc, handler } = await createHandlerHarness(sessionId);
+    const daemon = doc.handle?.doc;
+    if (!daemon) throw new Error('Missing real session document');
+    daemon.setPeerId('1');
+    const client = new LoroDoc();
+    client.import(daemon.export({ mode: 'snapshot' }));
+    client.setPeerId('2');
+    const clientMirror = createSessionMirror({ doc: client, initialState: {} });
+    try {
+      clientMirror.historyWriter.append(userEntry('disposed-user'));
+      handler.beginConversationTurn(sessionId, 'disposed-user', {
+        dispatchSource: 'rpc',
+        sessionDoc: doc,
+      });
+      handler.enqueueACPUpdate(sessionId, agentChunk(sessionId, 'retained reply'));
+      await vi.advanceTimersByTimeAsync(DEFAULT_TURN_HISTORY_GATE_TIMEOUT_MS + 200);
+      handler.store.clearTurnState(sessionId);
+      await doc.destroy({ preserveStatus: true });
+      daemon.import(client.export({ mode: 'snapshot' }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(
+        daemon
+          .getList('history')
+          .toJSON()
+          .map((entry: { id: string }) => entry.id)
+      ).toEqual(['assistant:disposed-user', 'disposed-user']);
+      expect(daemon.getList('history').toJSON()[0]?.items).toEqual([
+        { type: 'text', text: 'retained reply' },
+      ]);
+    } finally {
+      handler.store.clearTurnState(sessionId);
+      clientMirror.dispose();
+      await destroyRepoOnRealTimers(repo);
+    }
+  });
+
+  it.each([false, true])(
+    'keeps pending permissions attached after late sync with finished=%s',
+    async (finished) => {
+      const sessionId = 's-gate-permission' as SessionId;
+      const userTurnId = 'permission-user';
+      const { repo, doc, handler } = await createHandlerHarness(sessionId);
+      const turnId = handler.beginConversationTurn(sessionId, userTurnId, {
+        dispatchSource: 'rpc',
+        sessionDoc: doc,
+      });
+      try {
+        await vi.advanceTimersByTimeAsync(DEFAULT_TURN_HISTORY_GATE_TIMEOUT_MS);
+        await updateTestHistory(doc, (history) => {
+          const assistant = history.find((row) => row.id === turnId);
+          if (!assistant) throw new Error('Missing timeout assistant');
+          assistant.finished = finished;
+          assistant.items = [
+            {
+              type: 'tool_call',
+              toolCallId: 'tool',
+              status: 'pending',
+              permissionRequest: {
+                requestId: 'request',
+                options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
+              },
+            },
+          ];
+          return [...history, userEntry(userTurnId)];
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(doc.sessionData.writer.readStored().map((row) => row.id)).toEqual([
+          turnId,
+          userTurnId,
+        ]);
+        expect(readSessionHistory(doc.sessionData.history).map((row) => row.id)).toEqual([
+          userTurnId,
+          turnId,
+        ]);
+        const daemon = doc.handle?.doc;
+        if (!daemon) throw new Error('Missing real session document');
+        const peer = new LoroDoc();
+        peer.import(daemon.export({ mode: 'snapshot' }));
+        const peerMirror = createSessionMirror({ doc: peer, initialState: {} });
+        try {
+          expect(
+            peerMirror.historyWriter.respondPermission('request', {
+              outcome: 'selected',
+              optionId: 'allow',
+            })
+          ).toBe(true);
+          daemon.import(peer.export({ mode: 'snapshot' }));
+        } finally {
+          peerMirror.dispose();
+        }
+        await vi.advanceTimersByTimeAsync(0);
+        expect(doc.sessionData.writer.readStored().map((row) => row.id)).toEqual([
+          turnId,
+          userTurnId,
+        ]);
+        expect(readSessionHistory(doc.sessionData.history)[1]?.items[0]).toMatchObject({
+          permissionRequest: { outcome: { outcome: 'selected', optionId: 'allow' } },
+        });
+      } finally {
+        handler.store.clearTurnState(sessionId);
+        await destroyRepoOnRealTimers(repo);
+      }
+    }
+  );
+
+  it('reads a historical inversion in causal order through the CLI/MCP transcript boundary', async () => {
+    const sessionId = 's-gate-historical' as SessionId;
+    const { repo, doc } = await createHandlerHarness(sessionId);
+    const userTurnId = 'historical-user';
+    const turnId = `assistant:${userTurnId}`;
+    try {
+      await updateTestHistory(doc, () => [
+        { ...userEntry(turnId), role: 'assistant', items: [{ type: 'text', text: 'reply' }] },
+        userEntry(userTurnId),
+      ]);
+      expect(doc.sessionData.writer.readStored().map((entry) => entry.id)).toEqual([
+        turnId,
+        userTurnId,
+      ]);
+      const history = readSessionHistory(doc.sessionData.history);
+      expect(buildSessionArtifacts(history).transcript.map((entry) => entry.turnId)).toEqual([
+        userTurnId,
+        turnId,
+      ]);
+      expect(toSessionTranscriptEntries(history).map((entry) => entry.id)).toEqual([
+        userTurnId,
+        turnId,
+      ]);
+      expect(doc.sessionData.writer.readStored().map((entry) => entry.id)).toEqual([
+        turnId,
+        userTurnId,
+      ]);
     } finally {
       await destroyRepoOnRealTimers(repo);
     }

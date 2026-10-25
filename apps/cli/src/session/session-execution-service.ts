@@ -657,7 +657,8 @@ export type SessionExecutionServiceDeps = {
     sessionDoc: SessionDocument,
     reason: ChatFailedReason,
     message?: string,
-    code?: ChatFailedCode
+    code?: ChatFailedCode,
+    association?: { userTurnId?: string }
   ) => Promise<void>;
   maybeGenerateAndStoreSessionTitle: (
     sessionId: SessionId,
@@ -1704,7 +1705,9 @@ export class SessionExecutionService {
           await this.deps.recordChatFailure(
             sessionDoc,
             'turn_pre_prompt_failed',
-            `Goal ${pending.control.action} failed: ${formatErrorMessage(error)}`
+            `Goal ${pending.control.action} failed: ${formatErrorMessage(error)}`,
+            undefined,
+            {}
           );
         }
       }
@@ -3330,10 +3333,13 @@ export class SessionExecutionService {
         sessionDoc,
         'turn_pre_prompt_failed',
         message,
-        GIT_EXECUTABLE_NOT_FOUND_CODE
+        GIT_EXECUTABLE_NOT_FOUND_CODE,
+        { userTurnId: runtime.userTurnId }
       );
     } else {
-      await this.deps.recordChatFailure(sessionDoc, 'turn_pre_prompt_failed', message);
+      await this.deps.recordChatFailure(sessionDoc, 'turn_pre_prompt_failed', message, undefined, {
+        userTurnId: runtime.userTurnId,
+      });
     }
     this.deps.logger.debug(
       `[${sessionId}] Recorded pre-prompt failure notice for turn ${runtime.turnId}`
@@ -3384,7 +3390,13 @@ export class SessionExecutionService {
         { tier: 'A' }
       );
     }
-    await this.deps.recordChatFailure(options.sessionDoc, options.reason, options.message);
+    await this.deps.recordChatFailure(
+      options.sessionDoc,
+      options.reason,
+      options.message,
+      undefined,
+      { userTurnId: options.userTurnId }
+    );
     if (options.userTurnId) {
       await this.markTurnFailed(options.sessionId, options.sessionDoc, options.userTurnId);
     }
@@ -3588,6 +3600,7 @@ export class SessionExecutionService {
     describe: (error: unknown) => string;
     onUnhandledError?: (error: unknown) => Promise<void>;
   }): Promise<void> {
+    const userTurnId = options.runtime.userTurnId;
     try {
       await this.recordPrePromptFailure(
         options.sessionId,
@@ -3609,7 +3622,9 @@ export class SessionExecutionService {
     if (options.userTurnId) {
       await this.markTurnFailed(options.sessionId, options.sessionDoc, options.userTurnId);
     }
-    await this.handleTurnError(options.sessionId, options.sessionDoc, options.error);
+    await this.handleTurnError(options.sessionId, options.sessionDoc, options.error, {
+      userTurnId,
+    });
     await options.onUnhandledError?.(options.error);
   }
 
@@ -3716,8 +3731,10 @@ export class SessionExecutionService {
   private async handleTurnError(
     sessionId: SessionId,
     sessionDoc: SessionDocument,
-    error?: unknown
+    error?: unknown,
+    association?: { userTurnId?: string }
   ): Promise<void> {
+    const userTurnId = association ? association.userTurnId : this.getActiveUserTurnId(sessionId);
     const acpError = error ? parseACPError(error) : null;
     const providerDisconnected = error ? isAgentDisconnectedError(error) : false;
     await this.deps.turnFinalization.finalizeACPState(
@@ -3749,7 +3766,9 @@ export class SessionExecutionService {
           failureReason,
           true
         );
-        await this.deps.recordChatFailure(sessionDoc, failureReason, recordedMessage);
+        await this.deps.recordChatFailure(sessionDoc, failureReason, recordedMessage, undefined, {
+          userTurnId,
+        });
 
         if (shouldTerminateOnACPError(acpError, failureReason)) {
           // Expired credentials leave a healthy agent process behind, so close
@@ -3785,7 +3804,9 @@ export class SessionExecutionService {
         await this.deps.recordChatFailure(
           sessionDoc,
           'agent_disconnected',
-          'The agent process disconnected unexpectedly. Please try again.'
+          'The agent process disconnected unexpectedly. Please try again.',
+          undefined,
+          { userTurnId }
         );
 
         try {
@@ -5478,7 +5499,9 @@ export class SessionExecutionService {
     await this.deps.recordChatFailure(
       options.sessionDoc,
       'agent_no_output',
-      SILENT_TURN_FAILURE_MESSAGE
+      SILENT_TURN_FAILURE_MESSAGE,
+      undefined,
+      { userTurnId: options.userTurnId }
     );
     if (options.userTurnId) {
       await this.markTurnFailed(options.sessionId, options.sessionDoc, options.userTurnId);

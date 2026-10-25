@@ -15,6 +15,12 @@
   the directory; explicit export/replay uses one consistent `readAll` observation.
   `readTurnOutput` reads the selected assistant and relevant failure notices in
   one observation instead of serializing the transcript on every token.
+- Loro directory, positional reads and `readAll` project `orderSessionHistory` without
+  rewriting storage. Share a shallow order index; body edits must not rebuild it.
+  Stable suffix appends retain the projected prefix even if storage remains inverted;
+  notify every observer only from the previous display length.
+  Association edits invalidate structural positions. Writer captures retain raw order and existing containers; never copy/delete rows to repair order.
+  Ordering anchors at the first user copy; targeted identity lookup stays last-copy.
 - Repeated identity lookups reuse an unchanged pending transaction. Reads must not
   commit writes; uncommitted structural/ID edits and checkout still invalidate lookup.
 - Subscribe and capture the initial directory without a gap. Notifications carry
@@ -33,7 +39,9 @@
   invalidate a capture held by a fork. Do not add a second handle registry,
   backend capabilities, store tokens or source-lifetime coupling.
 - Tail replacement rechecks the expected user/provider boundary and active goal
-  inside the write. Await conditional rollback before persisting follow-up meta;
+  inside the write using projected order; translate retained rows to stored positions.
+  Import baseline comparisons use stored snapshots. Await conditional rollback
+  before persisting follow-up meta;
   rollback retains later appends and refuses to overwrite concurrent edits.
 - Import inputs are explicit data. Recheck current history/cursor and bind the
   stored baseline and cursor in the same synchronous write, without an await gap.
@@ -58,19 +66,8 @@
   change replies. Older cache writers must stay isolated. Prepare detached bodies and commit them with membership
   and checkpoint atomically; unusable patches require checkpoint-protected body
   reads. Never reinterpret raw segment edits as logical state/permission projection.
-- Normalized subagent events persist inside `subagent_task.run`, keyed by root ACP
-  session plus run id. Bind the initiating turn once; child output never changes root
-  turn identity, plan, tools, or accounting. Ignore unregistered/terminal output,
-  reject lineage cycles, and retain incomplete observation across snapshots. Declare
-  nested transcript streaming fields in `schema.ts`; legacy rows stay unchanged.
-- Root and normalized child ACP tools share `buildToolCallMessageForHistory` and
-  `mergeToolCallMessage` in `acp/history-apply.ts`: omit read bodies/edit diff text,
-  strip images/unused resource bytes, and bound terminal commands/output identically.
-  Derive paths before filtering; preserve omitted vs explicitly cleared lists and
-  monotonic status. Keep only displayed switch-mode plans and scheduling raw fields,
-  not generic raw or provider metadata copies. Permission enrichment preserves stored
-  content; malformed new retained values reach writer validation. CLI edit evidence
-  consumes enriched notifications with the original owning turn, not stored diff bodies.
+- Before changing normalized subagent storage or ACP tool history, read the
+  [ACP history rules](../acp/AGENTS.md).
 
 - Submissions append on the live doc as local commits; transports upload only
   local events. Never author on a fork and import the export: it misses upload,

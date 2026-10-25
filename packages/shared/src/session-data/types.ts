@@ -172,7 +172,7 @@ export interface SessionModelSummaryReader {
 export interface SessionHistoryReader {
   /** Raw slot count, including slots no domain turn owns. */
   count(): number | Promise<number>;
-  /** Authoritative read of one raw slot. */
+  /** Authoritative read of one slot in causal display order. */
   readAt(position: number): SessionTurnRead | Promise<SessionTurnRead>;
   /** Authoritative read of one business turn id. */
   readTurn(turnId: string): SessionTurnRead | Promise<SessionTurnRead>;
@@ -186,12 +186,12 @@ export interface SessionHistoryReader {
     sessionId: string,
     runId: string
   ): SessionSubagentRun | undefined | Promise<SessionSubagentRun | undefined>;
-  /** Authoritative read of raw slots `[from, to)`. */
+  /** Authoritative read of slots `[from, to)` in causal display order. */
   readRange(
     from: number,
     to: number
   ): readonly SessionTurnRead[] | Promise<readonly SessionTurnRead[]>;
-  /** Shallow identity/state for raw slots `[from, to)`; never a turn body. */
+  /** Shallow identity/state for causal slots `[from, to)`; never a turn body. */
   readDirectory(
     from: number,
     to: number

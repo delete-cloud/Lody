@@ -116,7 +116,8 @@ type SessionDispatchWatcherDeps = {
   recordChatFailure?: (
     sessionDoc: SessionDocumentHandle,
     reason: ChatFailedReason,
-    message?: string
+    message?: string,
+    userTurnId?: string
   ) => Promise<void>;
   // Startup bootstrap runs after the workspace is already considered started.
   // This hook lets callers keep post-bootstrap cleanup/recovery out of the
@@ -1933,7 +1934,7 @@ export class SessionDispatchWatcher {
     // Surface the denial to the user. Without this the turn renders as
     // "Delivered" in the web UI (isSessionHistoryDelivered treats any non-pending
     // status as delivered), so a genuine denial would look like a successful send.
-    await this.deps.recordChatFailure?.(sessionDoc, 'machine_access_denied', message);
+    await this.deps.recordChatFailure?.(sessionDoc, 'machine_access_denied', message, userTurnId);
   }
 
   /**
@@ -2996,7 +2997,8 @@ export class SessionDispatchWatcher {
         await this.deps.recordChatFailure(
           sessionDoc,
           'message_delivery_failed',
-          'The user message could not be delivered because its history payload did not sync to this machine. Please resend it after sync recovers.'
+          'The user message could not be delivered because its history payload did not sync to this machine. Please resend it after sync recovers.',
+          pendingUserMsgId
         );
       } catch (error) {
         this.deps.logger.debug(

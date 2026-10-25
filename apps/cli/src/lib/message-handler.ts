@@ -638,7 +638,7 @@ type ConversationTurnGateContext = {
 };
 
 type SessionImageUploadAttachTarget =
-  | { kind: 'active_turn'; turnId: string }
+  | { kind: 'active_turn'; turnId: string; userTurnId?: string }
   | { kind: 'new_entry' }
   | { kind: 'unavailable'; statusType: string };
 type SessionImageUploadOptions = {
@@ -1263,7 +1263,13 @@ export class MessageHandler {
     }
 
     const attachTarget = capturedTurnId
-      ? ({ kind: 'active_turn', turnId: capturedTurnId } satisfies SessionImageUploadAttachTarget)
+      ? ({
+          kind: 'active_turn',
+          turnId: capturedTurnId,
+          userTurnId: capturedTurnId.startsWith('assistant:')
+            ? capturedTurnId.slice('assistant:'.length)
+            : undefined,
+        } satisfies SessionImageUploadAttachTarget)
       : undefined;
 
     const callId = event.callId;
@@ -1387,6 +1393,7 @@ export class MessageHandler {
           sessionId: args.sessionId,
           sessionDoc,
           content,
+          userTurnId: initialTarget.userTurnId,
         });
       }
     } else if (initialTarget.kind === 'new_entry') {
@@ -1598,8 +1605,12 @@ export class MessageHandler {
     sessionDoc: SessionDocument,
     reason: ChatFailedReason,
     message?: string,
-    code?: ChatFailedCode
+    code?: ChatFailedCode,
+    association?: { userTurnId?: string }
   ): Promise<void> {
+    const userTurnId = association
+      ? association.userTurnId
+      : this.getHistoryUserTurnId(sessionDoc.sessionId);
     // Failure notices append to the history list; order them after the user
     // turn entry for RPC fast-path turns (no-op when no gate is pending).
     await this.awaitTurnHistoryGate(sessionDoc.sessionId);
@@ -1617,6 +1628,7 @@ export class MessageHandler {
     const systemNotice: SessionHistoryInput = {
       id: `system-notice-${Date.now()}`,
       role: 'system',
+      userTurnId,
       timestamp: new Date().toISOString(),
       read: undefined,
       userId: undefined,
@@ -1640,6 +1652,7 @@ export class MessageHandler {
       signal?: AbortSignal;
     }
   ): Promise<void> {
+    const userTurnId = context.basedOnUserTurnId ?? this.getHistoryUserTurnId(session.sessionId);
     const { runtimeConfigPatch, warningSelections } = await applyAcpSessionRunConfig({
       session,
       config,
@@ -1665,12 +1678,16 @@ export class MessageHandler {
     if (warningSelections.length > 0) {
       // Not awaited: this is reporting, and the prompt hot path must not block
       // on a history write.
-      void this.recordAgentWarning(session.sessionId, {
-        message: `The agent rejected part of the requested run configuration (${warningSelections.join(
-          ', '
-        )}) and is using its own values instead. Reasoning effort and fast mode depend on the selected model.`,
-        source: 'configWarning',
-      });
+      void this.recordAgentWarning(
+        session.sessionId,
+        {
+          message: `The agent rejected part of the requested run configuration (${warningSelections.join(
+            ', '
+          )}) and is using its own values instead. Reasoning effort and fast mode depend on the selected model.`,
+          source: 'configWarning',
+        },
+        { userTurnId }
+      );
     }
   }
 
@@ -1725,7 +1742,10 @@ export class MessageHandler {
     sessionId: SessionId;
     sessionDoc: SessionDocument;
     content?: SessionImageGroupContent;
+    userTurnId?: string;
   }): Promise<string> {
+    const userTurnId =
+      'userTurnId' in args ? args.userTurnId : this.getHistoryUserTurnId(args.sessionId);
     // Pushes a new history entry — subject to the same fast-path ordering gate.
     await this.awaitTurnHistoryGate(args.sessionId);
     const entryId = `assistant-image-${uuidV4()}`;
@@ -1734,6 +1754,7 @@ export class MessageHandler {
     await backend.appendHistoryTurn({
       id: entryId,
       role: 'assistant',
+      userTurnId,
       items: args.content
         ? ([args.content] as unknown as SessionHistoryInput['items'])
         : ([] as unknown as SessionHistoryInput['items']),
@@ -1787,7 +1808,7 @@ export class MessageHandler {
   ): Promise<SessionImageUploadAttachTarget> {
     const turnId = this.store.getTurnId(sessionId);
     if (turnId) {
-      return { kind: 'active_turn', turnId };
+      return { kind: 'active_turn', turnId, userTurnId: this.getHistoryUserTurnId(sessionId) };
     }
 
     const statusType = (await sessionDoc.getMetaState())?.status?.type;
@@ -3023,8 +3044,8 @@ export class MessageHandler {
           }
         },
       },
-      recordChatFailure: async (sessionDoc, reason, message, code) =>
-        await this.recordChatFailure(sessionDoc, reason, message, code),
+      recordChatFailure: async (sessionDoc, reason, message, code, association) =>
+        await this.recordChatFailure(sessionDoc, reason, message, code, association),
       maybeGenerateAndStoreSessionTitle: async (
         sessionId,
         cliType,
@@ -3562,8 +3583,8 @@ export class MessageHandler {
             verifiedAt: verdict === 'allowed' ? new Date(getServerNow()).toISOString() : null,
           })
         ),
-      recordChatFailure: async (sessionDoc, reason, message) =>
-        await this.recordChatFailure(sessionDoc, reason, message),
+      recordChatFailure: async (sessionDoc, reason, message, userTurnId) =>
+        await this.recordChatFailure(sessionDoc, reason, message, undefined, { userTurnId }),
       onStartupBootstrapComplete: () => {
         void this.resetMachineDisconnectedSessionsToIdle().catch((error: unknown) => {
           this.logger.debug(
@@ -3794,8 +3815,9 @@ export class MessageHandler {
     });
 
     this.sessionManager.on('onAgentWarning', (sessionId, warning) => {
+      const userTurnId = this.getHistoryUserTurnId(sessionId);
       this.enqueueSessionNoticeHistoryPersist(sessionId, () =>
-        this.recordAgentWarning(sessionId, warning)
+        this.recordAgentWarning(sessionId, warning, { userTurnId })
       );
     });
 
@@ -5865,9 +5887,6 @@ export class MessageHandler {
    * insertions concurrent — the Loro merge tiebreak can then permanently order
    * the agent reply before the user message. CRDT/queue-sourced turns have the
    * entry locally by construction and need no gate.
-   *
-   * The gate itself creates the turn's assistant entry when it opens, so every
-   * gated writer resumes against an existing, correctly-ordered entry.
    */
   private setTurnHistoryGate(
     sessionId: SessionId,
@@ -5898,6 +5917,11 @@ export class MessageHandler {
         );
       },
     });
+  }
+
+  private getHistoryUserTurnId(sessionId: SessionId): string | undefined {
+    const turn = this.store.get(sessionId).turn;
+    return turn.phase === 'idle' ? undefined : turn.userTurnId;
   }
 
   /** Wait until turn-scoped history writes may proceed (no-op without a gate). */
@@ -7704,6 +7728,7 @@ export class MessageHandler {
             sessionId,
             sessionDoc,
             content,
+            userTurnId: initialAttachTarget.userTurnId,
           });
           attachedTo = 'new_entry';
         } else {
@@ -7824,6 +7849,7 @@ export class MessageHandler {
     sessionId: SessionId;
     sessionDoc: SessionDocument;
     files?: UploadedSessionFile[];
+    userTurnId?: string;
   }): Promise<string> {
     const entryId = `assistant-file-${uuidV4()}`;
     const modelInfo = this.sessionManager.getSession(args.sessionId)?.agentClient?.currentModel;
@@ -7834,6 +7860,7 @@ export class MessageHandler {
     await backend.appendHistoryTurn({
       id: entryId,
       role: 'assistant',
+      userTurnId: args.userTurnId,
       items: items as SessionHistoryInput['items'],
       timestamp: new Date().toISOString(),
       userId: undefined,
@@ -7975,6 +8002,7 @@ export class MessageHandler {
     let historyEntryId: string;
     let attachedTo: SessionFileUploadResponse['attachedTo'];
     if (attachTarget.kind === 'active_turn') {
+      await this.awaitTurnHistoryGate(sessionId);
       const appended = await this.appendAssistantFileBlocksToActiveTurn({
         sessionDoc,
         turnId: attachTarget.turnId,
@@ -7988,6 +8016,7 @@ export class MessageHandler {
           sessionId,
           sessionDoc,
           files: uploadedFiles,
+          userTurnId: attachTarget.userTurnId,
         });
         attachedTo = 'new_entry';
       }
@@ -9396,8 +9425,10 @@ export class MessageHandler {
    */
   private async recordAgentWarning(
     sessionId: SessionId,
-    warning: AgentSessionWarning
+    warning: AgentSessionWarning,
+    association?: { userTurnId?: string }
   ): Promise<void> {
+    const userTurnId = association ? association.userTurnId : this.getHistoryUserTurnId(sessionId);
     try {
       const sessionDoc = await this.workspaceDocument.getOrCreateSessionDoc(sessionId);
       // Order the notice after the user turn that triggered it (RPC fast-path turns).
@@ -9415,6 +9446,7 @@ export class MessageHandler {
       const systemNotice: SessionHistoryInput = {
         id: `agent-warning-${uuidV4()}`,
         role: 'system',
+        userTurnId,
         timestamp: new Date(getServerNow()).toISOString(),
         read: undefined,
         userId: undefined,

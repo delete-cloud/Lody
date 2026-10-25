@@ -1,6 +1,6 @@
 import { writeStoredField } from './conversation-view-fixtures';
 import { describe, expect, it, vi } from 'vitest';
-import { LoroDoc, type LoroMap } from 'loro-crdt';
+import { LoroDoc, LoroList, type LoroMap } from 'loro-crdt';
 import type { SessionHistory } from '@lody/shared';
 import { createHistoryWriter } from '@lody/shared';
 import {
@@ -1628,3 +1628,139 @@ it('keeps child bodies out of display hydration while full reads and opened run 
     data.dispose();
   }
 });
+
+it('projects historical inversions through the shipped windowed reader and keeps streaming observable', async () => {
+  const doc = new LoroDoc();
+  const data = createLoroSessionData({ doc, sessionId: FIXTURE_SESSION_ID });
+  data.writer.append({
+    id: 'assistant:user',
+    role: 'assistant',
+    userTurnId: 'user',
+    timestamp: '2026-10-16T00:00:00.000Z',
+    items: [],
+  });
+  for (const role of ['system', 'assistant'] as const) {
+    data.writer.append({
+      id: `${role}-associated`,
+      role,
+      userTurnId: 'user',
+      timestamp: '2026-10-16T00:00:00.000Z',
+      items: [{ type: 'text', text: role }],
+    });
+  }
+  data.writer.append({
+    id: 'user',
+    role: 'user',
+    timestamp: '2026-10-16T00:00:00.000Z',
+    items: [{ type: 'text', text: 'question' }],
+  });
+  const idle = createManualIdle();
+  const view = createConversationViewFromReader(data.history, {
+    sessionId: FIXTURE_SESSION_ID,
+    tailKeep: 4,
+    scheduleIdle: idle.scheduleIdle,
+    yieldToEventLoop: () => Promise.resolve(),
+  });
+  try {
+    await flushReaderChanges();
+    idle.runAll();
+    await view.ready;
+    const lease = view.acquireRange(0, 4);
+    try {
+      await lease.ready;
+      expect(view.indexOf('user')).toBe(0);
+      expect(view.indexOf('assistant:user')).toBe(1);
+      expect(view.indexOf('system-associated')).toBe(2);
+      expect(view.indexOf('assistant-associated')).toBe(3);
+      expect(view.turn(0)?.items).toEqual([{ type: 'text', text: 'question' }]);
+      data.writer.updateEntry('assistant:user', (entry) => ({
+        ...entry,
+        items: [{ type: 'text', text: 'reply' }],
+      }));
+      await flushReaderChanges();
+      expect(view.turn(1)?.items).toEqual([{ type: 'text', text: 'reply' }]);
+      expect(data.writer.readStored().map((entry) => entry.id)).toEqual([
+        'assistant:user',
+        'system-associated',
+        'assistant-associated',
+        'user',
+      ]);
+      data.writer.append({
+        id: 'next',
+        role: 'user',
+        timestamp: '2026-10-16T00:00:01.000Z',
+        items: [],
+      });
+      await flushReaderChanges();
+      expect(view.indexOf('user')).toBe(0);
+      expect(view.indexOf('assistant:user')).toBe(1);
+      expect(view.indexOf('next')).toBe(4);
+    } finally {
+      lease.release();
+    }
+  } finally {
+    view.dispose();
+    data.dispose();
+    doc.free();
+  }
+});
+
+it.each([128, 1000])(
+  'keeps two conversation readers incremental after an inverted %i-row prefix',
+  async (prefixRows) => {
+    const doc = new LoroDoc();
+    const data = createLoroSessionData({ doc, sessionId: FIXTURE_SESSION_ID });
+    const row = (id: string, role: 'user' | 'assistant' = 'user') => ({
+      id, role, timestamp: 'synthetic', items: [], fileDiff: [],
+    });
+    data.writer.append({ ...row('assistant:owner', 'assistant'), userTurnId: 'owner' });
+    data.writer.append(row('owner'));
+    for (let index = 2; index < prefixRows; index++) data.writer.append(row(`prefix-${index}`));
+    const requests: { consumer: number; from: number; to: number }[] = [];
+    const idles = [createManualIdle(), createManualIdle()];
+    const views = idles.map((idle, consumer) => createConversationViewFromReader({
+      ...data.history,
+      readDirectory(from, to) {
+        requests.push({ consumer, from, to });
+        return data.history.readDirectory(from, to);
+      },
+    }, {
+      sessionId: FIXTURE_SESSION_ID, tailKeep: 1,
+      scheduleIdle: idle.scheduleIdle, yieldToEventLoop: () => Promise.resolve(),
+    }));
+    const originalGet = LoroList.prototype.get;
+    const historyId = doc.getList('history').id;
+    let rootReads = 0;
+    try {
+      await flushReaderChanges();
+      for (const idle of idles) idle.runAll();
+      await Promise.all(views.map((view) => view.ready));
+      expect(views.map((view) => view.indexOf('owner'))).toEqual([0, 0]);
+      LoroList.prototype.get = function (index) {
+        if (this.id === historyId) rootReads++;
+        return originalGet.call(this, index);
+      };
+      for (let append = 0; append < 3; append++) {
+        const previousLength = prefixRows + append;
+        requests.length = 0;
+        rootReads = 0;
+        const id = `appended-${append}`;
+        data.writer.append(row(id));
+        await flushReaderChanges();
+        for (const idle of idles) idle.runAll();
+        await flushReaderChanges();
+        expect(views.map((view) => view.turnCount)).toEqual([previousLength + 1, previousLength + 1]);
+        expect(views.map((view) => view.indexOf(id))).toEqual([previousLength, previousLength]);
+        expect([...new Set(requests.map((request) => request.consumer))].sort()).toEqual([0, 1]);
+        expect(requests.every((request) => request.from === previousLength && request.to === previousLength + 1)).toBe(true);
+        expect(rootReads).toBeLessThan(32);
+      }
+      expect(data.writer.readStored().slice(0, 2).map((turn) => turn.id)).toEqual(['assistant:owner', 'owner']);
+    } finally {
+      LoroList.prototype.get = originalGet;
+      for (const view of views) view.dispose();
+      data.dispose();
+      doc.free();
+    }
+  }
+);

@@ -11,9 +11,9 @@ Exact deletion bypasses discovery: [relations](../../specs/session-relations.md)
 - Session history storage tolerates unknown string item types from newer peers without
   rewriting them or blocking unrelated writes. Keep known-type guards and external-input
   parsing; `tests/session-doc-forward-compat.test.ts` covers this separately from unknown root keys.
-- `createSessionMirror` is the renderer/CLI session entrypoint. Its `HistoryWriter`
-  owns local history writes, including legacy callback updates; no raw history writes
-  or second Mirror writer. Read-path feature flags must never change this owner.
+- Local Loro history has one `HistoryWriter`, composed by SessionData; no raw writes
+  or second writer. Read flags never change ownership.
+  [Read ordering rules](src/session-data/AGENTS.md).
 - Validate new turns and changed known fields/items before applying a command, never
   unchanged history. Invalid commands preserve the old values and throw content-free
   diagnostics; they must not leave partial history writes. Keep stored unknown fields

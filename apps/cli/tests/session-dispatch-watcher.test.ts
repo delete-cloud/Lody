@@ -1440,7 +1440,8 @@ describe('SessionDispatchWatcher', () => {
     expect(recordChatFailure).toHaveBeenCalledWith(
       sessionDoc,
       'machine_access_denied',
-      expect.any(String)
+      expect.any(String),
+      'turn-denied'
     );
   });
 
@@ -1827,7 +1828,8 @@ describe('SessionDispatchWatcher', () => {
       expect(recordChatFailure).toHaveBeenCalledWith(
         expect.anything(),
         'machine_access_denied',
-        expect.any(String)
+        expect.any(String),
+        'turn-x'
       )
     );
 
@@ -4162,7 +4164,8 @@ describe('SessionDispatchWatcher', () => {
       expect(recordChatFailure).toHaveBeenCalledWith(
         sessionDoc,
         'message_delivery_failed',
-        expect.any(String)
+        expect.any(String),
+        'turn-missing'
       );
       expect(cleanSessionDoc).toHaveBeenCalledWith(sessionId, { preserveStatus: true });
       expect(unsubscribeMirror).toHaveBeenCalledTimes(1);

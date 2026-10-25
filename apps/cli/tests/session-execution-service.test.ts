@@ -2833,7 +2833,9 @@ describe('SessionExecutionService', () => {
     expect(deps.recordChatFailure).toHaveBeenCalledWith(
       sessionDoc,
       'agent_no_output',
-      expect.stringContaining('without producing any output')
+      expect.stringContaining('without producing any output'),
+      undefined,
+      { userTurnId: 'turn-user-1' }
     );
     expect(getHistory()[0]?.status).toBe('failed');
     // Claiming the session finished would contradict the failure shown in chat.
@@ -2976,7 +2978,9 @@ describe('SessionExecutionService', () => {
     expect(deps.recordChatFailure).toHaveBeenCalledWith(
       sessionDoc,
       'memory_pressure',
-      expect.stringContaining('The turn was not started')
+      expect.stringContaining('The turn was not started'),
+      undefined,
+      { userTurnId: 'turn-user-1' }
     );
     expect(history[0]?.status).toBe('failed');
     expect(agentClient.prompt).not.toHaveBeenCalled();
@@ -3555,7 +3559,9 @@ describe('SessionExecutionService', () => {
     expect(deps.recordChatFailure).toHaveBeenCalledWith(
       sessionDoc,
       'acp_auth_required',
-      'OAuth session expired'
+      'OAuth session expired',
+      undefined,
+      { userTurnId: 'turn-user-1' }
     );
     // Forcing the kill here skips `session/close`, and adapters that flush their
     // transcript on close would lose the artifact `loadSession` needs — so the
@@ -4070,7 +4076,9 @@ describe('SessionExecutionService', () => {
     expect(deps.recordChatFailure).toHaveBeenCalledWith(
       sessionDoc,
       'memory_pressure',
-      expect.stringContaining('The turn was not started')
+      expect.stringContaining('The turn was not started'),
+      undefined,
+      { userTurnId: 'turn-user-1' }
     );
     expect(createSession).not.toHaveBeenCalled();
     expect(agentClient.prompt).not.toHaveBeenCalled();
@@ -5644,7 +5652,9 @@ describe('SessionExecutionService', () => {
     expect(deps.recordChatFailure).toHaveBeenCalledWith(
       sessionDoc,
       'turn_pre_prompt_failed',
-      expect.stringContaining('Cannot switch branches with local changes')
+      expect.stringContaining('Cannot switch branches with local changes'),
+      undefined,
+      { userTurnId: 'turn-local-dirty' }
     );
   });
 
@@ -5801,7 +5811,8 @@ describe('SessionExecutionService', () => {
       sessionDoc,
       'turn_pre_prompt_failed',
       '[github---owner---repo] Failed to clone bare repository',
-      'git_executable_not_found'
+      'git_executable_not_found',
+      { userTurnId: 'turn-github-git-missing' }
     );
     expect(deps.buildAcpPromptBlocks).not.toHaveBeenCalled();
   });
@@ -5873,7 +5884,9 @@ describe('SessionExecutionService', () => {
     expect(deps.recordChatFailure).toHaveBeenCalledWith(
       sessionDoc,
       'turn_pre_prompt_failed',
-      expect.stringContaining('Local project branch not found: feature/deleted')
+      expect.stringContaining('Local project branch not found: feature/deleted'),
+      undefined,
+      { userTurnId: 'turn-local-missing-worktree-branch' }
     );
   });
 
@@ -6130,7 +6143,9 @@ describe('SessionExecutionService', () => {
     expect(deps.recordChatFailure).toHaveBeenCalledWith(
       sessionDoc,
       'turn_pre_prompt_failed',
-      'docker failed'
+      'docker failed',
+      undefined,
+      { userTurnId: 'turn-create-fail' }
     );
     expect(sessionDoc.setStatus).toHaveBeenCalledWith(
       SessionStatusFactory.initializing(),
@@ -6188,7 +6203,9 @@ describe('SessionExecutionService', () => {
     expect(deps.recordChatFailure).toHaveBeenCalledWith(
       sessionDoc,
       'acp_auth_required',
-      'Authentication required'
+      'Authentication required',
+      undefined,
+      { userTurnId: 'turn-create-auth' }
     );
   });
 
@@ -6285,12 +6302,19 @@ describe('SessionExecutionService', () => {
       // `recordChatFailure` writes, so the assertions read visible history
       // instead of counting mock calls.
       recordChatFailure: vi.fn(
-        async (_sessionDoc: unknown, reason: string, message?: string, code?: string) => {
+        async (
+          _sessionDoc: unknown,
+          reason: string,
+          message?: string,
+          code?: string,
+          association?: { userTurnId?: string }
+        ) => {
           await sessionDoc.updateHistory?.((entries: SessionHistoryInput[]) => [
             ...entries,
             {
               id: `system-notice-${entries.length}`,
               role: 'system',
+              userTurnId: association?.userTurnId,
               timestamp: '2026-09-10T00:00:00.000Z',
               fileDiff: [],
               items: [
@@ -6331,6 +6355,9 @@ describe('SessionExecutionService', () => {
       .flatMap((entry) => entry.items ?? [])
       .filter((item) => item.type === 'system_notice' && item.name === 'chat_failed');
     expect(notices).toHaveLength(1);
+    expect(history.find((entry) => entry.role === 'system')?.userTurnId).toBe(
+      'turn-pre-prompt-fail'
+    );
     expect(notices[0]?.meta).toMatchObject({
       reason: testCase.expectedReason,
       message: testCase.expectedMessage,
@@ -6400,12 +6427,19 @@ describe('SessionExecutionService', () => {
     const deps = createBaseDeps({
       sessionManager,
       recordChatFailure: vi.fn(
-        async (_sessionDoc: unknown, reason: string, message?: string, code?: string) => {
+        async (
+          _sessionDoc: unknown,
+          reason: string,
+          message?: string,
+          code?: string,
+          association?: { userTurnId?: string }
+        ) => {
           await sessionDoc.updateHistory?.((entries: SessionHistoryInput[]) => [
             ...entries,
             {
               id: `system-notice-${entries.length}`,
               role: 'system',
+              userTurnId: association?.userTurnId,
               timestamp: '2026-09-10T00:00:00.000Z',
               fileDiff: [],
               items: [
@@ -6447,6 +6481,7 @@ describe('SessionExecutionService', () => {
       .flatMap((entry) => entry.items ?? [])
       .filter((item) => item.type === 'system_notice' && item.name === 'chat_failed');
     expect(notices).toHaveLength(1);
+    expect(history.find((entry) => entry.role === 'system')?.userTurnId).toBe('turn-mid-turn-acp');
     expect(notices[0]?.meta).toMatchObject({
       reason: 'acp_internal_error',
       message: 'model exploded mid-turn',
@@ -6491,12 +6526,19 @@ describe('SessionExecutionService', () => {
       sessionManager,
       beginConversationTurn: vi.fn(() => 'assistant-create-cancel'),
       recordChatFailure: vi.fn(
-        async (_sessionDoc: unknown, reason: string, message?: string, code?: string) => {
+        async (
+          _sessionDoc: unknown,
+          reason: string,
+          message?: string,
+          code?: string,
+          association?: { userTurnId?: string }
+        ) => {
           await sessionDoc.updateHistory?.((entries: SessionHistoryInput[]) => [
             ...entries,
             {
               id: `system-notice-${entries.length}`,
               role: 'system',
+              userTurnId: association?.userTurnId,
               timestamp: '2026-09-10T00:00:00.000Z',
               fileDiff: [],
               items: [
@@ -6965,7 +7007,9 @@ describe('SessionExecutionService', () => {
     expect(deps.recordChatFailure).toHaveBeenCalledWith(
       sessionDoc,
       expectedReason,
-      expectedMessage
+      expectedMessage,
+      undefined,
+      { userTurnId: 'turn-restore-fail' }
     );
     expect(sessionManager.createSession).toHaveBeenCalledTimes(expectedCreateSessionCalls);
     expect(upsertDocMeta).toHaveBeenCalledWith('session-session-restore-fail', {
@@ -7060,7 +7104,9 @@ describe('SessionExecutionService', () => {
       expect(deps.recordChatFailure).toHaveBeenCalledWith(
         sessionDoc,
         expectedReason,
-        expectedMessage
+        expectedMessage,
+        undefined,
+        { userTurnId: 'turn-pending-init-fail' }
       );
       expect(upsertDocMeta).toHaveBeenCalledWith('session-session-pending-init-fail', {
         lastHandledUserMsgId: 'turn-pending-init-fail',
@@ -7261,7 +7307,12 @@ describe('SessionExecutionService', () => {
     });
 
     if (testCase.expectedFailure) {
-      expect(deps.recordChatFailure).toHaveBeenCalledWith(sessionDoc, ...testCase.expectedFailure);
+      expect(deps.recordChatFailure).toHaveBeenCalledWith(
+        sessionDoc,
+        ...testCase.expectedFailure,
+        undefined,
+        { userTurnId: 'turn-acp-data' }
+      );
     } else {
       expect(deps.recordChatFailure).not.toHaveBeenCalled();
     }
@@ -7366,7 +7417,9 @@ describe('SessionExecutionService', () => {
     expect(deps.recordChatFailure).toHaveBeenCalledWith(
       sessionDoc,
       'turn_pre_prompt_failed',
-      'prompt build failed'
+      'prompt build failed',
+      undefined,
+      { userTurnId: 'turn-pre-prompt-fail' }
     );
     expect(upsertDocMeta).toHaveBeenCalledWith('session-session-pre-prompt-fail', {
       lastHandledUserMsgId: 'turn-pre-prompt-fail',
@@ -10708,7 +10761,9 @@ describe('SessionExecutionService initialization deadline', () => {
       expect(harness.deps.recordChatFailure).toHaveBeenCalledWith(
         harness.sessionDoc,
         'session_init_failed',
-        expect.stringContaining('stopped making progress')
+        expect.stringContaining('stopped making progress'),
+        undefined,
+        { userTurnId: 'turn-user-1' }
       );
       expect(harness.getHistory()[0]?.status).toBe('failed');
       expect(harness.sessionDoc.setStatus.mock.calls.at(-1)?.[0]).toEqual(
@@ -10838,7 +10893,9 @@ describe('SessionExecutionService initialization deadline', () => {
       expect(harness.deps.recordChatFailure).toHaveBeenCalledWith(
         harness.sessionDoc,
         'session_init_failed',
-        expect.stringContaining('Downloading Kimi runtime 10%')
+        expect.stringContaining('Downloading Kimi runtime 10%'),
+        undefined,
+        { userTurnId: 'turn-user-1' }
       );
       expect(harness.getHistory()[0]?.status).toBe('failed');
       expect(harness.presenceEvents.at(-1)).toEqual({
