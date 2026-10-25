@@ -5,6 +5,10 @@ import {
   existsSync,
   readdirSync,
   readFileSync,
+  openSync,
+  readSync,
+  closeSync,
+  realpathSync,
   statSync,
   symlinkSync,
   linkSync,
@@ -14,7 +18,6 @@ import {
 import { execFileSync } from 'node:child_process';
 import { writeIfChanged } from './shell-file-utils';
 import { githubCredentialRuntime } from './github-credential-runtime';
-import { formatErrorMessage } from '@/utils/format-error';
 
 const TRANSPORT_MARKER_NAME = 'lody-git-transport.json';
 const EXEC_PATH_PROBE_ATTEMPTS = 4;
@@ -27,8 +30,7 @@ export interface GitTransportLogger {
 
 export interface GitHubGitTransportOptions {
   readonly logger?: GitTransportLogger;
-  /** Test seam: replaces one exec-path probe attempt's spawn. */
-  readonly probeExecPathOnce?: (realGit: string) => string;
+  readonly probeExecPathOnce?: (realGit: string, env: NodeJS.ProcessEnv) => string;
 }
 
 interface TransportMarker {
@@ -62,17 +64,102 @@ const sleepSync = (ms: number): void => {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 };
 
-const probeExecPathOnce = (realGit: string): string =>
+const resolveExecutablePath = (executable: string): string | null => {
+  const candidates =
+    path.isAbsolute(executable) || executable.includes(path.sep)
+      ? [executable]
+      : (process.env.PATH ?? '')
+          .split(path.delimiter)
+          .map((directory) => path.join(directory, executable));
+  const resolved = candidates.find(isExecutableFile);
+  return resolved === undefined ? null : path.resolve(resolved);
+};
+
+const isGeneratedTransportWrapper = (filePath: string): boolean => {
+  try {
+    const fd = openSync(filePath, 'r');
+    const buffer = Buffer.alloc(8192);
+    let source: string;
+    try {
+      source = buffer.subarray(0, readSync(fd, buffer, 0, buffer.length, 0)).toString('utf8');
+    } finally {
+      closeSync(fd);
+    }
+    return (
+      (source.includes('const REAL_GIT = ') && source.includes('LODY_GIT_NATIVE')) ||
+      (source.includes("const { spawn } = require('child_process');") &&
+        source.includes('GIT_EXEC_PATH: __dirname') &&
+        source.includes('LODY_GIT_NATIVE'))
+    );
+  } catch {
+    return false;
+  }
+};
+
+const isTransportLayoutPath = (candidate: string, outputDirectory: string): boolean => {
+  const candidates = new Set([path.resolve(candidate)]);
+  const outputs = new Set([path.resolve(outputDirectory)]);
+  if (existsSync(outputDirectory)) outputs.add(realpathSync(outputDirectory));
+  try {
+    candidates.add(realpathSync(candidate));
+  } catch {
+    return false;
+  }
+  for (const resolved of candidates) {
+    for (const output of outputs) {
+      const relative = path.relative(output, resolved);
+      if (
+        relative === '' ||
+        (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`))
+      )
+        return true;
+    }
+    if (isGeneratedTransportWrapper(resolved)) return true;
+    let directory = resolved;
+    try {
+      if (!statSync(resolved).isDirectory()) directory = path.dirname(resolved);
+    } catch {
+      directory = path.dirname(resolved);
+    }
+    while (true) {
+      if (
+        existsSync(path.join(directory, TRANSPORT_MARKER_NAME)) ||
+        isGeneratedTransportWrapper(path.join(directory, 'git'))
+      )
+        return true;
+      const parent = path.dirname(directory);
+      if (parent === directory) break;
+      directory = parent;
+    }
+  }
+  return false;
+};
+
+const isSafeGitExecutable = (filePath: string, outputDirectory: string): boolean =>
+  isExecutableFile(filePath) && !isTransportLayoutPath(filePath, outputDirectory);
+
+const createProbeEnvironment = (): NodeJS.ProcessEnv => {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (/^GIT_EXEC_PATH$/i.test(key)) delete env[key];
+  return env;
+};
+
+const probeExecPathOnce = (realGit: string, env: NodeJS.ProcessEnv): string =>
   execFileSync(realGit, ['--exec-path'], {
     encoding: 'utf8',
+    env,
     timeout: EXEC_PATH_PROBE_TIMEOUT_MS,
   }).trim();
 
-const probeExecPath = (realGit: string, once: (realGit: string) => string): string => {
+const probeExecPath = (
+  realGit: string,
+  once: (realGit: string, env: NodeJS.ProcessEnv) => string,
+  env: NodeJS.ProcessEnv
+): string => {
   let lastError: unknown;
   for (let attempt = 1; attempt <= EXEC_PATH_PROBE_ATTEMPTS; attempt++) {
     try {
-      return once(realGit);
+      return once(realGit, env);
     } catch (error) {
       lastError = error;
       if (!isTransientSpawnError(error)) break;
@@ -82,14 +169,11 @@ const probeExecPath = (realGit: string, once: (realGit: string) => string): stri
   throw lastError;
 };
 
-/**
- * A usable marker names the layout a completed materialization recorded; the
- * recorded files must still exist. An exact realGit/statePath match lets the
- * transport skip the synchronous probe entirely — including every transient
- * spawn failure it could hit — while a mismatched marker remains an emergency
- * fallback when the probe itself fails.
- */
-const readTransportMarker = (markerPath: string): TransportMarker | null => {
+const readTransportMarker = (
+  markerPath: string,
+  expectedRealGit: string,
+  expectedStatePath: string
+): TransportMarker | null => {
   try {
     const parsed = JSON.parse(readFileSync(markerPath, 'utf8')) as Partial<TransportMarker>;
     if (parsed.version !== 1) return null;
@@ -102,7 +186,26 @@ const readTransportMarker = (markerPath: string): TransportMarker | null => {
     ) {
       return null;
     }
-    if (!existsSync(execPath) || !isExecutableFile(nativeGit)) return null;
+    if (
+      realGit !== expectedRealGit ||
+      statePath !== expectedStatePath ||
+      !path.isAbsolute(execPath) ||
+      !path.isAbsolute(nativeGit) ||
+      !statSync(execPath).isDirectory() ||
+      isTransportLayoutPath(execPath, path.dirname(markerPath))
+    )
+      return null;
+    const realGitPath = resolveExecutablePath(expectedRealGit);
+    const directory = path.dirname(markerPath);
+    if (
+      !realGitPath ||
+      !isSafeGitExecutable(realGitPath, directory) ||
+      !isSafeGitExecutable(nativeGit, directory)
+    )
+      return null;
+    const coreGit = path.join(execPath, process.platform === 'win32' ? 'git.exe' : 'git');
+    const expectedNativeGit = isSafeGitExecutable(coreGit, directory) ? coreGit : realGitPath;
+    if (realpathSync(nativeGit) !== realpathSync(expectedNativeGit)) return null;
     return { version: 1, realGit, statePath, execPath, nativeGit };
   } catch {
     return null;
@@ -117,29 +220,30 @@ export function ensureGitHubGitTransport(
   options: GitHubGitTransportOptions = {}
 ): void {
   const markerPath = path.join(directory, TRANSPORT_MARKER_NAME);
-  const marker = readTransportMarker(markerPath);
-  const current = marker?.realGit === realGit && marker.statePath === statePath ? marker : null;
+  const marker = readTransportMarker(markerPath, realGit, statePath);
   let execPath: string;
   let nativeGit: string;
-  if (current) {
-    ({ execPath, nativeGit } = current);
+  if (marker) {
+    ({ execPath, nativeGit } = marker);
   } else {
-    try {
-      execPath = probeExecPath(realGit, options.probeExecPathOnce ?? probeExecPathOnce);
-      const coreGit = path.join(execPath, process.platform === 'win32' ? 'git.exe' : 'git');
-      nativeGit = existsSync(coreGit) ? coreGit : realGit;
-    } catch (error) {
-      // Without a recorded layout there is nothing to regenerate the adapters
-      // from. A machine that cannot spawn here cannot spawn the agent either.
-      if (!marker) throw error;
-      // The layout recorded for a different realGit still names a working Git;
-      // regenerating from it is better than failing session startup on a
-      // transient spawn error (for example EAGAIN).
-      options.logger?.warn(
-        `Git exec-path probe failed; reusing the recorded transport layout: ${formatErrorMessage(error)}`
-      );
-      ({ execPath, nativeGit } = marker);
+    const realGitPath = resolveExecutablePath(realGit);
+    if (!realGitPath || !isSafeGitExecutable(realGitPath, directory)) {
+      throw new Error(`Git executable is not a safe native Git path: ${realGit}`);
     }
+    execPath = probeExecPath(
+      realGitPath,
+      options.probeExecPathOnce ?? probeExecPathOnce,
+      createProbeEnvironment()
+    );
+    if (
+      !path.isAbsolute(execPath) ||
+      !statSync(execPath).isDirectory() ||
+      isTransportLayoutPath(execPath, directory)
+    ) {
+      throw new Error(`Git returned an unsafe exec path: ${execPath}`);
+    }
+    const coreGit = path.join(execPath, process.platform === 'win32' ? 'git.exe' : 'git');
+    nativeGit = isSafeGitExecutable(coreGit, directory) ? coreGit : realGitPath;
   }
   writeIfChanged(path.join(directory, 'package.json'), '{"type":"commonjs"}\n');
   const source = String.raw`#!/usr/bin/env node

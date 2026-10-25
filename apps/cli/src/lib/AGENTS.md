@@ -11,10 +11,8 @@
 
 - Daemon commands borrow its replica; command cleanup failures never fence.
 
-- GitHub auth: conversation-owner personal → matching-owner machine → repo App,
-  once per source. Failures advance without a policy RPC; local context grants
-  machine eligibility. Never persist managed tokens or replay uncertain writes.
-  Checkout/LFS share the pinned helper context. Contract: [identity fallback](../../../../specs/github-identity-fallback.md).
+- Before changing GitHub authentication, checkout/LFS credentials or generated Git
+  transport, read the [Git transport rules](git-transport/AGENTS.md).
 
 - `cloud-cli-port.ts` is the sole official-build composition root for cloud clients and
   endpoint-derived adapters. Daemon runtime modules must not construct cloud SDK
