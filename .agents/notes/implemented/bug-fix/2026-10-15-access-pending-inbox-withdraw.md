@@ -71,3 +71,5 @@ resource journaling, fencing, or release, and the same ID begins again after a w
 
 A daemon crash while access is pending still leaves an active execution without a receipt, as
 before; existing restart recovery owns that case.
+
+Later classification correction: [persistent submission evidence](2026-10-23-ended-input-outcome.md) distinguishes unsubmitted and unknown ended inputs; the withdraw decision is unchanged.

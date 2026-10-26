@@ -22,6 +22,7 @@ type Repository = {
     reason?: 'user_stop'
   ): Effect.Effect<boolean, unknown>;
   adopt(previous: InboxInput, next: InboxInput, id: string): Effect.Effect<boolean, unknown>;
+  markSubmissionStarted(scope: InboxInput, executionId: string): Effect.Effect<void, unknown>;
   canSubmit(scope: InboxScope, executionId: string, owner: string): Effect.Effect<boolean, unknown>;
   accept(input: InboxInput): Effect.Effect<boolean, unknown>;
   begin(scope: InboxScope, executionId: string, owner?: string): Effect.Effect<boolean, unknown>;
@@ -98,7 +99,7 @@ export class OperationInbox extends Context.Service<
     prepare(input: InboxInput): Effect.Effect<InboxBatch | undefined, unknown>;
     submit<A>(
       batch: InboxBatch | undefined,
-      scope: InboxScope,
+      scope: InboxInput,
       executionId: string,
       start: () => A
     ): Effect.Effect<{ value: A }, unknown>;
@@ -188,7 +189,7 @@ export class OperationInbox extends Context.Service<
         });
         const submit = <A>(
           batch: InboxBatch | undefined,
-          s: InboxScope,
+          s: InboxInput,
           id: string,
           start: () => A
         ) =>
@@ -204,6 +205,7 @@ export class OperationInbox extends Context.Service<
                     (batch && (!execution.admit(batch) || !(yield* repo.fence(batch, id))))
                   )
                     return yield* Effect.fail(new InboxAdmissionRejected());
+                  if (s.kind !== 'automatic') yield* repo.markSubmissionStarted(s, id);
                   // Return a container: do not assimilate the raw Promise into gate ownership.
                   return yield* Effect.try({
                     try: () => ({ value: start() }),

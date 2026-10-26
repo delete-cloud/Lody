@@ -196,6 +196,13 @@ confirmed fresh send with a duplicate-work warning, never an automatic retry. RP
 ACKs update presentation only; the execution service alone projects processing and terminal
 steer status, so delayed ACKs cannot resurrect canceled or completed history.
 
+An ended ordinary Inbox input is never replayed. New inputs persist `submission_started=0`;
+submission admission records `1` before starting transport. On restart, an ended input whose
+history is still pending becomes `delivery_unknown` with `turn_outcome_unknown` if submission
+started or legacy evidence is absent. The user can explicitly resend with a duplicate-work
+warning. A proven unsubmitted input retains `turn_pre_prompt_failed`. Both retire the activation
+so later inputs can run; these states do not prove whether files or external work changed.
+
 Stop and target completion abort local steer waits before entering the serialized completion
 lane. A submitted request keeps its late verdict outside that lane and its rewrite lease.
 Raw prompt/steer requests and configuration work remain in the owner's five-second drain;

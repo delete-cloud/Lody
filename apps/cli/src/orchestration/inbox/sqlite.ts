@@ -79,8 +79,10 @@ export class InboxSqlite {
       (db.prepare('PRAGMA table_info(inbox_results)').all() as { name: string }[]).some(
         (c) => c.name === 'consumed_at'
       ) &&
-      (db.prepare('PRAGMA table_info(inbox_inputs)').all() as { name: string }[]).some(
-        (c) => c.name === 'cancellation_reason'
+      ['cancellation_reason', 'submission_started'].every((name) =>
+        (db.prepare('PRAGMA table_info(inbox_inputs)').all() as { name: string }[]).some(
+          (c) => c.name === name
+        )
       )
     )
       return;
@@ -148,6 +150,12 @@ export class InboxSqlite {
         )
       )
         db.exec('ALTER TABLE inbox_inputs ADD COLUMN cancellation_reason TEXT');
+      if (
+        !(db.prepare('PRAGMA table_info(inbox_inputs)').all() as { name: string }[]).some(
+          (c) => c.name === 'submission_started'
+        )
+      )
+        db.exec('ALTER TABLE inbox_inputs ADD COLUMN submission_started INTEGER');
       const modesSql = (
         db.prepare("SELECT sql FROM sqlite_master WHERE name='inbox_modes'").get() as {
           sql: string;
@@ -410,7 +418,7 @@ export class InboxSqlite {
       const revision = current.revision + 1;
       this.db
         .prepare(
-          'INSERT INTO inbox_inputs(workspace_id,session_id,user_id,input_id,kind,revision) VALUES(?,?,?,?,?,?)'
+          'INSERT INTO inbox_inputs(workspace_id,session_id,user_id,input_id,kind,revision,submission_started) VALUES(?,?,?,?,?,?,0)'
         )
         .run(input.workspaceId, input.sessionId, input.userId, input.inputId, input.kind, revision);
       this.db
@@ -507,6 +515,36 @@ export class InboxSqlite {
       .get(workspaceId, sessionId, inputId) as { canceled: number; finished: number } | undefined;
     return row?.canceled === 1 || row?.finished === 1;
   }
+  inputSubmissionStarted(
+    workspaceId: string,
+    sessionId: string,
+    inputId: string
+  ): boolean | undefined {
+    const row = this.db
+      .prepare(
+        'SELECT submission_started FROM inbox_inputs WHERE workspace_id=? AND session_id=? AND input_id=?'
+      )
+      .get(workspaceId, sessionId, inputId) as { submission_started: number | null } | undefined;
+    return row?.submission_started == null ? undefined : row.submission_started === 1;
+  }
+  markSubmissionStarted(scope: InboxInput, executionId: string): void {
+    const result = this.db
+      .prepare(
+        'UPDATE inbox_inputs SET submission_started=1 WHERE workspace_id=? AND session_id=? AND user_id=? AND input_id=? AND kind=? AND input_id=(SELECT active_input FROM inbox_sessions WHERE workspace_id=? AND session_id=? AND user_id=? AND active_execution=?)'
+      )
+      .run(
+        scope.workspaceId,
+        scope.sessionId,
+        scope.userId,
+        scope.inputId,
+        scope.kind,
+        scope.workspaceId,
+        scope.sessionId,
+        scope.userId,
+        executionId
+      );
+    if (result.changes !== 1) throw new Error('INBOX_SUBMISSION_INPUT_MISSING');
+  }
   inputCanceled(workspaceId: string, sessionId: string, inputId: string): boolean {
     const row = this.db
       .prepare(
@@ -523,6 +561,7 @@ export class InboxSqlite {
       !current.blocked &&
       current.active_execution === executionId &&
       !!current.active_input &&
+      (!('inputId' in scope) || current.active_input === scope.inputId) &&
       !this.inputCanceled(scope.workspaceId, scope.sessionId, current.active_input)
     );
   }

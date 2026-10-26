@@ -59,9 +59,8 @@ Root/CLI rules apply; `specs/session-orchestration.md` owns behavior.
 - Inbox-aware Stop pauses/cancels queued eligibility; legacy Stop only cancels execution.
   Pause blocks only automatic wakes; fresh human and Agent-chat input both clear it. New
   acceptance cannot revive a canceled execution or discard an already prepared human input.
-- Fixed batch claims and submission fence precede synchronous transport start under the
-  same gate, with no await between. Post-fence uncertainty never replays, including
-  human-plus-batch stale-ACP recovery. Retry failed settlement only, never the request.
+- Before changing Session submission or steer, read the
+  [Inbox admission rules](inbox/AGENTS.md); preserve fixed claims and no-replay.
 - Physical request/resource release differs from waiter exit and Scope close. Keep immutable
   execution IDs, shared close receipts, full Cause and retained recovery owners. Unknown
   release blocks successors. Independent recovery proves release before clearing the slot.

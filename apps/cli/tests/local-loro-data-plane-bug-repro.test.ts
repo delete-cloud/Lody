@@ -141,6 +141,7 @@ function joinLine(requestId: string, docId: string): string {
 }
 
 describe('local Loro data-plane socket server — F6 regression', () => {
+  let engine: LocalLoroDataPlaneServerLegacy;
   beforeAll(async () => {
     originalHome = process.env.HOME;
     originalPlatform = process.env.LODY_PLATFORM;
@@ -156,7 +157,7 @@ describe('local Loro data-plane socket server — F6 regression', () => {
     fs.mkdirSync(path.dirname(getLocalLoroDataPlaneSocketPath()), { recursive: true });
 
     const docs = new Map<string, LoroDoc>();
-    const engine = new LocalLoroDataPlaneServerLegacy({
+    engine = new LocalLoroDataPlaneServerLegacy({
       workspaceId: WORKSPACE_ID,
       resolveDoc: async (docId) => {
         const existing = docs.get(docId);
@@ -178,6 +179,8 @@ describe('local Loro data-plane socket server — F6 regression', () => {
 
   afterAll(async () => {
     await stopLocalLoroDataPlaneServer();
+    await engine?.disposeLegacy();
+    await closeProcessLocalLoroWriterLegacy();
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;
     if (originalPlatform === undefined) delete process.env.LODY_PLATFORM;
@@ -238,7 +241,10 @@ describe('local Loro data-plane socket server — F6 regression', () => {
 import { Writable } from 'node:stream';
 import { Effect, Layer } from 'effect';
 import { LocalLoroWriterTurn, makeLocalLoroWriterOwner } from '@lody/shared/local-loro-writer';
-import { makeLocalLoroWriterLegacy } from '@lody/shared/local-loro-writer/legacy';
+import {
+  closeProcessLocalLoroWriterLegacy,
+  makeLocalLoroWriterLegacy,
+} from '@lody/shared/local-loro-writer/legacy';
 import { makeNodeLocalLoroWriterConnection } from '@lody/shared/node/local-loro-writer';
 
 it('the Node write(false)/drain boundary pauses export across workspaces and preserves fair resume order', async () => {

@@ -111,11 +111,11 @@ Ownership: [README.md](README.md).
   pills, list on `--background`.
 - Update `message-content-guards.ts` with every shared `MessageContent` variant.
   `isMessageContent` gates rendering; a missing case silently drops the item.
-- A user entry marked by `SessionMeta.lastMissingHistoryUserMsgId` renders the
-  terminal "Not delivered" label. That label is the only recovery entry: its
-  dialog resends the same content as a new ordinary message, then marks the old
-  entry `canceled` while retaining the marker as a tombstone. Never automatically
-  dispatch or revive the old turn.
+- `SessionMeta.lastMissingHistoryUserMsgId` marks a "Not delivered" entry.
+  Its label opens the only recovery dialog: resend identical content as a new
+  message, cancel the old entry, keep its marker tombstone; never revive it.
+  `delivery_unknown` needs duplicate-work consent before a fresh send; no Edit & Resend
+  or automatic replay.
 - Frozen Agent/Role names/icons never use human profiles or live catalogs. Human names
   sit right of time; only desktop avatars open accessible name/email cards.
 - Attachment layout, preview continuity, and mobile previews follow

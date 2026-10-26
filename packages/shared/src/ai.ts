@@ -1358,6 +1358,7 @@ export type ChatFailedReason =
   // HTTP 400), which would otherwise be recorded as an ordinary completion.
   | 'agent_no_output'
   | 'turn_pre_prompt_failed'
+  | 'turn_outcome_unknown'
   | 'message_delivery_failed'
   | 'machine_access_denied' // requester is not authorized to use this machine (definitive backend deny)
   // ACP RPC errors (from @agentclientprotocol/sdk)

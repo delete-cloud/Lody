@@ -3409,6 +3409,27 @@ export class SessionExecutionService {
     ) {
       return;
     }
+    const submissionStarted = this.operationInbox?.inputSubmissionStarted(
+      this.deps.workspaceId,
+      sessionId,
+      userTurnId
+    );
+    if (submissionStarted !== false) {
+      await this.deps.recordChatFailure(
+        sessionDoc,
+        'turn_outcome_unknown',
+        submissionStarted
+          ? 'The earlier attempt reached prompt submission and ended before its result was recorded. Work may already have happened. Lody will not replay it automatically; sending it again could repeat work.'
+          : 'An earlier attempt ended, but Lody cannot confirm whether it ran or completed work. Lody will not replay it automatically; sending it again could repeat work.'
+      );
+      await this.setTerminalUserTurnStatus(sessionId, sessionDoc, userTurnId, 'delivery_unknown');
+      await this.upsertSessionMeta(sessionId, {
+        lastHandledUserMsgId: userTurnId,
+        processingUserMsgId: undefined,
+      });
+      await sessionDoc.setStatus(SessionStatusFactory.idle());
+      return;
+    }
     await this.recordKnownChatFailure({
       sessionId,
       sessionDoc,
@@ -5061,7 +5082,14 @@ export class SessionExecutionService {
   private async setUserTurnStatus(
     backend: SessionBackend,
     userTurnId: string,
-    status: 'pending' | 'seen' | 'processing' | 'handled' | 'failed' | 'canceled',
+    status:
+      | 'pending'
+      | 'seen'
+      | 'processing'
+      | 'handled'
+      | 'failed'
+      | 'canceled'
+      | 'delivery_unknown',
     cancellationReason?: 'user_stop'
   ): Promise<boolean> {
     let matched = false;
@@ -5081,14 +5109,14 @@ export class SessionExecutionService {
   /** Per-session record of terminal turn statuses whose history entry was absent at write time. */
   private readonly terminalTurnStatusWithoutEntry = new Map<
     SessionId,
-    Map<string, 'handled' | 'failed' | 'canceled'>
+    Map<string, 'handled' | 'failed' | 'canceled' | 'delivery_unknown'>
   >();
   private static readonly TERMINAL_TURN_RECORD_LIMIT = 16;
 
   private recordTerminalTurnWithoutEntry(
     sessionId: SessionId,
     userTurnId: string,
-    status: 'handled' | 'failed' | 'canceled'
+    status: 'handled' | 'failed' | 'canceled' | 'delivery_unknown'
   ): void {
     let records = this.terminalTurnStatusWithoutEntry.get(sessionId);
     if (!records) {
@@ -5108,7 +5136,7 @@ export class SessionExecutionService {
     sessionId: SessionId,
     sessionDoc: SessionDocument,
     userTurnId: string,
-    status: 'handled' | 'failed' | 'canceled'
+    status: 'handled' | 'failed' | 'canceled' | 'delivery_unknown'
   ): Promise<void> {
     const meta = await this.getSessionMeta(sessionId);
     const backend = await createSessionBackend(sessionDoc, meta);
@@ -5136,7 +5164,7 @@ export class SessionExecutionService {
   recordTerminalUserTurnStatusWithoutEntry(
     sessionId: SessionId,
     userTurnId: string,
-    status: 'handled' | 'failed' | 'canceled'
+    status: 'handled' | 'failed' | 'canceled' | 'delivery_unknown'
   ): void {
     this.recordTerminalTurnWithoutEntry(sessionId, userTurnId, status);
   }
@@ -5145,7 +5173,7 @@ export class SessionExecutionService {
   getTerminalUserTurnStatusWithoutEntry(
     sessionId: SessionId,
     userTurnId: string
-  ): 'handled' | 'failed' | 'canceled' | undefined {
+  ): 'handled' | 'failed' | 'canceled' | 'delivery_unknown' | undefined {
     return this.terminalTurnStatusWithoutEntry.get(sessionId)?.get(userTurnId);
   }
 

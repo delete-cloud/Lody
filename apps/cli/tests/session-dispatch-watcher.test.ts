@@ -1192,72 +1192,75 @@ describe('SessionDispatchWatcher', () => {
     }
   );
 
-  it('repairs a late-arriving entry for an already-handled fast-path turn instead of re-dispatching', async () => {
-    const continueSession = vi.fn(async () => {});
-    const startSession = vi.fn(async () => {});
-    const cancelSession = vi.fn(async () => ({ success: true }));
-    const sessionId = 'session-rpc-repair' as SessionId;
-    const sessionMeta = {
-      id: sessionId,
-      machineId: 'machine-1',
-      userId: 'user-1',
-      createdAt: new Date().toISOString(),
-      cliType: 'builtin',
-      agentType: 'codex',
-      status: { type: 'idle' as const },
-      latestUserMsgId: 'turn-late',
-      lastHandledUserMsgId: 'turn-late',
-    };
-    let history: SessionHistoryInput[] = [createPendingUserTurn('turn-late', 'late entry')];
+  it.each(['handled', 'delivery_unknown'] as const)(
+    'repairs a late-arriving %s fast-path turn without re-dispatching',
+    async (status) => {
+      const continueSession = vi.fn(async () => {});
+      const startSession = vi.fn(async () => {});
+      const cancelSession = vi.fn(async () => ({ success: true }));
+      const sessionId = 'session-rpc-repair' as SessionId;
+      const sessionMeta = {
+        id: sessionId,
+        machineId: 'machine-1',
+        userId: 'user-1',
+        createdAt: new Date().toISOString(),
+        cliType: 'builtin',
+        agentType: 'codex',
+        status: { type: 'idle' as const },
+        latestUserMsgId: 'turn-late',
+        lastHandledUserMsgId: 'turn-late',
+      };
+      let history: SessionHistoryInput[] = [createPendingUserTurn('turn-late', 'late entry')];
 
-    const sessionDoc = withHistoryPort({
-      // No mirror: after the repair there is no dispatchable turn, and the
-      // legacy realtime wait resolves immediately without one.
-      mirror: undefined,
-      getMetaState: vi.fn(async () => sessionMeta),
-      getHistory: vi.fn(() => history),
-      updateHistory: vi.fn(async (updater: (prev: typeof history) => typeof history) => {
-        history = updater(history);
-      }),
-      setStatus: vi.fn(async () => {}),
-      waitForRemoteSync: vi.fn(async () => {}),
-    });
+      const sessionDoc = withHistoryPort({
+        // No mirror: after the repair there is no dispatchable turn, and the
+        // legacy realtime wait resolves immediately without one.
+        mirror: undefined,
+        getMetaState: vi.fn(async () => sessionMeta),
+        getHistory: vi.fn(() => history),
+        updateHistory: vi.fn(async (updater: (prev: typeof history) => typeof history) => {
+          history = updater(history);
+        }),
+        setStatus: vi.fn(async () => {}),
+        waitForRemoteSync: vi.fn(async () => {}),
+      });
 
-    const workspaceDocument = {
-      repo: {
-        getDocMeta: vi.fn(async () => ({ meta: sessionMeta })),
-        upsertDocMeta: vi.fn(async () => {}),
-      },
-      getOrCreateSessionDoc: vi.fn(async () => withSessionData(sessionDoc)),
-    } as unknown as LoroDocumentManager;
+      const workspaceDocument = {
+        repo: {
+          getDocMeta: vi.fn(async () => ({ meta: sessionMeta })),
+          upsertDocMeta: vi.fn(async () => {}),
+        },
+        getOrCreateSessionDoc: vi.fn(async () => withSessionData(sessionDoc)),
+      } as unknown as LoroDocumentManager;
 
-    const watcher = createWatcher({
-      logger: createSilentLogger(),
-      machineId: 'machine-1',
-      workspaceId: 'workspace-1' as WorkspaceId,
-      workspaceDocument,
-      executionService: {
-        getExecutionSnapshot: vi.fn(() => ({
-          hasActiveTurn: false,
-          hasBlockingPendingCreate: false,
-          hasReusableSession: false,
-        })),
-        getTerminalUserTurnStatusWithoutEntry: vi.fn(() => 'handled' as const),
-        clearTerminalUserTurnStatusWithoutEntry: vi.fn(),
-        continueSession,
-        startSession,
-        cancelSession,
-      } as unknown as SessionExecutionService,
-      canUseMachine: createAllowMachineAccess(),
-    });
+      const watcher = createWatcher({
+        logger: createSilentLogger(),
+        machineId: 'machine-1',
+        workspaceId: 'workspace-1' as WorkspaceId,
+        workspaceDocument,
+        executionService: {
+          getExecutionSnapshot: vi.fn(() => ({
+            hasActiveTurn: false,
+            hasBlockingPendingCreate: false,
+            hasReusableSession: false,
+          })),
+          getTerminalUserTurnStatusWithoutEntry: vi.fn(() => status),
+          clearTerminalUserTurnStatusWithoutEntry: vi.fn(),
+          continueSession,
+          startSession,
+          cancelSession,
+        } as unknown as SessionExecutionService,
+        canUseMachine: createAllowMachineAccess(),
+      });
 
-    await runMaybeHandleSession(watcher, sessionId);
-    await flushMicrotasks();
+      await runMaybeHandleSession(watcher, sessionId);
+      await flushMicrotasks();
 
-    expect(startSession).not.toHaveBeenCalled();
-    expect(continueSession).not.toHaveBeenCalled();
-    expect(history[0]?.status).toBe('handled');
-  });
+      expect(startSession).not.toHaveBeenCalled();
+      expect(continueSession).not.toHaveBeenCalled();
+      expect(history[0]?.status).toBe(status);
+    }
+  );
 
   it('repairs a late entry to failed (not handled) when the handled pointer advanced but no completed assistant entry exists', async () => {
     // Restart scenario: a denied/canceled fast-path turn advanced

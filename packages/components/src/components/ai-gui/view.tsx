@@ -3456,6 +3456,8 @@ const ChatFailedNoticeView = ({
           'sessions.systemNotices.chatFailed.agentNoOutput',
           'The agent ended the turn without producing any output — you can retry your message'
         );
+      case 'turn_outcome_unknown':
+        return t('sessions.systemNotices.chatFailed.turnOutcomeUnknown', 'Previous attempt ended; outcome unknown');
       case 'turn_pre_prompt_failed':
         return t(
           'sessions.systemNotices.chatFailed.turnPrePromptFailed',
@@ -3851,7 +3853,7 @@ const UserMessageRowView = ({
   const isPendingApply = message.status === 'pending_apply' && !rpcDelivered;
   const isDeliveryUnknown = message.status === 'delivery_unknown';
   const recoveryLabel = isDeliveryUnknown
-    ? t('sessions.messageStatus.deliveryUnknown', 'Application unknown')
+    ? t('sessions.messageStatus.deliveryUnknown', 'Outcome unknown')
     : t('sessions.messageStatus.notDelivered', 'Not delivered');
   const isDelivered = !isPendingApply && (isSessionHistoryDelivered(message) || rpcDelivered);
   // Missing-history recovery negatively acknowledged this exact turn
@@ -4314,14 +4316,14 @@ const ResendUndeliveredDialog = ({
         <AlertDialog.Header>
           <AlertDialog.Title>
             {deliveryUnknown
-              ? t('sessions.messageStatus.deliveryUnknown', 'Application unknown')
+              ? t('sessions.messageStatus.deliveryUnknown', 'Outcome unknown')
               : t('sessions.resendUndelivered.title', 'Message not delivered')}
           </AlertDialog.Title>
           <AlertDialog.Description>
             {deliveryUnknown
               ? t(
                   'sessions.resendUndelivered.unknownDescription',
-                  'The agent may already have applied this guidance. Sending it as a new message could repeat work. Send again?'
+                  'The agent may already have acted on this message. Sending it as a new message could repeat work. Send again?'
                 )
               : t(
                   'sessions.resendUndelivered.description',
