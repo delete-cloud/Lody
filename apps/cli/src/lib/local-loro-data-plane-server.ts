@@ -1,5 +1,4 @@
 import { makeNodeLocalLoroWriterConnection } from '@lody/shared/node/local-loro-writer';
-import { closeProcessLocalLoroWriterLegacy } from '@lody/shared/local-loro-writer/legacy';
 import fs from 'node:fs';
 import net from 'node:net';
 import {
@@ -257,7 +256,6 @@ async function stopInner(): Promise<void> {
       connectionReleases.delete(release);
     })
   );
-  await closeProcessLocalLoroWriterLegacy();
   dataPlaneServer = null;
   activeSocketPath = null;
   if (socketPath && process.platform !== 'win32' && fs.existsSync(socketPath))

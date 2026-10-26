@@ -55,7 +55,11 @@ writer directly; only `exportLocalFlock` adapts genuine SDK I/O. The one depreca
 `handleDisconnectLegacy` revoke queued work and await actual running export and drain
 cleanup. A failed bounded release retains full Cause and recovery ownership; late
 results cannot write or advance a disconnected/superseded frontier. Full room/app
-lifecycle migration remains separate. Stable API and evidence:
+lifecycle migration remains separate. Socket shutdown stops admission and releases
+connections while workspace engines still retain the shared writer runtime. Fleet
+releases that runtime only after workspace cleanup (including Repo persistence) and
+local-service release succeed. A failed final writer close remains retryable outside
+the memoized global shutdown receipt. Stable API and evidence:
 [writer README](../../packages/shared/src/local-loro-writer/README.md).
 
 ## Framing discipline

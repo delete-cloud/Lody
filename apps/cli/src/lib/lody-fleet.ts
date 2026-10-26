@@ -87,6 +87,7 @@ import {
   type SessionMeta,
 } from '@lody/shared';
 import type { LocalLoroDataPlaneServerLegacy } from '@lody/shared/local-loro-data-plane-server';
+import { closeProcessLocalLoroWriterLegacy } from '@lody/shared/local-loro-writer/legacy';
 import { Effect } from 'effect';
 import { AgentExecutionSlots } from './agent-execution-slots';
 import {
@@ -644,7 +645,10 @@ export class LodyFleet {
     await this.finishGlobalShutdown();
   }
 
-  private finishGlobalShutdown(): Promise<void> {
+  private async finishGlobalShutdown(): Promise<void> {
+    // Engines still need this runtime to release their owners and flush their Repos.
+    // Keep failed writer release retryable outside the memoized global receipt.
+    await closeProcessLocalLoroWriterLegacy();
     return (this.globalShutdownReceipt ??= this.finishGlobalShutdownOnce());
   }
 

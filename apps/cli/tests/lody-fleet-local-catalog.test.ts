@@ -1,3 +1,19 @@
+import fs from 'node:fs';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import Database from 'better-sqlite3';
+import { LoroRepo } from 'loro-repo';
+import { SqliteRepoStore } from 'loro-repo/storage/sqlite';
+import { LocalLoroDataPlaneServerLegacy } from '@lody/shared/local-loro-data-plane-server';
+import {
+  closeProcessLocalLoroWriterLegacy,
+  getProcessLocalLoroWriterLegacy,
+} from '@lody/shared/local-loro-writer/legacy';
+import { makeLocalLoroWriterOwner } from '@lody/shared/local-loro-writer';
+import { LocalLoroWriterNodeTurn } from '@lody/shared/node/local-loro-writer';
+import { getLocalLoroDataPlaneSocketPath } from '@lody/shared/node/local-ipc';
+import * as localDataPlane from '../src/lib/local-loro-data-plane-server';
 import { createLocalCloudPort, type CloudPort } from '@lody/platform';
 import {
   type LocalSessionControlRequest,
@@ -569,4 +585,186 @@ it('joins background project observation before closing its workspace document',
   await closing;
   expect(steps).toEqual(['schedules', 'document', 'poller']);
   expect(fleet.runtimes.has('observing')).toBe(false);
+});
+
+const createShutdownFleet = () =>
+  createFleetHarness(createCatalogStub(() => Effect.succeed(catalogSnapshot({}))))
+    .fleet as unknown as {
+    shutdown(): Promise<void>;
+    recoverShutdown(): Promise<void>;
+    runtimes: Map<string, unknown>;
+  };
+
+it('keeps the writer alive after endpoint stop until delayed workspace cleanup persists unflushed metadata', async () => {
+  const directory = fs.mkdtempSync(
+    path.join(process.platform === 'win32' ? os.tmpdir() : '/tmp', 'lody-fleet-close-')
+  );
+  vi.stubEnv('LODY_PLATFORM', 'local');
+  vi.stubEnv('LODY_DATA_DIR', directory);
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  const databasePath = path.join(directory, 'repo.sqlite3');
+  const store = new SqliteRepoStore({ path: databasePath });
+  const repo = await LoroRepo.create({ storageAdapter: store.storage, metaDebounceCommitMs: 0 });
+  const writer = getProcessLocalLoroWriterLegacy(LocalLoroWriterNodeTurn);
+  const engine = new LocalLoroDataPlaneServerLegacy({
+    workspaceId: 'shutdown',
+    resolveDoc: async (id) => (await repo.openPersistedDoc(id)).doc,
+    resolveFlockDoc: async (id) => (await repo.openFlockDoc(id)).flock,
+    resolveMetaFlock: async () => repo.getMeta(),
+    writerLegacy: writer,
+  });
+  const fleet = createShutdownFleet();
+  const workspaceEntered = Promise.withResolvers<void>();
+  const releaseWorkspace = Promise.withResolvers<void>();
+  const endpointStopped = Promise.withResolvers<void>();
+  const stopEndpoint = localDataPlane.stopLocalLoroDataPlaneServer;
+  const stopped = vi
+    .spyOn(localDataPlane, 'stopLocalLoroDataPlaneServer')
+    .mockImplementation(async () => {
+      await stopEndpoint();
+      endpointStopped.resolve();
+    });
+  const steps: string[] = [];
+  const closeWriter = writer.closeLegacy;
+  const writerClose = vi.spyOn(writer, 'closeLegacy').mockImplementation(async () => {
+    await closeWriter();
+    steps.push('writer');
+  });
+  fleet.runtimes.set('shutdown', {
+    workspace: { id: 'shutdown' },
+    schedules: { dispose: async () => {} },
+    lody: {
+      cleanup: async () => {
+        workspaceEntered.resolve();
+        await releaseWorkspace.promise;
+        await engine.disposeLegacy();
+        steps.push('engine');
+        await repo.destroy();
+        steps.push('repo');
+      },
+    },
+    unsubscribeTerminalCleanup: () => {},
+    prPollerWorkspace: { dispose: async () => {} },
+  });
+  let socket: net.Socket | undefined;
+  let shutdown: Promise<unknown> | undefined;
+  try {
+    const docId = 'session-shutdown';
+    const meta = { id: 'shutdown', title: 'Synthetic shutdown metadata' };
+    await repo.upsertDocMeta(docId, meta);
+    expect(await repo.getDocMeta(docId)).toMatchObject({ meta });
+    const disk = new Database(databasePath, { readonly: true });
+    try {
+      // Freeze the normal persistence debounce; shutdown must provide the barrier.
+      expect(disk.prepare('SELECT count(*) AS count FROM meta_updates').get()).toEqual({
+        count: 0,
+      });
+    } finally {
+      disk.close();
+    }
+    fs.mkdirSync(path.dirname(getLocalLoroDataPlaneSocketPath()), { recursive: true });
+    await localDataPlane.startLocalLoroDataPlaneServer({
+      logger: createSilentLogger(),
+      getWorkspaceServer: () => engine,
+    });
+    socket = net.createConnection(getLocalLoroDataPlaneSocketPath());
+    await new Promise<void>((resolve, reject) => {
+      socket?.once('connect', resolve);
+      socket?.once('error', reject);
+    });
+    const closed = new Promise<void>((resolve) => socket?.once('close', () => resolve()));
+    shutdown = fleet.shutdown().then(
+      () => ({ ok: true }),
+      (error: unknown) => ({ ok: false, error })
+    );
+    await workspaceEntered.promise;
+    await endpointStopped.promise;
+    await closed;
+    expect(writer.isReleased()).toBe(false);
+    const refused = net.createConnection(getLocalLoroDataPlaneSocketPath());
+    await expect(
+      new Promise((resolve, reject) => {
+        refused.once('connect', resolve);
+        refused.once('error', reject);
+      })
+    ).rejects.toMatchObject({ code: expect.stringMatching(/ENOENT|ECONNREFUSED/) });
+    refused.destroy();
+    releaseWorkspace.resolve();
+    expect(await shutdown).toEqual({ ok: true });
+    expect(steps).toEqual(['engine', 'repo', 'writer']);
+    expect(writer.isReleased()).toBe(true);
+    const reopenedStore = new SqliteRepoStore({ path: databasePath });
+    const reopened = await LoroRepo.create({
+      storageAdapter: reopenedStore.storage,
+      metaDebounceCommitMs: 0,
+    });
+    try {
+      expect(await reopened.getDocMeta(docId)).toMatchObject({ meta });
+    } finally {
+      await reopened.destroy();
+    }
+  } finally {
+    releaseWorkspace.resolve();
+    await shutdown;
+    stopped.mockRestore();
+    writerClose.mockRestore();
+    socket?.destroy();
+    await engine.disposeLegacy().catch(() => undefined);
+    await repo.destroy();
+    await stopEndpoint();
+    await closeProcessLocalLoroWriterLegacy();
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it('retries a failed final writer release without caching its rejection as global shutdown', async () => {
+  const writer = getProcessLocalLoroWriterLegacy(LocalLoroWriterNodeTurn);
+  const built = Promise.withResolvers<void>();
+  let releaseFails = true;
+  let subscribed = false;
+  const failure = new Error('synthetic drain unsubscribe failure');
+  writer.writer.offer(
+    {
+      id: 'shutdown-retry',
+      send: () => true,
+      onDrain: () => {
+        subscribed = true;
+        return () => {
+          if (releaseFails) throw failure;
+          subscribed = false;
+        };
+      },
+    },
+    {
+      owner: makeLocalLoroWriterOwner(),
+      valid: () => true,
+      onCause: () => {},
+      build: Effect.sync(() => {
+        built.resolve();
+        return [];
+      }),
+    }
+  );
+  const fleet = createShutdownFleet();
+  try {
+    await built.promise;
+    const initial = fleet.shutdown();
+    await expect(initial).rejects.toThrow();
+    expect(fleet.shutdown()).toBe(initial);
+    expect(subscribed).toBe(true);
+    expect(writer.isReleased()).toBe(false);
+    await expect(fleet.recoverShutdown()).rejects.toThrow();
+    expect(writer.isReleased()).toBe(false);
+    releaseFails = false;
+    const recovered = fleet.recoverShutdown();
+    expect(fleet.recoverShutdown()).toBe(recovered);
+    await recovered;
+    expect(subscribed).toBe(false);
+    expect(writer.isReleased()).toBe(true);
+  } finally {
+    releaseFails = false;
+    await closeProcessLocalLoroWriterLegacy();
+  }
 });

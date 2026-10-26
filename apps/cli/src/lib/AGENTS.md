@@ -56,8 +56,9 @@ writing machine Flock rows, or reacting to reconnection. Before changing
 [rules and design](../../../../.agents/docs/cli-lib-local-loro-data-plane.md): named
 `LoroDocumentManager` options, scheduler and bulk-writer limits, sender-enforced
 framing, the RAW-chunk `createJsonLineSplitter` requirement, renderer room lifetime.
-The room engine remains explicitly Legacy; outbound work uses the single native
-process writer facade, and cleanup awaits its release receipt. Two are never negotiable: a renderer joining a Session Doc room must not call
+Legacy engines share the native process writer. Stop sockets first; release the
+writer after all workspace and local-service cleanup succeeds. A renderer joining
+a Session Doc room must not call
 `getOrCreateSessionDoc` or retain a live cloud room, and the CLI's cloud room status is
 never pushed to renderers as local room health.
 
