@@ -12,9 +12,9 @@ export default defineConfig({
     trace: 'on-first-retry',
   },
   webServer: {
-    command: `pnpm storybook --ci --host 127.0.0.1 --port ${new URL(storybookUrl).port || '6006'}`,
+    command: `pnpm exec vite preview --config storybook-preview.config.mjs --port ${new URL(storybookUrl).port || '6006'}`,
     url: storybookUrl,
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: false,
     timeout: 120_000,
   },
 });

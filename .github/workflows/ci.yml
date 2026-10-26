@@ -301,6 +301,13 @@ jobs:
         if: steps.plan.outputs.run != 'false'
         run: pnpm --filter @lody/components exec playwright install --with-deps chromium
 
+      - name: Build static Storybook
+        if: steps.plan.outputs.run != 'false'
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
+          STORYBOOK_DISABLE_TELEMETRY: '1'
+        run: pnpm --filter @lody/components build-storybook
+
       - name: Run conversation browser tests
         if: steps.plan.outputs.run != 'false'
         env:

@@ -66,10 +66,10 @@
   "scripts": {
     "dev": "tsr generate && oxfmt src/routeTree.gen.ts",
     "typecheck": "tsgo --noEmit",
-    "test": "vitest run",
+    "test": "node --test playwright.config.test.ts && vitest run",
     "test:watch": "vitest",
-    "test:e2e": "playwright test",
-    "test:e2e:ui": "playwright test --ui",
+    "test:e2e": "pnpm build-storybook && playwright test",
+    "test:e2e:ui": "pnpm build-storybook && playwright test --ui",
     "storybook": "storybook dev -p 6006",
     "build-storybook": "storybook build",
     "bench:conversation": "vitest bench benchmarks/conversation-window.bench.ts --run"
