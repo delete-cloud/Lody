@@ -12,7 +12,7 @@ mobile surfaces. Background for the rules below:
 - Regenerate TanStack routes after changing route files.
 - Use `pnpm --filter @lody/components dev` to generate and format the route tree
   with Oxfmt before CI compares it with the committed file.
-- Add Storybook coverage for new presentational components and meaningful states.
+- Add meaningful Storybook states for new UI; [prebuild browser tests](README.md).
 - All user-visible copy must go through i18n.
 - Compact number units (K/M/B vs 万/亿) follow the product language via
   `toIntlLocaleOrEn` / `formatCompactNumber`, never the host OS locale.
