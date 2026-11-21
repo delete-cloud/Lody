@@ -39,6 +39,7 @@ function fixture() {
   let offer: ((job: McpRelayRequest) => boolean) | undefined;
   let closedCallbacks = 0;
   let closedRelays = 0;
+  let upstream: (() => Response) | undefined;
   const fetcher: typeof fetch = async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
     expect(init?.redirect).toBe('error');
@@ -86,6 +87,7 @@ function fixture() {
       });
     }
     remoteHeaders.push(new Headers(init?.headers));
+    if (upstream) return upstream();
     return Response.json({ tools: ['synthetic_tool'] });
   };
   const store: McpCredentialStore = {
@@ -161,6 +163,9 @@ function fixture() {
     closedCallbacks: () => closedCallbacks,
     closedRelays: () => closedRelays,
     offer: (job: McpRelayRequest) => offer?.(job),
+    respond: (next: () => Response) => {
+      upstream = next;
+    },
   };
 }
 
@@ -442,6 +447,100 @@ describe('local MCP authentication', () => {
       ).rejects.toThrow('cancelled');
     } finally {
       await f.runtime.dispose();
+    }
+  });
+
+  it('relays protocol statuses from the upstream but keeps provider failures redacted', async () => {
+    const resolved = {
+      type: 'http' as const,
+      name: entry.name,
+      url: 'https://resource.example/mcp',
+      headers: [],
+    };
+    const secret = 'provider-detail private-token';
+    const send = async (
+      f: ReturnType<typeof fixture>,
+      method: string,
+      upstream: (call: number) => Response
+    ) => {
+      let call = 0;
+      f.respond(() => upstream(call++));
+      const request = Object.assign(Readable.from(method === 'POST' ? ['{}'] : []), {
+        method,
+        headers: { authorization: 'Bearer session-capability', accept: 'text/event-stream' },
+      }) as unknown as IncomingMessage;
+      const written: { status: number; headers: unknown }[] = [];
+      const response = Object.assign(new PassThrough(), {
+        headersSent: false,
+        writeHead: (status: number, headers: unknown) => {
+          if (response.headersSent) throw new Error('headers written twice');
+          response.headersSent = true;
+          written.push({ status, headers });
+          return response;
+        },
+      }) as unknown as ServerResponse & { headersSent: boolean };
+      const chunks: Buffer[] = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      const finished = Promise.withResolvers<void>();
+      response.once('finish', () => finished.resolve());
+      expect(f.offer({ request, response })).toBe(true);
+      await finished.promise;
+      expect(written).toHaveLength(1);
+      expect(written[0]?.headers).toEqual({
+        'content-type': 'text/plain',
+        'cache-control': 'no-store',
+      });
+      return { status: written[0]?.status, body: Buffer.concat(chunks).toString() };
+    };
+    const challenged = (status: number) =>
+      new Response(secret, {
+        status,
+        headers: { 'www-authenticate': 'Bearer realm="private"' },
+      });
+
+    const manual = fixture();
+    try {
+      await manual.run((service) =>
+        service.configure(entry, { mode: 'manual', bearerToken: 'private-token' })
+      );
+      await manual.run((service) => service.prepare(entry, resolved, 'session-instance', 'owner'));
+      for (const [method, status] of [
+        ['GET', 405],
+        ['DELETE', 405],
+        ['POST', 400],
+        ['POST', 404],
+        ['POST', 406],
+        ['POST', 415],
+        ['POST', 422],
+      ] as const) {
+        expect(await send(manual, method, () => challenged(status))).toEqual({
+          status,
+          body: `MCP service rejected the request (HTTP ${status}).`,
+        });
+      }
+      for (const status of [401, 403, 409, 429, 500])
+        expect(await send(manual, 'POST', () => challenged(status))).toEqual({
+          status: 503,
+          body: 'MCP connection unavailable. Check this service in Lody Settings.',
+        });
+    } finally {
+      await manual.runtime.dispose();
+    }
+
+    const oauth = fixture();
+    try {
+      await oauth.grant();
+      await oauth.run((service) => service.prepare(entry, resolved, 'session-instance', 'owner'));
+      const before = oauth.remoteHeaders.length;
+      expect(
+        await send(oauth, 'POST', (call) =>
+          call === 0 ? new Response(secret, { status: 401 }) : challenged(422)
+        )
+      ).toEqual({ status: 422, body: 'MCP service rejected the request (HTTP 422).' });
+      expect(oauth.remoteHeaders.length - before).toBe(2);
+      expect(oauth.refreshed.has('rotated-refresh')).toBe(true);
+    } finally {
+      await oauth.runtime.dispose();
     }
   });
 

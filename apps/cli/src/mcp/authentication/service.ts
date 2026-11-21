@@ -47,6 +47,13 @@ const external = <A>(run: (signal: AbortSignal) => Promise<A>) =>
   });
 const targetOf = (server: WorkspaceMcpServerMeta) =>
   JSON.stringify(publicMcpServer(server).connection);
+/**
+ * Upstream statuses that Streamable HTTP clients may act on, such as 405 for no standalone
+ * GET stream, 404 for an expired session, or 400/422 for a rejected probe. Recovery still
+ * depends on the client. Only the status crosses the relay. Bodies, including JSON-RPC
+ * version hints, and auth challenges stay redacted; 401/403 stay masked as 503.
+ */
+const relayedUpstreamStatuses = new Set([400, 404, 405, 406, 415, 422]);
 const result = (
   status: McpAuthenticationResult['status'],
   hasCredentials = false,
@@ -431,14 +438,22 @@ export function mcpAuthenticationLayer(options: {
             })
           );
         });
-      const reject = (job: McpRelayRequest) =>
+      const reject = (job: McpRelayRequest, upstreamStatus?: number) =>
         Effect.sync(() => {
+          const status =
+            upstreamStatus !== undefined && relayedUpstreamStatuses.has(upstreamStatus)
+              ? upstreamStatus
+              : 503;
           if (!job.response.headersSent)
-            job.response.writeHead(503, {
+            job.response.writeHead(status, {
               'content-type': 'text/plain',
               'cache-control': 'no-store',
             });
-          job.response.end('MCP connection unavailable. Check this service in Lody Settings.');
+          job.response.end(
+            status === 503
+              ? 'MCP connection unavailable. Check this service in Lody Settings.'
+              : `MCP service rejected the request (HTTP ${status}).`
+          );
         });
       const prepare = (
         server: WorkspaceMcpServerMeta,
@@ -512,7 +527,7 @@ export function mcpAuthenticationLayer(options: {
                 }
                 if (response) {
                   if (own) yield* observe(server, response);
-                  yield* reject(job);
+                  yield* reject(job, response.status);
                 }
               }).pipe(
                 Effect.catch(() => reject(job)),

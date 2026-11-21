@@ -16,7 +16,8 @@ Parent rules apply. Lifecycle background: [../README.md](../README.md#local-auth
 - Relays bind the selected entry and exact runtime instance. Require a random capability,
   reject Origin/foreign Host, and on Linux prove peer uid. Unlike the built-in MCP host,
   these relays preserve upstream GET/SSE. Bound queues, bodies and cleanup, reject
-  redirects, redact upstream failures, and close on retirement or local sign-out.
+  redirects, redact upstream failure bodies and challenges (only Streamable HTTP protocol
+  statuses 400/404/405/406/415/422 pass through), and close on retirement or local sign-out.
 - No plaintext storage fallback, remote credential management, automatic legacy import,
   or credential sharing. E2EE sharing requires its own reviewed contract.
 - Tests inject SDK HTTP, callbacks, clocks and vault ports; never contact live OAuth services.
